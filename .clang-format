@@ -1,0 +1,11 @@
+AlignAfterOpenBracket: Align
+AlignArrayOfStructures: Left
+AllowShortEnumsOnASingleLine: true
+AllowShortCaseLabelsOnASingleLine: true
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: false
+BreakBeforeBraces: Attach
+BreakStringLiterals: false
+PointerAlignment: Right
+SpaceBeforeSquareBrackets: false

@@ -1,0 +1,61 @@
+project sp
+
+globals {
+    set CC cc
+    set LINK_OPTS [list -lcbor]
+    set SOURCE [lmap f [glob *.c *.h] { file normalize $f }]
+    set OUT [file normalize build/sp]
+    set STANDARD_OPTS [list -std=c11 -Os -D_POSIX_C_SOURCE=200809L \
+			   -Wall -Wextra -Wpedantic -D_GNU_SOURCE \
+			   -Wstrict-overflow -fno-strict-aliasing]
+    set DEBUG_OPTS   [list -g -O0 -DDEBUG {*}$STANDARD_OPTS]
+    set RELEASE_OPTS [list -O2 -DNDEBUG -s -march=native {*}$STANDARD_OPTS]
+}
+
+task setup {
+    run {
+	mkdir -p build
+    }
+}
+
+task fmt {
+    inputs $sp::SOURCE
+    outputs [file normalize ../.clang-format]
+    run {
+	set -e
+	clang-format -i $sp::SOURCE
+	touch $sp::fmt::outputs
+    }
+}
+
+task debug {
+    depends_on sp::setup
+    inputs $sp::SOURCE
+    outputs $sp::OUT
+    run {
+	$sp::CC $sp::SOURCE $sp::LINK_OPTS $sp::DEBUG_OPTS -o $sp::OUT
+    }
+}
+
+task bear {
+    depends_on sp::debug
+    inputs $sp::SOURCE
+    outputs compile_commands.json
+    run {
+	bear -- [string trim ${sp::debug::run}]
+    }
+}
+
+command compile_demo_subscriber {
+    run {
+	set -e
+	cc -std=c11 -O2 -Wall -Wextra -D_GNU_SOURCE -DBUILD_SUB sp_client.c sp.h sp_pub.c sp_sub.c sp_utils.h sp_utils.c tmp/test_client.c -o sp_sub_demo -lcbor
+    }
+}
+
+command compile_demo_publisher {
+    run {
+	set -e
+	cc -std=c11 -O2 -Wall -Wextra -D_GNU_SOURCE -DBUILD_PUB sp_client.c sp.h sp_pub.c sp_sub.c sp_utils.h sp_utils.c tmp/test_client.c -o sp_pub_demo -lcbor
+    }
+}
