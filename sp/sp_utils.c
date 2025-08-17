@@ -1,6 +1,11 @@
 #include <cbor.h>
+#include <errno.h>
 #include <memory.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <stdlib.h>
 
+#include "sp.h"
 #include "sp_utils.h"
 
 int sp_parse_publish(const uint8_t *payload, size_t len,
@@ -150,4 +155,106 @@ uint8_t *sp_parse_publish_msg_dup(const uint8_t *payload, size_t len,
 
   cbor_decref(&root);
   return buf;
+}
+
+int sp_run_loop(int fd, const struct sp_handlers *h, void *ud, int timeout_ms) {
+  struct pollfd pfd = {.fd = fd, .events = POLLIN};
+
+  for (;;) {
+    int r = poll(&pfd, 1, timeout_ms);
+
+    if (r < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+
+      if (h && h->on_error) {
+        h->on_error(errno, ud);
+      }
+
+      return -1;
+    }
+
+    if (r == 0) {
+      if (h && h->on_idle) {
+        h->on_idle(ud);
+      }
+
+      continue;
+    }
+
+    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+      if (h && h->on_disconnect) {
+        h->on_disconnect(ud);
+      }
+
+      return -1;
+    }
+
+    if (pfd.revents & POLLIN) {
+      for (;;) {
+        struct sp_frame hdr;
+        uint8_t *pl = NULL;
+        int rr = sp_recv(fd, &hdr, &pl);
+
+        if (rr <= 0) {
+          if (rr == 0) {
+            if (h && h->on_disconnect) {
+              h->on_disconnect(ud);
+            }
+
+            return -1;
+          }
+
+          if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            break;
+          }
+
+          if (h && h->on_error) {
+            h->on_error(errno, ud);
+          }
+
+          free(pl);
+          return -1;
+        }
+
+        int stop = 0;
+
+        switch (hdr.kind) {
+        case SP_PUBLISH: {
+          struct sp_publish_view view;
+
+          if (sp_parse_publish(pl, ntohl(hdr.length), &view)) {
+            if (h && h->on_publish)
+              stop =
+                  h->on_publish(&hdr, view.topic, view.msg, view.msg_len, ud);
+          } else {
+            if (h && h->on_other) {
+              h->on_other(&hdr, pl, ntohl(hdr.length), ud);
+            }
+          }
+        } break;
+        case SP_PING:
+          if (h && h->on_ping) {
+            h->on_ping(ud);
+          }
+
+          sp_ping(fd);
+          break;
+        default:
+          if (h && h->on_other) {
+            h->on_other(&hdr, pl, ntohl(hdr.length), ud);
+          }
+
+          break;
+        }
+
+        free(pl);
+
+        if (stop) {
+          return 0;
+        }
+      }
+    }
+  }
 }

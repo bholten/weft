@@ -14,6 +14,27 @@
 #include "../sp_utils.h"
 
 #ifdef BUILD_SUB
+
+static int on_pub_print(const struct sp_frame *hdr, const char *topic,
+                        const uint8_t *msg, size_t msg_len, void *ud) {
+  printf("PUBLISH topic='%s' len=%lu\n", topic, msg_len);
+  return 0;
+}
+
+int main(void) {
+  int fd = sp_connect("/run/user/1000/spd.sock");
+  
+  const char *topic = "overlay:";
+  const char *caps[] = {"*"};
+  
+  sp_register(fd, "sub_demo", caps, 1);
+  sp_sub(fd, topic);
+
+  struct sp_handlers handler = {.on_publish = on_pub_print};
+  return sp_run_loop(fd, &handler, NULL, -1);
+}
+
+/*
 // --- demo: subscriber that prints PUBLISH topics it receives ---
 int main(int argc, char **argv){
   const char *sock = (argc>1) ? argv[1] : "/run/user/1000/spd.sock";
@@ -38,7 +59,7 @@ int main(int argc, char **argv){
       fprintf(stderr,"disconnected\n");
       break;
     }
-    
+
     if (h.kind == SP_PUBLISH) {
       struct sp_publish_view view = {0};
 
@@ -50,13 +71,14 @@ int main(int argc, char **argv){
     } else if(h.kind == SP_PING){
       sp_ping(fd); // reply with a ping; your broker may PONG instead
     }
-    
+
     free(pl);
   }
 
   close(fd);
   return 0;
 }
+*/
 #endif
 
 #ifdef BUILD_PUB

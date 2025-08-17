@@ -76,5 +76,6 @@ int sp_send_frame(int fd, uint8_t kind, const uint8_t *payload, uint32_t len);
 int sp_publish(int fd, const char *topic, const uint8_t *msg, uint32_t len);
 int sp_recv(int fd, struct sp_frame *hdr, uint8_t **payload_out);
 int sp_ping(int fd);
+void sp_close(int fd);
 
 #endif
