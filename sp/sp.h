@@ -1,6 +1,7 @@
 #ifndef SP_H
 #define SP_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 
@@ -35,6 +36,7 @@ struct sub {
 struct client {
   int fd;
   int id;
+
   uid_t uid;
   gid_t gid;
   pid_t pid;
@@ -48,26 +50,71 @@ struct client {
   size_t wlen;
   size_t woff;
 
-  struct sub *subs;
-  int nsubs;
-  int csubs;
+  struct {
+    char *prefix;
+  } *subs;
+  size_t nsubs;
+  size_t csubs;
 
-  char **caps;
-  int ncaps;
-  int ccaps;
+  unsigned dead : 1;
 
-  char *name;
   struct client *next;
+  struct client *previous;
+};
+
+struct sp_poller {
+  int (*init)(void);
+  int (*add)(int fd, uint32_t *events, void *tag);
+  int (*mod)(int fd, uint32_t *events, void *tag);
+  int (*del)(int fd);
+  // int (*wait)(event *events[], size_t max, int timeout);
+  void (*fini)(void);
 };
 
 struct broker {
   int lfd;
   int epfd;
+
+  int running;
   int next_id;
-  struct client *clients;
+
+  struct client *head;
+  struct client *tail;
+  size_t num_clients;
+  size_t max_clients;
+
   char sockpath[108];
+
+  size_t max_frame;
+  size_t max_write_buf_per_client;
+  size_t max_subs_per_client;
+
+  struct client *dead_head;
+
+  struct {
+    uint64_t accepts, drops, publishes, routed, bytes_in, bytes_out;
+    uint64_t sub_add, sub_del;
+  } stats;
 };
 
+// Lifecycle
+int broker_init(struct broker *b);
+void broker_close(struct broker *b);
+
+// Operations
+void broker_register(struct broker *b);
+void broker_subscribe(struct broker *b);
+void broker_unsubscribe(struct broker *b);
+void broker_publish(struct broker *b);
+void broker_ping(struct broker *b);
+void broker_pong(struct broker *b);
+void broker_bye(struct broker *b);
+
+// Builder
+struct client *add_client(struct broker *b, int fd);
+void broker_remove_client(struct broker *b, struct client *c);
+
+// Core API:
 int sp_connect(const char *sockpath);
 int sp_register(int fd, const char *name, const char **caps, int ncaps);
 int sp_sub(int fd, const char *topic);

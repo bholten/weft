@@ -34,6 +34,7 @@ int sp_parse_publish(const uint8_t *payload, size_t len,
 
     for (size_t i = 0; i < n; ++i) {
       cbor_item_t *k = pairs[i].key;
+
       if (!cbor_isa_string(k) || !cbor_string_is_definite(k)) {
         continue;
       }
@@ -78,7 +79,6 @@ done:
   return ok;
 }
 
-// Returns malloc'd NUL-terminated topic; NULL on error. Caller frees.
 char *sp_parse_publish_topic_dup(const uint8_t *payload, size_t len) {
   struct cbor_load_result res = {0};
   cbor_item_t *root = cbor_load(payload, len, &res);
@@ -118,7 +118,6 @@ char *sp_parse_publish_topic_dup(const uint8_t *payload, size_t len) {
   return out;
 }
 
-// For msg bstr: returns malloc'd copy; sets *out_len; NULL on error.
 uint8_t *sp_parse_publish_msg_dup(const uint8_t *payload, size_t len,
                                   size_t *out_len) {
   struct cbor_load_result res = {0};
@@ -144,9 +143,15 @@ uint8_t *sp_parse_publish_msg_dup(const uint8_t *payload, size_t len,
             size_t L = cbor_bytestring_length(v);
             buf = (uint8_t *)malloc(L);
 
-            if (buf) memcpy(buf, cbor_bytestring_handle(v), L);
-            if (out_len) *out_len = L;
+            if (buf) {
+              memcpy(buf, cbor_bytestring_handle(v), L);
+            }
+
+            if (out_len) {
+              *out_len = L;
+            }
           }
+
           break;
         }
       }
@@ -158,6 +163,7 @@ uint8_t *sp_parse_publish_msg_dup(const uint8_t *payload, size_t len,
 }
 
 int sp_run_loop(int fd, const struct sp_handlers *h, void *ud, int timeout_ms) {
+  puts("starting run loop");
   struct pollfd pfd = {.fd = fd, .events = POLLIN};
 
   for (;;) {
@@ -165,6 +171,7 @@ int sp_run_loop(int fd, const struct sp_handlers *h, void *ud, int timeout_ms) {
 
     if (r < 0) {
       if (errno == EINTR) {
+        puts("errno == eintr");
         continue;
       }
 
@@ -172,6 +179,7 @@ int sp_run_loop(int fd, const struct sp_handlers *h, void *ud, int timeout_ms) {
         h->on_error(errno, ud);
       }
 
+      puts("poll failed");
       return -1;
     }
 
@@ -188,10 +196,13 @@ int sp_run_loop(int fd, const struct sp_handlers *h, void *ud, int timeout_ms) {
         h->on_disconnect(ud);
       }
 
+      puts("pollerr | pollhup | pollnval");
       return -1;
     }
 
     if (pfd.revents & POLLIN) {
+      puts("events");
+
       for (;;) {
         struct sp_frame hdr;
         uint8_t *pl = NULL;
@@ -203,10 +214,12 @@ int sp_run_loop(int fd, const struct sp_handlers *h, void *ud, int timeout_ms) {
               h->on_disconnect(ud);
             }
 
+            puts("rr == 0");
             return -1;
           }
 
           if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            puts("eagain || ewouldblock");
             break;
           }
 
@@ -215,46 +228,50 @@ int sp_run_loop(int fd, const struct sp_handlers *h, void *ud, int timeout_ms) {
           }
 
           free(pl);
+          puts("error");
           return -1;
         }
 
         int stop = 0;
 
         switch (hdr.kind) {
-        case SP_PUBLISH: {
-          struct sp_publish_view view;
+          case SP_PUBLISH: {
+            struct sp_publish_view view;
 
-          if (sp_parse_publish(pl, ntohl(hdr.length), &view)) {
-            if (h && h->on_publish)
-              stop =
-                  h->on_publish(&hdr, view.topic, view.msg, view.msg_len, ud);
-          } else {
+            if (sp_parse_publish(pl, ntohl(hdr.length), &view)) {
+              if (h && h->on_publish) {
+                stop =
+                    h->on_publish(&hdr, view.topic, view.msg, view.msg_len, ud);
+              }
+            } else {
+              if (h && h->on_other) {
+                h->on_other(&hdr, pl, ntohl(hdr.length), ud);
+              }
+            }
+          } break;
+          case SP_PING: {
+            if (h && h->on_ping) {
+              h->on_ping(ud);
+            }
+
+            sp_ping(fd);
+          } break;
+          default: {
             if (h && h->on_other) {
               h->on_other(&hdr, pl, ntohl(hdr.length), ud);
             }
           }
-        } break;
-        case SP_PING:
-          if (h && h->on_ping) {
-            h->on_ping(ud);
-          }
-
-          sp_ping(fd);
-          break;
-        default:
-          if (h && h->on_other) {
-            h->on_other(&hdr, pl, ntohl(hdr.length), ud);
-          }
-
-          break;
         }
 
         free(pl);
 
         if (stop) {
+          puts("stopping");
           return 0;
         }
       }
     }
   }
+
+  puts("exiting?");
 }

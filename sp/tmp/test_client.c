@@ -15,6 +15,10 @@
 
 #ifdef BUILD_SUB
 
+static void on_disconnect_print(void *ud) {
+  printf("DISCONNECT\n"); 
+}
+
 static int on_pub_print(const struct sp_frame *hdr, const char *topic,
                         const uint8_t *msg, size_t msg_len, void *ud) {
   printf("PUBLISH topic='%s' len=%lu\n", topic, msg_len);
@@ -22,6 +26,7 @@ static int on_pub_print(const struct sp_frame *hdr, const char *topic,
 }
 
 int main(void) {
+  printf("[demo] [sub] starting demo subscriber\n");
   int fd = sp_connect("/run/user/1000/spd.sock");
   
   const char *topic = "overlay:";
@@ -30,55 +35,15 @@ int main(void) {
   sp_register(fd, "sub_demo", caps, 1);
   sp_sub(fd, topic);
 
-  struct sp_handlers handler = {.on_publish = on_pub_print};
+  printf("[demo] [sub] setting up handlers\n");
+
+  struct sp_handlers handler = {
+    .on_publish = on_pub_print,
+    .on_disconnect = on_disconnect_print
+  };
   return sp_run_loop(fd, &handler, NULL, -1);
 }
 
-/*
-// --- demo: subscriber that prints PUBLISH topics it receives ---
-int main(int argc, char **argv){
-  const char *sock = (argc>1) ? argv[1] : "/run/user/1000/spd.sock";
-  const char *topic= (argc>2) ? argv[2] : "overlay:";
-  int fd = sp_connect(sock);
-
-  if (fd < 0) {
-    fprintf(stderr, "connect failed\n");
-    return 1;
-  }
-
-  const char *caps[] = {"*"};
-  sp_register(fd, "sub_demo", caps, 1);
-  sp_sub(fd, topic);
-
-  for (;;){
-    struct sp_frame h;
-    uint8_t *pl = NULL;
-    int r = sp_recv(fd, &h, &pl);
-
-    if (r <= 0) {
-      fprintf(stderr,"disconnected\n");
-      break;
-    }
-
-    if (h.kind == SP_PUBLISH) {
-      struct sp_publish_view view = {0};
-
-      if (pl && sp_parse_publish(pl, ntohl(h.length), &view)) {
-        printf("PUBLISH topic='%s' len=%lu\n", view.topic, view.msg_len);
-      } else {
-        printf("PUBLISH (topic: <unknown>) len=%lu\n", view.msg_len);
-      }
-    } else if(h.kind == SP_PING){
-      sp_ping(fd); // reply with a ping; your broker may PONG instead
-    }
-
-    free(pl);
-  }
-
-  close(fd);
-  return 0;
-}
-*/
 #endif
 
 #ifdef BUILD_PUB
@@ -94,6 +59,9 @@ static size_t make_dummy_msg(uint8_t **out){
       root, (struct cbor_pair){.key = cbor_move(cbor_build_string("hello")),
                                .value = cbor_move(cbor_build_string("world"))});
   written = cbor_serialize_alloc(root, out, &payload_cap);
+
+  cbor_decref(&root);  
+  
   return written;
 }
 
@@ -119,9 +87,9 @@ int main(int argc, char **argv){
       perror("sp_publish");
     }
     
-    usleep(300*1000);
+    usleep(300 * 1000);
   }
-  
+
   free(msg);
   close(fd);
 

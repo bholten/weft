@@ -45,6 +45,50 @@ static void cleanup(void) {
   unlink(B.sockpath);
 }
 
+static void mark_dead(struct client *c) {
+  if (c->dead) return;
+
+  c->dead = 1;
+  c->next = B.dead_head;
+  B.dead_head = c;
+}
+
+static void sweep_dead(void) {
+  struct client *c = B.dead_head;
+  B.dead_head = NULL;
+
+  while (c) {
+    struct client *next = c->next;
+
+    if (c->previous) {
+      c->previous->next = c->next;
+    } else {
+      B.head = c->next;
+    }
+
+    if (c->next) {
+      c->next->previous = c->previous;
+    } else {
+      B.tail = c->previous;
+    }
+
+    B.num_clients--;
+
+    epoll_ctl(B.epfd, EPOLL_CTL_DEL, c->fd, NULL);
+    close(c->fd);
+
+    for (size_t i = 0; i < c->nsubs; i++) {
+      free(c->subs[i].prefix);
+    }
+
+    free(c->subs);
+    free(c->rbuf);
+    free(c->wbuf);
+    free(c);
+    c = next;
+  }
+}
+
 static int make_listener(const char *path) {
   int fd = socket(AF_UNIX, SOCK_STREAM, 0);
 
@@ -92,7 +136,7 @@ static void del_epoll(int fd) {
   epoll_ctl(B.epfd, EPOLL_CTL_DEL, fd, NULL);
 }
 
-static struct client *add_client(int fd) {
+struct client *add_client(struct broker *b, int fd) {
   struct client *c = calloc(1, sizeof(*c));
   c->fd = fd;
   c->id = ++B.next_id;
@@ -114,47 +158,11 @@ static struct client *add_client(int fd) {
   c->wcap = 64 * 1024;
   c->wbuf = malloc(c->wcap);
 
-  c->next = B.clients;
-  B.clients = c;
-
   return c;
 }
 
-static void remove_client(struct client *c) {
-  del_epoll(c->fd);
-  close(c->fd);
-
-  struct client **pp = &B.clients;
-
-  while (*pp && *pp != c) {
-    pp = &(*pp)->next;
-
-    if (*pp) {
-      *pp = c->next;
-    }
-  }
-
-  for (int i = 0; i < c->nsubs; i++) {
-    free(c->subs[i].prefix);
-  }
-
-  free(c->subs);
-  free(c->rbuf);
-  free(c->wbuf);
-  free(c->name);
-
-  if (c->caps) {
-    for (int i = 0; i < c->ncaps; i++) {
-      free(c->caps[i]);
-    }
-    free(c->caps);
-  }
-
-  free(c);
-}
-
 static int topic_matches(struct client *c, const char *topic) {
-  for (int i = 0; i < c->nsubs; i++) {
+  for (size_t i = 0; i < c->nsubs; i++) {
     const char *p = c->subs[i].prefix;
 
     if (strncmp(topic, p, strlen(p)) == 0) {
@@ -214,21 +222,21 @@ static int cbor_get_str(const uint8_t *buf, size_t len, const char *key,
 }
 
 static int queue_bytes(struct client *c, const void *data, size_t n) {
-  if (c->wlen + n > c->wcap) {
-    size_t cap = c->wcap ? c->wcap : 65536;
+  size_t need = c->wlen + n;
 
-    while (cap < c->wlen + n) {
-      cap <<= 1;
+  if (need > c->wcap) {
+    size_t newcap = c->wcap ? c->wcap * 2 : 65536;
+
+    while (newcap < need) {
+      newcap <<= 1;
     }
 
-    uint8_t *nb = realloc(c->wbuf, cap);
+    void *np = realloc(c->wbuf, newcap);
 
-    if (!nb) {
-      return -1;
-    }
+    if (!np) return -1;
 
-    c->wbuf = nb;
-    c->wcap = cap;
+    c->wbuf = np;
+    c->wcap = newcap;
   }
 
   memcpy(c->wbuf + c->wlen, data, n);
@@ -239,73 +247,104 @@ static int queue_bytes(struct client *c, const void *data, size_t n) {
 
 static void route_publish(struct client *from, const struct sp_frame *h,
                           const uint8_t *payload) {
-  char topic[512] = {0};
+  char topic[512];
+  const uint32_t paylen = ntohl(h->length);
 
-  if (!cbor_get_str(payload, ntohl(h->length), "topic", topic, sizeof(topic))) {
-    // drop decode fails
+  if (!cbor_get_str(payload, paylen, "topic", topic, sizeof(topic))) {
     return;
   }
 
-  for (struct client *c = B.clients; c; c = c->next) {
-    if (!topic_matches(c, topic)) {
-      continue;
-    }
+  size_t cap = 0;
+  size_t n = 0;
+  struct client **recips = NULL;
 
-    if (queue_bytes(c, h, sizeof(*h)) < 0) {
-      remove_client(c);
-      continue;
-    }
+  for (struct client *x = B.head; x; x = x->next) {
+    if (x == from) continue;
+    if (!topic_matches(x, topic)) continue;
 
-    if (queue_bytes(c, payload, ntohl(h->length)) < 0) {
-      remove_client(c);
-      continue;
-    }
+    if (n == cap) {
+      size_t newcap = cap ? cap * 2 : 8;
+      void *np = realloc(recips, newcap * sizeof(*recips));
 
-    mod_epoll(c->fd, EPOLLIN | EPOLLOUT, c);
+      if (!np) {
+        free(recips);
+        return;
+      }
+
+      recips = np;
+      cap = newcap;
+    }
+    recips[n++] = x;
   }
+
+  for (size_t i = 0; i < n; i++) {
+    struct client *c = recips[i];
+
+    if (c->dead) continue;
+
+    if (queue_bytes(c, h, sizeof(*h)) < 0 ||
+        queue_bytes(c, payload, paylen) < 0) {
+      mark_dead(c);
+    } else {
+      struct epoll_event e = {.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP,
+                              .data.ptr = c};
+      epoll_ctl(B.epfd, EPOLL_CTL_MOD, c->fd, &e);
+    }
+  }
+
+  free(recips);
 }
 
 static void handle_payload(struct client *c, struct sp_frame *h,
                            uint8_t *payload) {
   switch (h->kind) {
-  case 1: {
-    break;
-  }
-  case 2: {
-    char topic[512] = {0};
+    case SP_REGISTER: break;
+    case SP_SUB: {
+      printf("[sp] SP_SUB %d\n", c->id);
+      char topic[512] = {0};
 
-    if (!cbor_get_str(payload, ntohl(h->length), "topic", topic,
-                      sizeof(topic))) {
-      return;
-    }
+      if (!cbor_get_str(payload, ntohl(h->length), "topic", topic,
+                        sizeof(topic))) {
+        return;
+      }
 
-    if (c->nsubs == c->csubs) {
-      c->csubs = c->csubs ? c->csubs * 2 : 8;
-      c->subs = realloc(c->subs, c->csubs * sizeof(*c->subs));
-    }
-    c->subs[c->nsubs++].prefix = strdup(topic);
+      if (c->nsubs == c->csubs) {
+        int new_cap = c->csubs ? c->csubs * 2 : 8;
+        void *np = realloc(c->subs, (size_t)new_cap * sizeof(*c->subs));
 
-    break;
-  }
-  case 3: break;
-  case 4: {
-    route_publish(c, h, payload);
-    break;
-  }
-  case 5: {
-    struct sp_frame oh = *h;
-    oh.kind = 6;
-    queue_bytes(c, &oh, sizeof(oh));
-    queue_bytes(c, payload, ntohl(h->length));
-    mod_epoll(c->fd, EPOLLIN | EPOLLOUT, c);
+        if (!np) {
+          mark_dead(c);
+          return;
+        }
 
-    break;
-  }
-  case 7: {
-    remove_client(c);
-    break;
-  }
-  default: break;
+        c->subs = np;
+        c->csubs = new_cap;
+      }
+
+      c->subs[c->nsubs].prefix = strdup(topic);
+
+      if (!c->subs[c->nsubs].prefix) {
+        mark_dead(c);
+        return;
+      }
+
+      c->nsubs++;
+    } break;
+    case SP_PUBLISH: {
+      printf("[sp] SP_PUBLISH %d\n", c->id);
+      route_publish(c, h, payload);
+    } break;
+    case SP_PING: {
+      struct sp_frame oh = *h;
+      oh.kind = 6;
+      queue_bytes(c, &oh, sizeof(oh));
+      queue_bytes(c, payload, ntohl(h->length));
+      mod_epoll(c->fd, EPOLLIN | EPOLLOUT, c);
+    } break;
+    case SP_BYE: {
+      mark_dead(c);
+    } break;
+    default: break;
   }
 }
 
@@ -315,7 +354,7 @@ static void on_read(struct client *c) {
       ssize_t r = read(c->fd, (char *)c->rbuf + c->rlen, c->rcap - c->rlen);
 
       if (r == 0) {
-        remove_client(c);
+        mark_dead(c);
         return;
       }
 
@@ -324,7 +363,7 @@ static void on_read(struct client *c) {
           return;
         }
 
-        remove_client(c);
+        mark_dead(c);
         return;
       }
 
@@ -339,14 +378,14 @@ static void on_read(struct client *c) {
     struct sp_frame *h = (struct sp_frame *)c->rbuf;
 
     if (ntohl(h->magic) != SP_MAGIC) {
-      remove_client(c);
+      mark_dead(c);
       return;
     }
 
     uint32_t need = sizeof(*h) + ntohl(h->length);
 
     if (need > MAX_FRAME + sizeof(*h)) {
-      remove_client(c);
+      mark_dead(c);
       return;
     }
 
@@ -354,7 +393,7 @@ static void on_read(struct client *c) {
       ssize_t r = read(c->fd, (char *)c->rbuf + c->rlen, c->rcap - c->rlen);
 
       if (r == 0) {
-        remove_client(c);
+        mark_dead(c);
         return;
       }
 
@@ -362,7 +401,7 @@ static void on_read(struct client *c) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
           return;
         }
-        remove_client(c);
+        mark_dead(c);
         return;
       }
 
@@ -387,20 +426,21 @@ static void on_write(struct client *c) {
   while (c->woff < c->wlen) {
     ssize_t n = write(c->fd, c->wbuf + c->woff, c->wlen - c->woff);
 
-    if (n < 0) {
-      if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        return;
-      }
+    if (n > 0) {
+      c->woff += (size_t)n;
+      continue;
+    }
 
-      remove_client(c);
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
       return;
     }
 
-    c->woff += (size_t)n;
+    mark_dead(c);
+    return;
   }
 
   c->woff = c->wlen = 0;
-  mod_epoll(c->fd, EPOLLIN, c);
+  mod_epoll(c->fd, EPOLLIN | EPOLLRDHUP, c);
 }
 
 int main(void) {
@@ -409,18 +449,28 @@ int main(void) {
   signal(SIGTERM, (void (*)(int))exit);
 
   snprintf(B.sockpath, sizeof(B.sockpath), SOCK_PATH, getuid());
+
+  B.max_clients = 1024;
+  B.max_frame = 8 * 1024 * 1024;
+  B.max_write_buf_per_client = 1024 * 1024;
+  B.max_subs_per_client = 1024;
+
   B.lfd = make_listener(B.sockpath);
-  B.epfd = epoll_create1(0);
+  B.epfd = epoll_create1(EPOLL_CLOEXEC);
 
   if (B.epfd < 0) {
     die("epoll_create1");
   }
 
-  add_epoll(B.lfd, EPOLLIN, (void *)(intptr_t)B.lfd);
+  struct epoll_event lev = {.events = EPOLLIN, .data.fd = B.lfd};
 
-  struct epoll_event evs[MAX_EVENTS];
+  if (epoll_ctl(B.epfd, EPOLL_CTL_ADD, B.lfd, &lev) < 0) {
+    die("epoll_ctl");
+  }
 
   for (;;) {
+    sweep_dead();
+    struct epoll_event evs[MAX_EVENTS];
     int n = epoll_wait(B.epfd, evs, MAX_EVENTS, -1);
 
     if (n < 0) {
@@ -431,25 +481,78 @@ int main(void) {
     }
 
     for (int i = 0; i < n; i++) {
-      if ((int)(intptr_t)evs[i].data.ptr == B.lfd) {
-        int fd = accept4(B.lfd, NULL, NULL, SOCK_NONBLOCK);
+      uint32_t re = evs[i].events;
 
-        if (fd < 0) {
-          continue;
+      if (evs[i].data.fd == B.lfd) {
+        for (;;) {
+          int fd = accept4(B.lfd, NULL, NULL, SOCK_NONBLOCK);
+
+          if (fd < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            break;
+          }
+
+          if (B.num_clients >= B.max_clients) {
+            close(fd);
+            continue;
+          }
+
+          struct client *c = calloc(1, sizeof(*c));
+          c->fd = fd;
+          c->id = ++B.next_id;
+
+          c->wcap = 64 * 1024;
+          c->wbuf = malloc(c->wcap);
+
+          c->rcap = 64 * 1024;
+          c->rbuf = malloc(c->rcap);
+
+          c->previous = B.tail;
+
+          if (B.tail) {
+            B.tail->next = c;
+          } else {
+            B.head = c;
+            B.tail = c;
+            B.num_clients++;
+          }
+
+#ifdef SO_PEERCRED
+          struct ucred u;
+          socklen_t ul = sizeof(u);
+
+          if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &u, &ul) == 0) {
+            c->uid = u.uid;
+            c->gid = u.gid;
+            c->pid = u.pid;
+          }
+#endif
+
+          struct epoll_event cev = {.events = EPOLLIN | EPOLLRDHUP,
+                                    .data.ptr = c};
+
+          if (epoll_ctl(B.epfd, EPOLL_CTL_ADD, fd, &cev) < 0) {
+            mark_dead(c);
+            continue;
+          }
         }
 
-        struct client *c = add_client(fd);
-        add_epoll(fd, EPOLLIN, c);
-      } else {
-        struct client *c = (struct client *)evs[i].data.ptr;
+        continue;
+      }
 
-        if (evs[i].events & EPOLLIN) {
-          on_read(c);
-        }
+      struct client *c = (struct client *)evs[i].data.ptr;
 
-        if (evs[i].events & EPOLLOUT) {
-          on_write(c);
-        }
+      if (re & (EPOLLHUP | EPOLLERR | EPOLLRDHUP)) {
+        mark_dead(c);
+        continue;
+      }
+
+      if (re & EPOLLIN) {
+        on_read(c);
+      }
+
+      if (re & EPOLLOUT) {
+        on_write(c);
       }
     }
   }

@@ -8,7 +8,8 @@ globals {
     set STANDARD_OPTS [list -std=c11 -Os -D_POSIX_C_SOURCE=200809L \
 			   -Wall -Wextra -Wpedantic -D_GNU_SOURCE \
 			   -Wstrict-overflow -fno-strict-aliasing]
-    set DEBUG_OPTS   [list -g -O0 -DDEBUG {*}$STANDARD_OPTS]
+    set DEBUG_OPTS   [list -g3 -O0 -fno-omit-frame-pointer -fno-inline -DDEBUG \
+			  -fsanitize=address,undefined {*}$STANDARD_OPTS]
     set RELEASE_OPTS [list -O2 -DNDEBUG -s -march=native {*}$STANDARD_OPTS]
 }
 
@@ -46,16 +47,27 @@ task bear {
     }
 }
 
-command compile_demo_subscriber {
+globals {
+    set DEMO_IN [normalize-files sp_client.c sp.h sp_pub.c \
+		     sp_sub.c sp_utils.h sp_utils.c tmp/test_client.c]
+    set DEMO_OPTS [list -std=c11 -O2 -Wall -Wextra -D_GNU_SOURCE]
+   
+}
+
+task demo_sub {
+    inputs $sp::DEMO_IN
+    outputs [file normalize sp_sub_demo]
     run {
 	set -e
-	cc -std=c11 -O2 -Wall -Wextra -D_GNU_SOURCE -DBUILD_SUB sp_client.c sp.h sp_pub.c sp_sub.c sp_utils.h sp_utils.c tmp/test_client.c -o sp_sub_demo -lcbor
+	cc $sp::DEMO_OPTS -DBUILD_SUB $sp::demo_sub::inputs -o $sp::demo_sub::outputs -lcbor
     }
 }
 
-command compile_demo_publisher {
+task demo_pub {
+    inputs $sp::DEMO_IN
+    outputs [file normalize sp_pub_demo]
     run {
 	set -e
-	cc -std=c11 -O2 -Wall -Wextra -D_GNU_SOURCE -DBUILD_PUB sp_client.c sp.h sp_pub.c sp_sub.c sp_utils.h sp_utils.c tmp/test_client.c -o sp_pub_demo -lcbor
+	cc $sp::DEMO_OPTS -DBUILD_PUB $sp::demo_pub::inputs -o $sp::demo_pub::outputs -lcbor
     }
 }

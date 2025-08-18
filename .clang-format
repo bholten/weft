@@ -7,5 +7,6 @@ AllowShortIfStatementsOnASingleLine: WithoutElse
 AllowShortLoopsOnASingleLine: false
 BreakBeforeBraces: Attach
 BreakStringLiterals: false
+IndentCaseLabels: true
 PointerAlignment: Right
 SpaceBeforeSquareBrackets: false
