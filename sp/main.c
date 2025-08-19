@@ -21,6 +21,14 @@
 
 #include "sp.h"
 
+#ifdef DEBUG
+#define DEBUG_PRINTF(...) fprintf(stderr, "DEBUG: " __VA_ARGS__);
+#else
+#define DEBUG_PRINTF(...)                                                      \
+  do {                                                                         \
+  } while (0);
+#endif
+
 static struct broker B = {0};
 
 static void die(const char *m) {
@@ -54,13 +62,17 @@ static void mark_dead(struct client *c) {
 }
 
 static void sweep_dead(void) {
+  DEBUG_PRINTF("sweeping...\n");
   struct client *c = B.dead_head;
   B.dead_head = NULL;
 
   while (c) {
+    DEBUG_PRINTF("dead %d\n", c->id);
+
     struct client *next = c->next;
 
     if (c->previous) {
+      // TODO ASan barfs here when connecting multiple clients:
       c->previous->next = c->next;
     } else {
       B.head = c->next;
@@ -72,7 +84,11 @@ static void sweep_dead(void) {
       B.tail = c->previous;
     }
 
-    B.num_clients--;
+    if (B.num_clients > 0) {
+      B.num_clients--;
+    }
+
+    DEBUG_PRINTF("new number of clients: %zu\n", B.num_clients);
 
     epoll_ctl(B.epfd, EPOLL_CTL_DEL, c->fd, NULL);
     close(c->fd);
@@ -114,26 +130,6 @@ static int make_listener(const char *path) {
   set_nonblock(fd);
 
   return fd;
-}
-
-static void add_epoll(int fd, uint32_t evt, void *ptr) {
-  struct epoll_event e = {.events = evt, .data.ptr = ptr};
-
-  if (epoll_ctl(B.epfd, EPOLL_CTL_ADD, fd, &e) < 0) {
-    die("epoll add");
-  }
-}
-
-static void mod_epoll(int fd, uint32_t evt, void *ptr) {
-  struct epoll_event e = {.events = evt, .data.ptr = ptr};
-
-  if (epoll_ctl(B.epfd, EPOLL_CTL_MOD, fd, &e) < 0) {
-    die("epoll mod");
-  }
-}
-
-static void del_epoll(int fd) {
-  epoll_ctl(B.epfd, EPOLL_CTL_DEL, fd, NULL);
 }
 
 struct client *add_client(struct broker *b, int fd) {
@@ -300,7 +296,7 @@ static void handle_payload(struct client *c, struct sp_frame *h,
   switch (h->kind) {
     case SP_REGISTER: break;
     case SP_SUB: {
-      printf("[sp] SP_SUB %d\n", c->id);
+      DEBUG_PRINTF("[sp] SP_SUB %d\n", c->id);
       char topic[512] = {0};
 
       if (!cbor_get_str(payload, ntohl(h->length), "topic", topic,
@@ -330,8 +326,12 @@ static void handle_payload(struct client *c, struct sp_frame *h,
 
       c->nsubs++;
     } break;
+    case SP_UNSUB: {
+      DEBUG_PRINTF("SP_UNSUB %d\n", c->id);
+      mark_dead(c);
+    } break;
     case SP_PUBLISH: {
-      printf("[sp] SP_PUBLISH %d\n", c->id);
+      DEBUG_PRINTF("SP_PUBLISH %d\n", c->id);
       route_publish(c, h, payload);
     } break;
     case SP_PING: {
@@ -339,7 +339,13 @@ static void handle_payload(struct client *c, struct sp_frame *h,
       oh.kind = 6;
       queue_bytes(c, &oh, sizeof(oh));
       queue_bytes(c, payload, ntohl(h->length));
-      mod_epoll(c->fd, EPOLLIN | EPOLLOUT, c);
+
+      struct epoll_event e = {.events = EPOLLIN | EPOLLOUT, .data.ptr = c};
+
+      if (epoll_ctl(B.epfd, EPOLL_CTL_MOD, c->fd, &e) < 0) {
+        die("epoll_ctl(EPOLL_CTL_MOD)");
+      }
+
     } break;
     case SP_BYE: {
       mark_dead(c);
@@ -440,7 +446,12 @@ static void on_write(struct client *c) {
   }
 
   c->woff = c->wlen = 0;
-  mod_epoll(c->fd, EPOLLIN | EPOLLRDHUP, c);
+
+  struct epoll_event e = {.events = EPOLLIN | EPOLLRDHUP, .data.ptr = c};
+
+  if (epoll_ctl(B.epfd, EPOLL_CTL_MOD, c->fd, &e) < 0) {
+    die("epoll_mod(EPOLL_CTL_MOD)");
+  }
 }
 
 int main(void) {
