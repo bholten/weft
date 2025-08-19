@@ -4,6 +4,11 @@
 #include <cbor/maps.h>
 #include <cbor/strings.h>
 #include <errno.h>
+#include <event2/buffer.h>
+#include <event2/bufferevent.h>
+#include <event2/event.h>
+#include <event2/listener.h>
+#include <event2/util.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <signal.h>
@@ -12,7 +17,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -46,11 +50,49 @@ static void cleanup(void) {
     close(B.lfd);
   }
 
-  if (B.epfd > 0) {
-    close(B.epfd);
+  unlink(B.sockpath);
+}
+
+static void link_client(struct client *c) {
+  c->previous = B.tail;
+  c->next = NULL;
+
+  if (B.tail) {
+    B.tail->next = c;
+  } else {
+    B.head = c;
   }
 
-  unlink(B.sockpath);
+  B.tail = c;
+}
+
+static void unlink_client(struct client *c) {
+  if (c->previous) {
+    c->previous->next = c->next;
+  } else {
+    B.head = c->next;
+  }
+
+  if (c->next) {
+    c->next->previous = c->previous;
+  } else {
+    B.tail = c->previous;
+  }
+}
+
+static void free_client(struct client *c) {
+  if (!c) return;
+
+  if (c->bev) {
+    bufferevent_free(c->bev);
+  }
+
+  for (size_t i = 0; i < c->nsubs; i++) {
+    free(c->subs[i].prefix);
+  }
+
+  free(c->subs);
+  free(c);
 }
 
 static void mark_dead(struct client *c) {
@@ -89,9 +131,6 @@ static void sweep_dead(void) {
     }
 
     DEBUG_PRINTF("new number of clients: %zu\n", B.num_clients);
-
-    epoll_ctl(B.epfd, EPOLL_CTL_DEL, c->fd, NULL);
-    close(c->fd);
 
     for (size_t i = 0; i < c->nsubs; i++) {
       free(c->subs[i].prefix);
@@ -133,6 +172,8 @@ static int make_listener(const char *path) {
 }
 
 struct client *add_client(struct broker *b, int fd) {
+  (void)b;
+
   struct client *c = calloc(1, sizeof(*c));
   c->fd = fd;
   c->id = ++B.next_id;
@@ -217,30 +258,6 @@ static int cbor_get_str(const uint8_t *buf, size_t len, const char *key,
   return ok;
 }
 
-static int queue_bytes(struct client *c, const void *data, size_t n) {
-  size_t need = c->wlen + n;
-
-  if (need > c->wcap) {
-    size_t newcap = c->wcap ? c->wcap * 2 : 65536;
-
-    while (newcap < need) {
-      newcap <<= 1;
-    }
-
-    void *np = realloc(c->wbuf, newcap);
-
-    if (!np) return -1;
-
-    c->wbuf = np;
-    c->wcap = newcap;
-  }
-
-  memcpy(c->wbuf + c->wlen, data, n);
-  c->wlen += n;
-
-  return 0;
-}
-
 static void route_publish(struct client *from, const struct sp_frame *h,
                           const uint8_t *payload) {
   char topic[512];
@@ -278,13 +295,10 @@ static void route_publish(struct client *from, const struct sp_frame *h,
 
     if (c->dead) continue;
 
-    if (queue_bytes(c, h, sizeof(*h)) < 0 ||
-        queue_bytes(c, payload, paylen) < 0) {
-      mark_dead(c);
-    } else {
-      struct epoll_event e = {.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP,
-                              .data.ptr = c};
-      epoll_ctl(B.epfd, EPOLL_CTL_MOD, c->fd, &e);
+    bufferevent_write(c->bev, h, sizeof(*h));
+
+    if (ntohl(h->length)) {
+      bufferevent_write(c->bev, payload, ntohl(h->length));
     }
   }
 
@@ -335,16 +349,6 @@ static void handle_payload(struct client *c, struct sp_frame *h,
       route_publish(c, h, payload);
     } break;
     case SP_PING: {
-      struct sp_frame oh = *h;
-      oh.kind = 6;
-      queue_bytes(c, &oh, sizeof(oh));
-      queue_bytes(c, payload, ntohl(h->length));
-
-      struct epoll_event e = {.events = EPOLLIN | EPOLLOUT, .data.ptr = c};
-
-      if (epoll_ctl(B.epfd, EPOLL_CTL_MOD, c->fd, &e) < 0) {
-        die("epoll_ctl(EPOLL_CTL_MOD)");
-      }
 
     } break;
     case SP_BYE: {
@@ -354,104 +358,109 @@ static void handle_payload(struct client *c, struct sp_frame *h,
   }
 }
 
-static void on_read(struct client *c) {
+static int try_pop_frame(struct evbuffer *in, struct sp_frame *hdr,
+                         uint8_t **payload, size_t *plen) {
+  size_t have = evbuffer_get_length(in);
+
+  if (have < sizeof(*hdr)) {
+    return 0;
+  }
+
+  struct sp_frame tmp;
+  evbuffer_copyout(in, &tmp, sizeof(tmp));
+
+  uint32_t magic = ntohl(tmp.magic);
+  uint32_t len = ntohl(tmp.length);
+
+  if (magic != SP_MAGIC || tmp.codec != 1) return -1;
+  if (len > B.max_frame) return -1;
+  if (have < sizeof(tmp) + len) return 0;
+
+  evbuffer_drain(in, sizeof(tmp));
+  *payload = malloc(len);
+
+  if (!*payload) return -1;
+
+  evbuffer_remove(in, *payload, len);
+  *hdr = tmp;
+  *plen = len;
+  return 1;
+}
+
+static void on_read(struct bufferevent *bev, void *ctx) {
+  struct client *c = (struct client *)ctx;
+  struct evbuffer *in = bufferevent_get_input(bev);
+
   for (;;) {
-    while (c->rlen < sizeof(struct sp_frame)) {
-      ssize_t r = read(c->fd, (char *)c->rbuf + c->rlen, c->rcap - c->rlen);
+    struct sp_frame hdr;
+    uint8_t *pl = NULL;
+    size_t len = 0;
 
-      if (r == 0) {
-        mark_dead(c);
-        return;
-      }
+    int r = try_pop_frame(in, &hdr, &pl, &len);
 
-      if (r < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-          return;
-        }
+    if (r == 0) break;
 
-        mark_dead(c);
-        return;
-      }
-
-      c->rlen += (size_t)r;
-
-      if (c->rlen >= c->rcap) {
-        c->rcap <<= 1;
-        c->rbuf = realloc(c->rbuf, c->rcap);
-      }
-    }
-
-    struct sp_frame *h = (struct sp_frame *)c->rbuf;
-
-    if (ntohl(h->magic) != SP_MAGIC) {
-      mark_dead(c);
+    if (r < 0) {
+      bufferevent_free(bev);
       return;
     }
 
-    uint32_t need = sizeof(*h) + ntohl(h->length);
-
-    if (need > MAX_FRAME + sizeof(*h)) {
-      mark_dead(c);
-      return;
-    }
-
-    while (c->rlen < need) {
-      ssize_t r = read(c->fd, (char *)c->rbuf + c->rlen, c->rcap - c->rlen);
-
-      if (r == 0) {
-        mark_dead(c);
-        return;
-      }
-
-      if (r < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-          return;
-        }
-        mark_dead(c);
-        return;
-      }
-
-      c->rlen += (size_t)r;
-
-      if (c->rlen >= c->rcap) {
-        c->rcap <<= 1;
-        c->rbuf = realloc(c->rbuf, c->rcap);
-      }
-    }
-
-    uint8_t *payload = c->rbuf + sizeof(*h);
-    handle_payload(c, h, payload);
-
-    size_t left = c->rlen - need;
-    memmove(c->rbuf, c->rbuf + need, left);
-    c->rlen = left;
+    handle_payload(c, &hdr, pl);
+    free(pl);
   }
 }
 
-static void on_write(struct client *c) {
-  while (c->woff < c->wlen) {
-    ssize_t n = write(c->fd, c->wbuf + c->woff, c->wlen - c->woff);
+static void on_write(struct bufferevent *bev, void *ctx) {
+  struct client *c = (struct client *)ctx;
 
-    if (n > 0) {
-      c->woff += (size_t)n;
-      continue;
-    }
+  size_t outlen = evbuffer_get_length(bufferevent_get_output(bev));
+  if (outlen > B.max_write_buf_per_client) {
+    unlink_client(c);
+    free(c);
+  }
+}
 
-    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-      return;
-    }
+static void on_event(struct bufferevent *bev, short what, void *ctx) {
+  (void)bev;
 
-    mark_dead(c);
+  struct client *c = (struct client *)ctx;
+
+  if (what & (BEV_EVENT_ERROR | BEV_EVENT_EOF | BEV_EVENT_TIMEOUT)) {
+    unlink_client(c);
+    free_client(c);
+  }
+}
+
+static void on_accept(struct evconnlistener *lev, evutil_socket_t fd,
+                      struct sockaddr *sa, int socklen, void *arg) {
+  (void)lev;
+  (void)sa;
+  (void)socklen;
+  (void)(arg);
+
+  evutil_make_socket_nonblocking(fd);
+
+  struct client *c = calloc(1, sizeof(*c));
+  c->id = ++B.next_id;
+  c->bev = bufferevent_socket_new(
+      B.base, fd, BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS);
+
+  if (!c->bev) {
+    close(fd);
+    free(c);
     return;
   }
 
-  c->woff = c->wlen = 0;
+  link_client(c);
 
-  struct epoll_event e = {.events = EPOLLIN | EPOLLRDHUP, .data.ptr = c};
+  bufferevent_setcb(c->bev, on_read, on_write, on_event, c);
+  bufferevent_setwatermark(c->bev, EV_READ, 0, B.max_frame + 64);
 
-  if (epoll_ctl(B.epfd, EPOLL_CTL_MOD, c->fd, &e) < 0) {
-    die("epoll_mod(EPOLL_CTL_MOD)");
-  }
+  struct timeval rto = {60, 0};
+  struct timeval wto = {60, 0};
+  bufferevent_set_timeouts(c->bev, &rto, &wto);
+
+  bufferevent_enable(c->bev, EV_READ);
 }
 
 int main(void) {
@@ -466,107 +475,19 @@ int main(void) {
   B.max_write_buf_per_client = 1024 * 1024;
   B.max_subs_per_client = 1024;
 
+  B.base = event_base_new();
   B.lfd = make_listener(B.sockpath);
-  B.epfd = epoll_create1(EPOLL_CLOEXEC);
+  B.lev =
+      evconnlistener_new(B.base, on_accept, NULL,
+                         LEV_OPT_CLOSE_ON_FREE | LEV_OPT_REUSEABLE, -1, B.lfd);
 
-  if (B.epfd < 0) {
-    die("epoll_create1");
-  }
-
-  struct epoll_event lev = {.events = EPOLLIN, .data.fd = B.lfd};
-
-  if (epoll_ctl(B.epfd, EPOLL_CTL_ADD, B.lfd, &lev) < 0) {
-    die("epoll_ctl");
-  }
-
-  for (;;) {
+  for (B.running = 1; B.running;) {
     sweep_dead();
-    struct epoll_event evs[MAX_EVENTS];
-    int n = epoll_wait(B.epfd, evs, MAX_EVENTS, -1);
-
-    if (n < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      die("epoll_wait");
-    }
-
-    for (int i = 0; i < n; i++) {
-      uint32_t re = evs[i].events;
-
-      if (evs[i].data.fd == B.lfd) {
-        for (;;) {
-          int fd = accept4(B.lfd, NULL, NULL, SOCK_NONBLOCK);
-
-          if (fd < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-            break;
-          }
-
-          if (B.num_clients >= B.max_clients) {
-            close(fd);
-            continue;
-          }
-
-          struct client *c = calloc(1, sizeof(*c));
-          c->fd = fd;
-          c->id = ++B.next_id;
-
-          c->wcap = 64 * 1024;
-          c->wbuf = malloc(c->wcap);
-
-          c->rcap = 64 * 1024;
-          c->rbuf = malloc(c->rcap);
-
-          c->previous = B.tail;
-
-          if (B.tail) {
-            B.tail->next = c;
-          } else {
-            B.head = c;
-            B.tail = c;
-            B.num_clients++;
-          }
-
-#ifdef SO_PEERCRED
-          struct ucred u;
-          socklen_t ul = sizeof(u);
-
-          if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &u, &ul) == 0) {
-            c->uid = u.uid;
-            c->gid = u.gid;
-            c->pid = u.pid;
-          }
-#endif
-
-          struct epoll_event cev = {.events = EPOLLIN | EPOLLRDHUP,
-                                    .data.ptr = c};
-
-          if (epoll_ctl(B.epfd, EPOLL_CTL_ADD, fd, &cev) < 0) {
-            mark_dead(c);
-            continue;
-          }
-        }
-
-        continue;
-      }
-
-      struct client *c = (struct client *)evs[i].data.ptr;
-
-      if (re & (EPOLLHUP | EPOLLERR | EPOLLRDHUP)) {
-        mark_dead(c);
-        continue;
-      }
-
-      if (re & EPOLLIN) {
-        on_read(c);
-      }
-
-      if (re & EPOLLOUT) {
-        on_write(c);
-      }
-    }
+    event_base_loop(B.base, EVLOOP_ONCE);
   }
+
+  evconnlistener_free(B.lev);
+  event_base_free(B.base);
 
   return 0;
 }

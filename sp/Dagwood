@@ -2,7 +2,7 @@ project sp
 
 globals {
     set CC cc
-    set LINK_OPTS [list -lcbor]
+    set LINK_OPTS [list -lcbor -levent]
     set SOURCE [normalize-files {*}[glob *.c *.h]]
     set OUT [file normalize build/sp]
     set STANDARD_OPTS [list -std=c11 -Os -D_POSIX_C_SOURCE=200809L \
@@ -15,7 +15,7 @@ globals {
 
 task setup {
     run {
-	mkdir -p build
+	mkdir -p [file normalize build]
     }
 }
 
@@ -71,3 +71,7 @@ task demo_pub {
 	cc $sp::DEMO_OPTS -DBUILD_PUB $sp::demo_pub::inputs -o $sp::demo_pub::outputs -lcbor
     }
 }
+
+
+set wd [pwd]
+puts "pwd => $wd"

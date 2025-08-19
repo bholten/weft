@@ -1,6 +1,7 @@
 #ifndef SP_H
 #define SP_H
 
+#include <event2/event.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -34,13 +35,16 @@ struct sub {
 };
 
 struct client {
-  int fd;
+  int fd; // todo remove?
   int id;
 
-  uid_t uid;
-  gid_t gid;
-  pid_t pid;
+  uid_t uid; // todo remove?
+  gid_t gid; // todo remove?
+  pid_t pid; // todo remove?
 
+  struct bufferevent *bev;
+
+  // TODO remove below?
   uint8_t *rbuf;
   size_t rcap;
   size_t rlen;
@@ -73,13 +77,16 @@ struct sp_poller {
 
 struct broker {
   int lfd;
-  int epfd;
+
+  struct event_base *base;
+  struct evconnlistener *lev;
 
   int running;
   int next_id;
 
   struct client *head;
   struct client *tail;
+
   size_t num_clients;
   size_t max_clients;
 
@@ -87,6 +94,7 @@ struct broker {
 
   size_t max_frame;
   size_t max_write_buf_per_client;
+  size_t max_out_bytes;
   size_t max_subs_per_client;
 
   struct client *dead_head;

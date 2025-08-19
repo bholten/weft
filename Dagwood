@@ -1,2 +1,4 @@
+import protocol sp/Dagwood
+
 project weft
 
