@@ -14,8 +14,11 @@ set(WEFT_SOURCES
   src/platform.c
   src/renderer.c
   src/input.c
-  src/annotation.c
+  src/annot_store.c
+  src/buffer.c
   src/editor.c
+  src/pane.c
+  src/layout.c
 )
 
 set(CMAKE_C_STANDARD 11)

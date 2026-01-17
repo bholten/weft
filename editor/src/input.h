@@ -32,6 +32,7 @@ typedef struct {
             int x;
             int y;
             int button;
+            SDL_Keymod mod;
         } mouse;
         struct {
             float dx;

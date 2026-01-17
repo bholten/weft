@@ -45,7 +45,11 @@ bool renderer_load_font(Renderer *r, const char *path, int size) {
         return false;
     }
 
-    TTF_Font *ttf_font = TTF_OpenFont(path, size);
+    // Scale font size by DPI for crisp rendering on high-DPI displays
+    float dpi_scale = platform_get_dpi_scale(r->platform);
+    int scaled_size = (int)(size * dpi_scale);
+
+    TTF_Font *ttf_font = TTF_OpenFont(path, scaled_size);
     if (!ttf_font) {
         SDL_LogError(SDL_LOG_CATEGORY_CUSTOM, "TTF_OpenFont failed: %s", SDL_GetError());
         return false;
@@ -96,7 +100,14 @@ void renderer_clear(Renderer *r, uint8_t red, uint8_t green, uint8_t blue) {
 }
 
 void renderer_draw_text(Renderer *r, const char *text, int x, int y, SDL_Color color) {
-    if (!r || !r->platform || !r->font || !r->font->font || !text) {
+    if (!text) {
+        return;
+    }
+    renderer_draw_text_n(r, text, strlen(text), x, y, color);
+}
+
+void renderer_draw_text_n(Renderer *r, const char *text, size_t len, int x, int y, SDL_Color color) {
+    if (!r || !r->platform || !r->font || !r->font->font || !text || len == 0) {
         return;
     }
 
@@ -105,12 +116,7 @@ void renderer_draw_text(Renderer *r, const char *text, int x, int y, SDL_Color c
         return;
     }
 
-    size_t len = strlen(text);
-    if (len == 0) {
-        return;
-    }
-
-    SDL_Surface *surface = TTF_RenderText_Solid(r->font->font, text, len, color);
+    SDL_Surface *surface = TTF_RenderText_Blended(r->font->font, text, len, color);
     if (!surface) {
         return;
     }
@@ -154,6 +160,20 @@ void renderer_draw_rect(Renderer *r, int x, int y, int w, int h, SDL_Color color
     };
 
     SDL_RenderFillRect(sdl_renderer, &rect);
+}
+
+void renderer_draw_line(Renderer *r, int x1, int y1, int x2, int y2, SDL_Color color) {
+    if (!r || !r->platform) {
+        return;
+    }
+
+    SDL_Renderer *sdl_renderer = platform_get_sdl_renderer(r->platform);
+    if (!sdl_renderer) {
+        return;
+    }
+
+    SDL_SetRenderDrawColor(sdl_renderer, color.r, color.g, color.b, color.a);
+    SDL_RenderLine(sdl_renderer, (float)x1, (float)y1, (float)x2, (float)y2);
 }
 
 void renderer_present(Renderer *r) {

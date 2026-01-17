@@ -1,0 +1,3 @@
+[submodule "submodules/lcl"]
+	path = submodules/lcl
+	url = git@github.com:bholten/lcl.git

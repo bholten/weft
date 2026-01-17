@@ -15,8 +15,11 @@
 #include "renderer.h"
 #include "input.h"
 #include "document.h"
-#include "annotation.h"
+#include "annot_store.h"
+#include "buffer.h"
 #include "editor.h"
+#include "pane.h"
+#include "layout.h"
 
 static void test_document(void) {
     printf("=== Document Tests ===\n");
@@ -111,9 +114,6 @@ typedef struct {
 } AppContext;
 
 SDL_AppResult SDL_AppInit(void **app_state, int argc, char **argv) {
-    (void)argc;
-    (void)argv;
-
     test_document();
 
     // Create application context
@@ -147,41 +147,104 @@ SDL_AppResult SDL_AppInit(void **app_state, int argc, char **argv) {
         return SDL_APP_FAILURE;
     }
 
-    // Create sample document
-    const char *sample_text = "Hello, Weft!\nThis is a test document.\nLine 3 here.";
-    ctx->app.document = document_from_string(sample_text, strlen(sample_text));
-    if (!ctx->app.document) {
+    // Create buffer manager
+    ctx->app.buffers = buffer_manager_new();
+    if (!ctx->app.buffers) {
         renderer_free(ctx->app.renderer);
         platform_free(ctx->app.platform);
         free(ctx);
         return SDL_APP_FAILURE;
     }
 
-    // Create annotation store (empty for now)
-    ctx->app.annotations = annotation_new();
-    if (!ctx->app.annotations) {
-        document_free(ctx->app.document);
+    // Create initial buffer (load file or create empty)
+    Buffer *initial_buffer = NULL;
+    if (argc > 1) {
+        initial_buffer = buffer_manager_open_file(ctx->app.buffers, argv[1]);
+        if (!initial_buffer) {
+            SDL_LogError(SDL_LOG_CATEGORY_CUSTOM, "Failed to load file: %s", argv[1]);
+        }
+    }
+    if (!initial_buffer) {
+        initial_buffer = buffer_manager_create(ctx->app.buffers);
+    }
+    if (!initial_buffer) {
+        buffer_manager_free(ctx->app.buffers);
         renderer_free(ctx->app.renderer);
         platform_free(ctx->app.platform);
         free(ctx);
         return SDL_APP_FAILURE;
     }
 
-    // Create editor
-    ctx->app.editor = editor_new(ctx->app.document);
-    if (!ctx->app.editor) {
-        annotation_free(ctx->app.annotations);
-        document_free(ctx->app.document);
-        renderer_free(ctx->app.renderer);
-        platform_free(ctx->app.platform);
-        free(ctx);
-        return SDL_APP_FAILURE;
+    // Add test content and annotations if buffer is empty (new buffer)
+    if (document_length(initial_buffer->document) == 0) {
+        const char *test_text = "Hello, Weft!\nThis is styled text with annotations.\nRed, green, and blue words here.\nUnderlined text too!";
+        document_insert(initial_buffer->document, 0, test_text, strlen(test_text));
+
+        // Add test annotations to demonstrate styling
+        // "Weft" in cyan (bytes 7-11 of line 1)
+        const char *keys1[] = { "style:fg" };
+        const char *vals1[] = { "cyan" };
+        annot_store_add(initial_buffer->annots, 7, 11, "style", keys1, vals1, 1);
+
+        // "styled" in yellow with underline (line 2)
+        const char *keys2[] = { "style:fg", "style:underline" };
+        const char *vals2[] = { "yellow", "true" };
+        annot_store_add(initial_buffer->annots, 21, 27, "style", keys2, vals2, 2);
+
+        // "Red" in red (line 3)
+        const char *keys3[] = { "style:fg" };
+        const char *vals3[] = { "red" };
+        annot_store_add(initial_buffer->annots, 60, 63, "style", keys3, vals3, 1);
+
+        // "green" in green (line 3)
+        const char *keys4[] = { "style:fg" };
+        const char *vals4[] = { "green" };
+        annot_store_add(initial_buffer->annots, 65, 70, "style", keys4, vals4, 1);
+
+        // "blue" in blue (line 3)
+        const char *keys5[] = { "style:fg" };
+        const char *vals5[] = { "#0088FF" };
+        annot_store_add(initial_buffer->annots, 76, 80, "style", keys5, vals5, 1);
+
+        // "Underlined" with underline and orange bg (line 4)
+        const char *keys6[] = { "style:underline", "style:bg" };
+        const char *vals6[] = { "true", "#442200" };
+        annot_store_add(initial_buffer->annots, 94, 104, "style", keys6, vals6, 2);
+
+        printf("Added test annotations for styling demo\n");
     }
 
-    // Set editor layout from renderer metrics
+    // Get renderer metrics for pane creation
     int char_width = renderer_get_char_width(ctx->app.renderer);
     int line_height = renderer_get_line_height(ctx->app.renderer);
-    editor_set_layout(ctx->app.editor, char_width, line_height, 10, 10);
+
+    // Create initial pane with the buffer
+    Pane *initial_pane = pane_new(initial_buffer, char_width, line_height);
+    if (!initial_pane) {
+        buffer_manager_free(ctx->app.buffers);
+        renderer_free(ctx->app.renderer);
+        platform_free(ctx->app.platform);
+        free(ctx);
+        return SDL_APP_FAILURE;
+    }
+
+    // Create layout root with the pane
+    ctx->app.layout_root = layout_leaf_new(initial_pane);
+    if (!ctx->app.layout_root) {
+        pane_free(initial_pane);
+        buffer_manager_free(ctx->app.buffers);
+        renderer_free(ctx->app.renderer);
+        platform_free(ctx->app.platform);
+        free(ctx);
+        return SDL_APP_FAILURE;
+    }
+
+    // Set focused pane
+    ctx->app.focused_pane = initial_pane;
+
+    // Compute initial bounds
+    SDL_Rect window_rect = { .x = 0, .y = 0, .w = 800, .h = 600 };
+    layout_compute_bounds(ctx->app.layout_root, window_rect);
 
     // Initialize input state
     input_state_init(&ctx->input_state);
@@ -193,6 +256,168 @@ SDL_AppResult SDL_AppInit(void **app_state, int argc, char **argv) {
     *app_state = ctx;
 
     return SDL_APP_CONTINUE;
+}
+
+// Helper to create a new pane with a new buffer
+static Pane *create_new_pane(AppContext *ctx) {
+    Buffer *new_buffer = buffer_manager_create(ctx->app.buffers);
+    if (!new_buffer) {
+        return NULL;
+    }
+
+    int char_width = renderer_get_char_width(ctx->app.renderer);
+    int line_height = renderer_get_line_height(ctx->app.renderer);
+
+    Pane *new_pane = pane_new(new_buffer, char_width, line_height);
+    if (!new_pane) {
+        buffer_manager_close(ctx->app.buffers, new_buffer);
+        return NULL;
+    }
+
+    return new_pane;
+}
+
+// Helper to get window bounds
+static SDL_Rect get_window_rect(AppContext *ctx) {
+    int w, h;
+    SDL_GetWindowSize(platform_get_window(ctx->app.platform), &w, &h);
+    return (SDL_Rect){ .x = 0, .y = 0, .w = w, .h = h };
+}
+
+// File dialog callback data
+typedef struct {
+    AppContext *ctx;
+    Pane *target_pane;
+    bool save_as;  // true for SaveAs, false for Open
+} FileDialogData;
+
+// Open file dialog callback
+static void open_file_callback(void *userdata, const char * const *filelist, int filter) {
+    (void)filter;
+    FileDialogData *data = (FileDialogData *)userdata;
+
+    if (filelist && filelist[0]) {
+        Buffer *buf = pane_get_buffer(data->target_pane);
+        if (buf) {
+            buffer_load(buf, filelist[0]);
+        }
+    }
+
+    free(data);
+}
+
+// Save file dialog callback
+static void save_file_callback(void *userdata, const char * const *filelist, int filter) {
+    (void)filter;
+    FileDialogData *data = (FileDialogData *)userdata;
+
+    if (filelist && filelist[0]) {
+        Buffer *buf = pane_get_buffer(data->target_pane);
+        if (buf) {
+            buffer_save_as(buf, filelist[0]);
+        }
+    }
+
+    free(data);
+}
+
+// Handle tag bar command
+static void handle_tag_command(AppContext *ctx, Pane *pane, TagCommand cmd) {
+    switch (cmd) {
+        case TAG_CMD_NEW: {
+            // Create new buffer in current pane
+            Buffer *buf = pane_get_buffer(pane);
+            if (buf && buf->ref_count <= 1) {
+                // If buffer has no other refs, just clear it
+                document_delete(buf->document, 0, document_length(buf->document));
+                free(buf->file_path);
+                buf->file_path = NULL;
+                buf->modified = false;
+            }
+            break;
+        }
+
+        case TAG_CMD_OPEN: {
+            FileDialogData *data = calloc(1, sizeof(FileDialogData));
+            if (data) {
+                data->ctx = ctx;
+                data->target_pane = pane;
+                data->save_as = false;
+                SDL_ShowOpenFileDialog(
+                    open_file_callback,
+                    data,
+                    platform_get_window(ctx->app.platform),
+                    NULL,  // No filters
+                    0,     // No filter count
+                    NULL,  // Default location
+                    false  // Single file
+                );
+            }
+            break;
+        }
+
+        case TAG_CMD_SAVE: {
+            Buffer *buf = pane_get_buffer(pane);
+            if (buf) {
+                if (buf->file_path) {
+                    buffer_save(buf);
+                } else {
+                    // No path - fall through to SaveAs
+                    FileDialogData *data = calloc(1, sizeof(FileDialogData));
+                    if (data) {
+                        data->ctx = ctx;
+                        data->target_pane = pane;
+                        data->save_as = true;
+                        SDL_ShowSaveFileDialog(
+                            save_file_callback,
+                            data,
+                            platform_get_window(ctx->app.platform),
+                            NULL,
+                            0,
+                            NULL
+                        );
+                    }
+                }
+            }
+            break;
+        }
+
+        case TAG_CMD_SAVEAS: {
+            FileDialogData *data = calloc(1, sizeof(FileDialogData));
+            if (data) {
+                data->ctx = ctx;
+                data->target_pane = pane;
+                data->save_as = true;
+                SDL_ShowSaveFileDialog(
+                    save_file_callback,
+                    data,
+                    platform_get_window(ctx->app.platform),
+                    NULL,
+                    0,
+                    NULL
+                );
+            }
+            break;
+        }
+
+        case TAG_CMD_DEL: {
+            // Close this pane (like Ctrl+W)
+            Pane *next = layout_next_pane(ctx->app.layout_root, pane);
+            if (next && next != pane) {
+                ctx->app.layout_root = layout_close_pane(ctx->app.layout_root, pane);
+                ctx->app.focused_pane = next;
+                if (ctx->app.layout_root) {
+                    layout_compute_bounds(ctx->app.layout_root, get_window_rect(ctx));
+                } else {
+                    ctx->app.running = false;
+                }
+            }
+            break;
+        }
+
+        default:
+            break;
+    }
 }
 
 SDL_AppResult SDL_AppEvent(void *app_state, SDL_Event *event) {
@@ -207,9 +432,76 @@ SDL_AppResult SDL_AppEvent(void *app_state, SDL_Event *event) {
     // Handle resize
     if (event->type == SDL_EVENT_WINDOW_RESIZED) {
         platform_update_size(ctx->app.platform);
+        SDL_Rect window_rect = { .x = 0, .y = 0, .w = event->window.data1, .h = event->window.data2 };
+        layout_compute_bounds(ctx->app.layout_root, window_rect);
     }
 
-    // Convert SDL events to InputEvents and dispatch to editor
+    // Handle app-level key commands (split/close/focus)
+    if (event->type == SDL_EVENT_KEY_DOWN && (event->key.mod & SDL_KMOD_CTRL)) {
+        SDL_Keycode key = event->key.key;
+
+        // Ctrl+2: Split horizontally
+        if (key == SDLK_2) {
+            Pane *new_pane = create_new_pane(ctx);
+            if (new_pane) {
+                LayoutNode *current_leaf = layout_find_pane(ctx->app.layout_root, ctx->app.focused_pane);
+                if (current_leaf) {
+                    LayoutNode *new_split = layout_split_horizontal(current_leaf, new_pane);
+                    if (new_split && !new_split->parent) {
+                        ctx->app.layout_root = new_split;
+                    }
+                    layout_compute_bounds(ctx->app.layout_root, get_window_rect(ctx));
+                    ctx->app.focused_pane = new_pane;
+                }
+            }
+            return SDL_APP_CONTINUE;
+        }
+
+        // Ctrl+3: Split vertically
+        if (key == SDLK_3) {
+            Pane *new_pane = create_new_pane(ctx);
+            if (new_pane) {
+                LayoutNode *current_leaf = layout_find_pane(ctx->app.layout_root, ctx->app.focused_pane);
+                if (current_leaf) {
+                    LayoutNode *new_split = layout_split_vertical(current_leaf, new_pane);
+                    if (new_split && !new_split->parent) {
+                        ctx->app.layout_root = new_split;
+                    }
+                    layout_compute_bounds(ctx->app.layout_root, get_window_rect(ctx));
+                    ctx->app.focused_pane = new_pane;
+                }
+            }
+            return SDL_APP_CONTINUE;
+        }
+
+        // Ctrl+W: Close current pane
+        if (key == SDLK_W) {
+            Pane *next = layout_next_pane(ctx->app.layout_root, ctx->app.focused_pane);
+            if (next && next != ctx->app.focused_pane) {
+                ctx->app.layout_root = layout_close_pane(ctx->app.layout_root, ctx->app.focused_pane);
+                ctx->app.focused_pane = next;
+                if (ctx->app.layout_root) {
+                    layout_compute_bounds(ctx->app.layout_root, get_window_rect(ctx));
+                } else {
+                    // No panes left, quit
+                    ctx->app.running = false;
+                    return SDL_APP_SUCCESS;
+                }
+            }
+            return SDL_APP_CONTINUE;
+        }
+
+        // Ctrl+Tab: Cycle focus
+        if (key == SDLK_TAB) {
+            Pane *next = layout_next_pane(ctx->app.layout_root, ctx->app.focused_pane);
+            if (next) {
+                ctx->app.focused_pane = next;
+            }
+            return SDL_APP_CONTINUE;
+        }
+    }
+
+    // Convert SDL events to InputEvents and dispatch
     InputEvent input_event = { .type = INPUT_NONE };
 
     switch (event->type) {
@@ -231,29 +523,186 @@ SDL_AppResult SDL_AppEvent(void *app_state, SDL_Event *event) {
             input_event.text.text[sizeof(input_event.text.text) - 1] = '\0';
             break;
 
-        case SDL_EVENT_MOUSE_BUTTON_DOWN:
-            input_event.type = INPUT_MOUSE_DOWN;
-            input_event.mouse.x = (int)event->button.x;
-            input_event.mouse.y = (int)event->button.y;
-            input_event.mouse.button = event->button.button;
-            break;
+        case SDL_EVENT_MOUSE_BUTTON_DOWN: {
+            int x = (int)event->button.x;
+            int y = (int)event->button.y;
 
-        case SDL_EVENT_MOUSE_BUTTON_UP:
-            input_event.type = INPUT_MOUSE_UP;
-            input_event.mouse.x = (int)event->button.x;
-            input_event.mouse.y = (int)event->button.y;
-            input_event.mouse.button = event->button.button;
+            if (event->button.button == 1) {  // Left click
+                // First check if clicking on a divider
+                LayoutNode *divider = layout_divider_at_point(ctx->app.layout_root, x, y);
+                if (divider) {
+                    ctx->app.dragging_divider = true;
+                    ctx->app.drag_split = divider;
+                    ctx->app.drag_start_pos = (divider->type == LAYOUT_SPLIT_H) ? x : y;
+                    break;
+                }
+
+                // Check for pane click
+                Pane *target = layout_pane_at_point(ctx->app.layout_root, x, y);
+                if (target) {
+                    ctx->app.focused_pane = target;
+
+                    // Check for tag bar click
+                    TagCommand cmd = pane_tag_bar_hit_test(target, x, y);
+                    if (cmd != TAG_CMD_NONE) {
+                        handle_tag_command(ctx, target, cmd);
+                        break;
+                    }
+
+                    // Check if click is in tag bar area (but not on a command)
+                    if (pane_point_in_tag_bar(target, x, y)) {
+                        // Just focus the pane, don't pass to editor
+                        break;
+                    }
+
+                    // Translate coordinates to pane-local
+                    int local_x, local_y;
+                    pane_window_to_local(target, x, y, &local_x, &local_y);
+
+                    input_event.type = INPUT_MOUSE_DOWN;
+                    input_event.mouse.x = local_x;
+                    input_event.mouse.y = local_y;
+                    input_event.mouse.button = event->button.button;
+                    input_event.mouse.mod = SDL_GetModState();
+                }
+            }
+            break;
+        }
+
+        case SDL_EVENT_MOUSE_BUTTON_UP: {
+            int x = (int)event->button.x;
+            int y = (int)event->button.y;
+
+            // Stop divider dragging
+            if (ctx->app.dragging_divider) {
+                ctx->app.dragging_divider = false;
+                ctx->app.drag_split = NULL;
+                break;
+            }
+
+            // Translate to focused pane coordinates
+            if (ctx->app.focused_pane) {
+                int local_x, local_y;
+                pane_window_to_local(ctx->app.focused_pane, x, y, &local_x, &local_y);
+
+                input_event.type = INPUT_MOUSE_UP;
+                input_event.mouse.x = local_x;
+                input_event.mouse.y = local_y;
+                input_event.mouse.button = event->button.button;
+                input_event.mouse.mod = SDL_GetModState();
+            }
+            break;
+        }
+
+        case SDL_EVENT_MOUSE_MOTION: {
+            int x = (int)event->motion.x;
+            int y = (int)event->motion.y;
+
+            // Handle divider dragging
+            if (ctx->app.dragging_divider && ctx->app.drag_split) {
+                int current_pos = (ctx->app.drag_split->type == LAYOUT_SPLIT_H) ? x : y;
+                int delta = current_pos - ctx->app.drag_start_pos;
+                if (delta != 0) {
+                    layout_adjust_split(ctx->app.drag_split, delta);
+                    layout_compute_bounds(ctx->app.layout_root, get_window_rect(ctx));
+                    ctx->app.drag_start_pos = current_pos;
+                }
+                break;
+            }
+
+            // Translate to focused pane coordinates (for drag operations)
+            if (ctx->app.focused_pane) {
+                int local_x, local_y;
+                pane_window_to_local(ctx->app.focused_pane, x, y, &local_x, &local_y);
+
+                input_event.type = INPUT_MOUSE_MOVE;
+                input_event.mouse.x = local_x;
+                input_event.mouse.y = local_y;
+                input_event.mouse.button = 0;
+                input_event.mouse.mod = SDL_GetModState();
+            }
+            break;
+        }
+
+        case SDL_EVENT_MOUSE_WHEEL:
+            input_event.type = INPUT_SCROLL;
+            input_event.scroll.dx = event->wheel.x;
+            input_event.scroll.dy = event->wheel.y;
             break;
 
         default:
             break;
     }
 
-    if (input_event.type != INPUT_NONE) {
-        editor_handle_event(ctx->app.editor, &input_event);
+    // Dispatch to focused pane's editor
+    if (input_event.type != INPUT_NONE && ctx->app.focused_pane) {
+        Editor *editor = pane_get_editor(ctx->app.focused_pane);
+        if (editor) {
+            editor_handle_event(editor, &input_event);
+        }
     }
 
     return SDL_APP_CONTINUE;
+}
+
+// Render context for layout traversal
+typedef struct {
+    Renderer *renderer;
+    Pane *focused_pane;
+    uint64_t time;
+} RenderContext;
+
+// Context for updating panes
+typedef struct {
+    uint64_t time;
+    Pane *focused_pane;
+} UpdateContext;
+
+// Callback to update each pane's editor (only blink cursor on focused pane)
+static void update_pane_editor(Pane *pane, void *data) {
+    UpdateContext *uc = (UpdateContext *)data;
+    if (pane == uc->focused_pane) {
+        Editor *editor = pane_get_editor(pane);
+        if (editor) {
+            editor_update(editor, uc->time);
+        }
+    }
+}
+
+// Callback to render each pane
+static void render_pane_callback(Pane *pane, void *data) {
+    RenderContext *rc = (RenderContext *)data;
+    bool focused = (pane == rc->focused_pane);
+    pane_render(pane, rc->renderer, focused);
+}
+
+// Draw dividers between panes
+static void draw_dividers(LayoutNode *node, Renderer *r) {
+    if (!node || node->type == LAYOUT_LEAF) {
+        return;
+    }
+
+    // Draw the divider for this split
+    SDL_Rect first_bounds = pane_get_bounds(layout_first_pane(node->split.first));
+    SDL_Color divider_color = { .r = 60, .g = 60, .b = 60, .a = 255 };
+
+    if (node->type == LAYOUT_SPLIT_H) {
+        // Vertical divider
+        int x = first_bounds.x + first_bounds.w;
+        int y = first_bounds.y;
+        int h = first_bounds.h;
+        renderer_draw_rect(r, x, y, DIVIDER_SIZE, h, divider_color);
+    } else {
+        // Horizontal divider
+        int x = first_bounds.x;
+        int y = first_bounds.y + first_bounds.h;
+        int w = first_bounds.w;
+        renderer_draw_rect(r, x, y, w, DIVIDER_SIZE, divider_color);
+    }
+
+    // Recurse
+    draw_dividers(node->split.first, r);
+    draw_dividers(node->split.second, r);
 }
 
 SDL_AppResult SDL_AppIterate(void *app_state) {
@@ -265,49 +714,23 @@ SDL_AppResult SDL_AppIterate(void *app_state) {
 
     uint64_t now = SDL_GetTicks();
 
-    // Update editor (cursor blink)
-    editor_update(ctx->app.editor, now);
+    // Update focused pane's editor (cursor blink)
+    UpdateContext uc = { .time = now, .focused_pane = ctx->app.focused_pane };
+    layout_for_each_pane(ctx->app.layout_root, update_pane_editor, &uc);
 
-    // Animated background (keep the fun demo effect)
-    float time = (float)now / 1000.f;
-    uint8_t red = (uint8_t)(((sinf(time) + 1.0f) / 2.0f) * 255.0f);
-    uint8_t green = (uint8_t)(((sinf(time / 2.0f) + 1.0f) / 2.0f) * 255.0f);
-    uint8_t blue = (uint8_t)(((sinf(time * 2.0f) + 1.0f) / 2.0f) * 255.0f);
+    // Clear with a dark background
+    renderer_clear(ctx->app.renderer, 40, 40, 40);
 
-    renderer_clear(ctx->app.renderer, red, green, blue);
+    // Render all panes
+    RenderContext rc = {
+        .renderer = ctx->app.renderer,
+        .focused_pane = ctx->app.focused_pane,
+        .time = now
+    };
+    layout_for_each_pane(ctx->app.layout_root, render_pane_callback, &rc);
 
-    // Draw document content line by line
-    SDL_Color text_color = { .r = 255, .g = 255, .b = 255, .a = 255 };
-    int line_height = renderer_get_line_height(ctx->app.renderer);
-    int y = 10;
-
-    size_t line_count = document_line_count(ctx->app.document);
-    char line_buf[256];
-
-    for (size_t i = 0; i < line_count; i++) {
-        size_t start = document_line_start(ctx->app.document, i);
-        size_t end = document_line_end(ctx->app.document, i);
-        size_t len = end - start;
-
-        if (len > sizeof(line_buf) - 1) {
-            len = sizeof(line_buf) - 1;
-        }
-
-        size_t got = document_get_text(ctx->app.document, start, line_buf, len);
-        line_buf[got] = '\0';
-
-        renderer_draw_text(ctx->app.renderer, line_buf, 10, y, text_color);
-        y += line_height;
-    }
-
-    // Draw cursor
-    if (editor_cursor_is_visible(ctx->app.editor)) {
-        int cursor_x, cursor_y;
-        editor_pos_to_screen(ctx->app.editor, editor_get_cursor_pos(ctx->app.editor), &cursor_x, &cursor_y);
-
-        SDL_Color cursor_color = { .r = 255, .g = 255, .b = 255, .a = 255 };
-        renderer_draw_rect(ctx->app.renderer, cursor_x, cursor_y, 2, line_height, cursor_color);
-    }
+    // Draw dividers
+    draw_dividers(ctx->app.layout_root, ctx->app.renderer);
 
     renderer_present(ctx->app.renderer);
 
@@ -322,9 +745,9 @@ void SDL_AppQuit(void *app_state, SDL_AppResult result) {
         return;
     }
 
-    editor_free(ctx->app.editor);
-    annotation_free(ctx->app.annotations);
-    document_free(ctx->app.document);
+    // layout_free frees all panes (which own their editors)
+    layout_free(ctx->app.layout_root);
+    buffer_manager_free(ctx->app.buffers);
     renderer_free(ctx->app.renderer);
     platform_free(ctx->app.platform);
     free(ctx);
