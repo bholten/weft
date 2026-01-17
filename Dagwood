@@ -1,4 +1,12 @@
-import protocol sp/Dagwood
-
 project weft
 
+def CC gcc
+def SOURCES [glob src/*.c]
+
+task build {
+    inputs $weft::SOURCES
+    outputs build/weft
+    run {
+        $weft::CC $weft::SOURCES -o build/weft
+    }
+}
