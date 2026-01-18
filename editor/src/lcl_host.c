@@ -1096,6 +1096,65 @@ static int c_buffer_open_output(lcl_interp *interp, int argc, lcl_value **argv,
     return LCL_RC_OK;
 }
 
+// weft::repl::open -> open Lcl REPL buffer
+static int c_repl_open(lcl_interp *interp, int argc, lcl_value **argv,
+                        lcl_value **out) {
+    (void)argc;
+    (void)argv;
+
+    LclHost *host = lcl_interp_get_user_data(interp);
+    if (!host || !host->buffer_manager || !host->layout_root_ptr) {
+        lcl_set_error(interp, "no buffer manager context");
+        return LCL_RC_ERR;
+    }
+
+    // Create new buffer
+    Buffer *new_buffer = buffer_manager_create(host->buffer_manager);
+    if (!new_buffer) {
+        lcl_set_error(interp, "repl::open: failed to create buffer");
+        return LCL_RC_ERR;
+    }
+
+    // Set initial content with welcome message
+    const char *welcome =
+        ";; Lcl REPL - Weft Scripting Console\n"
+        ";; Type Lcl expressions and press Ctrl+Enter to evaluate\n"
+        ";; Results appear below each expression\n"
+        ";;\n"
+        ";; Examples:\n"
+        ";;   [+ 1 2]              ;; => 3\n"
+        ";;   [weft::doc::length]  ;; => document length\n"
+        ";;   [weft::version]      ;; => version string\n"
+        ";;\n\n";
+
+    document_insert(new_buffer->document, 0, welcome, strlen(welcome));
+
+    // Set special name to identify as REPL buffer
+    new_buffer->file_path = strdup("*lcl*");
+
+    // Create new pane using renderer metrics
+    Pane *new_pane = pane_new(new_buffer, host->char_width, host->line_height);
+    if (!new_pane) {
+        buffer_manager_close(host->buffer_manager, new_buffer);
+        lcl_set_error(interp, "repl::open: failed to create pane");
+        return LCL_RC_ERR;
+    }
+
+    // Split to show new pane
+    LayoutNode *root = *host->layout_root_ptr;
+    LayoutNode *new_split = layout_split_horizontal(root, new_pane);
+
+    if (new_split && !new_split->parent) {
+        *host->layout_root_ptr = new_split;
+    }
+
+    // Recompute layout bounds
+    recompute_layout_bounds(host);
+
+    *out = lcl_list_new();
+    return LCL_RC_OK;
+}
+
 // weft::buffer::open-at path line -> open file and jump to line
 static int c_buffer_open_at(lcl_interp *interp, int argc, lcl_value **argv,
                              lcl_value **out) {
@@ -1815,6 +1874,12 @@ static void register_weft_bindings(lcl_interp *interp) {
 
     lcl_ns_def(plumb_ns, "scan", lcl_c_proc_new("weft::plumb::scan", c_plumb_scan));
 
+    // Create weft::repl namespace for REPL operations
+    lcl_value *repl_ns = lcl_ns_new("repl");
+    lcl_ns_def(weft_ns, "repl", repl_ns);
+
+    lcl_ns_def(repl_ns, "open", lcl_c_proc_new("weft::repl::open", c_repl_open));
+
     // Create weft::config namespace for configuration
     lcl_value *config_ns = lcl_ns_new("config");
     lcl_ns_def(weft_ns, "config", config_ns);
@@ -1997,6 +2062,45 @@ bool lcl_host_eval_file(LclHost *host, const char *path, const char **error_msg)
     }
 
     return true;
+}
+
+char *lcl_host_eval_to_string(LclHost *host, const char *code, const char **error_msg) {
+    if (!host || !host->interp || !code) {
+        if (error_msg) {
+            *error_msg = "invalid arguments";
+        }
+        return NULL;
+    }
+
+    lcl_value *result = NULL;
+    int rc = lcl_eval_string(host->interp, code, &result);
+
+    if (rc != LCL_RC_OK) {
+        if (error_msg) {
+            *error_msg = lcl_interp_error_msg(host->interp);
+        }
+        if (result) {
+            lcl_ref_dec(result);
+        }
+        return NULL;
+    }
+
+    // Convert result to string
+    char *result_str = NULL;
+    if (result) {
+        const char *str = lcl_value_to_string(result);
+        if (str) {
+            result_str = strdup(str);
+        } else {
+            // Empty result
+            result_str = strdup("");
+        }
+        lcl_ref_dec(result);
+    } else {
+        result_str = strdup("");
+    }
+
+    return result_str;
 }
 
 void lcl_host_set_buffer(LclHost *host, Buffer *buffer) {

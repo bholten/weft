@@ -114,6 +114,11 @@ bool lcl_host_eval(LclHost *host, const char *code, const char **error_msg);
 // Evaluate an Lcl file
 bool lcl_host_eval_file(LclHost *host, const char *path, const char **error_msg);
 
+// Evaluate Lcl code and return the result as a string
+// Returns allocated string on success (caller must free), NULL on error
+// If error_msg is non-NULL, it receives a pointer to the error message on failure
+char *lcl_host_eval_to_string(LclHost *host, const char *code, const char **error_msg);
+
 // === Buffer Context ===
 
 // Set the current buffer for bindings (used during layer execution)

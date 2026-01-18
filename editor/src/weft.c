@@ -652,6 +652,16 @@ SDL_AppResult SDL_AppEvent(void *app_state, SDL_Event *event) {
             return SDL_APP_CONTINUE;
         }
 
+        // Ctrl+`: Open Lcl REPL
+        if (key == SDLK_GRAVE) {
+            const char *error_msg = NULL;
+            if (!lcl_host_eval(ctx->app.lcl, "weft::repl::open", &error_msg)) {
+                fprintf(stderr, "Failed to open REPL: %s\n",
+                        error_msg ? error_msg : "unknown");
+            }
+            return SDL_APP_CONTINUE;
+        }
+
         // Ctrl+Enter: Execute selection or line (keyboard middle-click)
         if (key == SDLK_RETURN) {
             if (ctx->app.focused_pane) {
@@ -660,12 +670,14 @@ SDL_AppResult SDL_AppEvent(void *app_state, SDL_Event *event) {
                 if (editor && buffer) {
                     char *text_to_execute = NULL;
                     size_t text_len = 0;
+                    size_t insert_pos = 0;  // Where to insert result in REPL mode
 
                     if (editor_has_selection(editor)) {
                         // Use selected text
                         size_t sel_start, sel_end;
                         editor_get_selection(editor, &sel_start, &sel_end);
                         text_len = sel_end - sel_start;
+                        insert_pos = sel_end;
                         text_to_execute = malloc(text_len + 1);
                         if (text_to_execute) {
                             document_get_text(buffer->document, sel_start, text_to_execute, text_len);
@@ -677,6 +689,7 @@ SDL_AppResult SDL_AppEvent(void *app_state, SDL_Event *event) {
                         size_t line_num = document_pos_to_line(buffer->document, cursor_pos);
                         size_t line_start = document_line_start(buffer->document, line_num);
                         size_t line_end = document_line_end(buffer->document, line_num);
+                        insert_pos = line_end;
                         text_len = line_end - line_start;
                         text_to_execute = malloc(text_len + 1);
                         if (text_to_execute) {
@@ -693,22 +706,74 @@ SDL_AppResult SDL_AppEvent(void *app_state, SDL_Event *event) {
                     }
 
                     if (text_to_execute && text_len > 0) {
-                        // Create a virtual middle-click event
-                        InteractEvent *ie = interact_event_new(
-                            INTERACT_MIDDLE_CLICK,
-                            editor_get_cursor_pos(editor),
-                            0, 0,  // screen coords not needed
-                            event->key.mod
-                        );
-                        if (ie) {
-                            // Set the text as selected_text (takes priority in acme handler)
-                            ie->has_selection = true;
-                            ie->selected_text = text_to_execute;
-                            text_to_execute = NULL;  // ownership transferred
+                        // Check if this is a REPL buffer
+                        bool is_repl = buffer->file_path &&
+                                       strcmp(buffer->file_path, "*lcl*") == 0;
 
-                            // Dispatch through interaction system
-                            interaction_dispatch(ctx->app.lcl, editor, ie);
-                            interact_event_free(ie);
+                        if (is_repl) {
+                            // REPL mode: evaluate as Lcl directly and insert result
+                            const char *error_msg = NULL;
+                            char *result = lcl_host_eval_to_string(ctx->app.lcl,
+                                                                    text_to_execute,
+                                                                    &error_msg);
+                            bool success = (result != NULL);
+
+                            // Format the output
+                            char *output = NULL;
+                            if (success) {
+                                // Success: show "=> result"
+                                size_t output_len = strlen(result) + 10;  // "\n;; => " + result + "\n"
+                                output = malloc(output_len + 1);
+                                if (output) {
+                                    snprintf(output, output_len + 1, "\n;; => %s\n", result);
+                                }
+                                free(result);
+                            } else {
+                                // Error: show ";; ERROR: message"
+                                const char *err = error_msg ? error_msg : "unknown error";
+                                size_t output_len = strlen(err) + 16;
+                                output = malloc(output_len + 1);
+                                if (output) {
+                                    snprintf(output, output_len + 1, "\n;; ERROR: %s\n", err);
+                                }
+                            }
+
+                            if (output) {
+                                // Insert result after the evaluated line
+                                size_t out_len = strlen(output);
+                                document_insert(buffer->document, insert_pos, output, out_len);
+
+                                // Add styling annotation for the result
+                                const char *keys[] = { "style:fg" };
+                                const char *vals[] = { success ? "#88CC88" : "#CC8888" };
+                                annot_store_add(buffer->annots,
+                                               insert_pos, insert_pos + out_len,
+                                               "style", keys, vals, 1);
+
+                                // Move cursor to end of inserted result
+                                editor->cursor_pos = insert_pos + out_len;
+                                editor->selection_anchor = SIZE_MAX;
+
+                                free(output);
+                            }
+                        } else {
+                            // Normal mode: create a virtual middle-click event
+                            InteractEvent *ie = interact_event_new(
+                                INTERACT_MIDDLE_CLICK,
+                                editor_get_cursor_pos(editor),
+                                0, 0,  // screen coords not needed
+                                event->key.mod
+                            );
+                            if (ie) {
+                                // Set the text as selected_text (takes priority in acme handler)
+                                ie->has_selection = true;
+                                ie->selected_text = text_to_execute;
+                                text_to_execute = NULL;  // ownership transferred
+
+                                // Dispatch through interaction system
+                                interaction_dispatch(ctx->app.lcl, editor, ie);
+                                interact_event_free(ie);
+                            }
                         }
                     }
                     free(text_to_execute);

@@ -196,9 +196,38 @@ This means if you have "Hello" styled in red and insert "Dear " before it, "Hell
 | Ctrl+F | Find |
 | Ctrl+H | Find and Replace |
 | Ctrl+G | Go to line |
+| Ctrl+` | Open Lcl REPL |
 | Ctrl+Enter | Execute selection or line |
 | Tab | Insert tab or spaces (per file type settings) |
 | Escape | Close search/dialogs |
+
+## Lcl REPL
+
+Press **Ctrl+`** to open the Lcl scripting console. This is an interactive environment for:
+
+- Testing Lcl expressions
+- Querying document state (`weft::doc::*`)
+- Experimenting with annotation commands
+- Debugging layer scripts
+
+Type an expression and press **Ctrl+Enter** to evaluate. Results appear inline:
+
+```
+[+ 1 2]
+;; => 3
+
+[weft::version]
+;; => Weft 0.1.0
+
+[weft::doc::line-count]
+;; => 42
+```
+
+Errors are shown in red:
+```
+[undefined-command]
+;; ERROR: unknown command: undefined-command
+```
 
 ## Roadmap
 
@@ -216,6 +245,7 @@ This means if you have "Hello" styled in red and insert "Dear " before it, "Hell
 - [x] File type associations for syntax highlighting
 - [x] Indent settings per file type
 - [x] Plumber (file:line pattern detection)
+- [x] Lcl REPL for interactive scripting
 - [ ] More syntax highlighting layers
 - [ ] Auto-trigger layers on document change (with dirty tracking)
 - [ ] Fuel-limited sandboxing for untrusted layers
