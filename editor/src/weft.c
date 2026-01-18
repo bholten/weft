@@ -20,6 +20,8 @@
 #include "editor.h"
 #include "pane.h"
 #include "layout.h"
+#include "lcl_host.h"
+#include "interaction.h"
 
 static void test_document(void) {
     printf("=== Document Tests ===\n");
@@ -214,11 +216,132 @@ SDL_AppResult SDL_AppInit(void **app_state, int argc, char **argv) {
         printf("Added test annotations for styling demo\n");
     }
 
-    // Get renderer metrics for pane creation
+    // Create Lcl scripting host
+    ctx->app.lcl = lcl_host_new();
+    if (!ctx->app.lcl) {
+        SDL_LogError(SDL_LOG_CATEGORY_CUSTOM, "Failed to create Lcl host");
+        buffer_manager_free(ctx->app.buffers);
+        renderer_free(ctx->app.renderer);
+        platform_free(ctx->app.platform);
+        free(ctx);
+        return SDL_APP_FAILURE;
+    }
+
+    // Set the initial buffer for Lcl bindings
+    lcl_host_set_buffer(ctx->app.lcl, initial_buffer);
+
+    // Set up app context for buffer operations
     int char_width = renderer_get_char_width(ctx->app.renderer);
     int line_height = renderer_get_line_height(ctx->app.renderer);
+    int win_w, win_h;
+    SDL_GetWindowSize(platform_get_window(ctx->app.platform), &win_w, &win_h);
+    lcl_host_set_app_context(ctx->app.lcl, ctx->app.buffers,
+                              &ctx->app.layout_root, ctx,
+                              char_width, line_height,
+                              win_w, win_h);
 
-    // Create initial pane with the buffer
+    // Load user configuration (~/.config/weft/init.lcl)
+    if (!lcl_host_load_config(ctx->app.lcl)) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_CUSTOM, "Failed to load config file");
+    }
+
+    // Apply file type associations to initial buffer (syntax highlighting, etc.)
+    lcl_host_apply_filetypes(ctx->app.lcl, initial_buffer);
+
+    // Register default Acme-like middle-click handler
+    // Recognizes:
+    //   /path/to/file -> open file
+    //   weft::* -> evaluate as Lcl command
+    //   anything else -> execute as shell command
+    const char *acme_handler =
+        "let sel [weft::interact::selection]\n"
+        "var text \"\"\n"
+        "if [> [len $sel] 0] {\n"
+        "    set! text [List::index $sel 2]\n"
+        "} else {\n"
+        "    set! text [weft::interact::word-at-pos]\n"
+        "}\n"
+        "if [== $text \"\"] { return }\n"
+        "puts (str \"acme: executing '\" $text \"'\")\n"
+        "if [== [String::index $text 0] \"/\"] {\n"
+        "    weft::buffer::open $text\n"
+        "    weft::interact::handled\n"
+        "    return\n"
+        "}\n"
+        "if [== [String::range $text 0 6] \"weft::\"] {\n"
+        "    eval $text\n"
+        "    weft::interact::handled\n"
+        "    return\n"
+        "}\n"
+        "let result [weft::shell::exec $text]\n"
+        "let stdout [List::index $result 3]\n"
+        "let stderr [List::index $result 5]\n"
+        "if [> [len $stdout] 0] {\n"
+        "    weft::buffer::open-output (str \"+\" $text) $stdout\n"
+        "} else {\n"
+        "    if [> [len $stderr] 0] {\n"
+        "        weft::buffer::open-output (str \"!\" $text) $stderr\n"
+        "    }\n"
+        "}\n"
+        "weft::interact::handled\n";
+
+    lcl_host_register_handler(ctx->app.lcl, "acme-middle-click",
+                               HANDLER_MIDDLE_CLICK, acme_handler, 0);
+
+    // Test Lcl evaluation
+    const char *error_msg = NULL;
+    printf("=== Lcl Integration Test ===\n");
+    if (lcl_host_eval(ctx->app.lcl, "puts [weft::version]", &error_msg)) {
+        printf("Lcl: weft::version evaluated successfully\n");
+    } else {
+        printf("Lcl error: %s\n", error_msg ? error_msg : "unknown");
+    }
+
+    // Test document bindings
+    if (lcl_host_eval(ctx->app.lcl, "puts (str \"Doc length: \" [weft::doc::length])", &error_msg)) {
+        printf("Lcl: doc::length evaluated successfully\n");
+    } else {
+        printf("Lcl error: %s\n", error_msg ? error_msg : "unknown");
+    }
+
+    if (lcl_host_eval(ctx->app.lcl, "puts (str \"Line count: \" [weft::doc::line-count])", &error_msg)) {
+        printf("Lcl: doc::line-count evaluated successfully\n");
+    } else {
+        printf("Lcl error: %s\n", error_msg ? error_msg : "unknown");
+    }
+
+    // Test annotation bindings
+    if (lcl_host_eval(ctx->app.lcl, "let id [weft::annot::add 0 5 \"test\" \"style:fg\" \"magenta\"]", &error_msg)) {
+        printf("Lcl: annot::add evaluated successfully\n");
+    } else {
+        printf("Lcl error: %s\n", error_msg ? error_msg : "unknown");
+    }
+
+    if (lcl_host_eval(ctx->app.lcl, "puts (str \"Annots at 2: \" [weft::annot::at 2])", &error_msg)) {
+        printf("Lcl: annot::at evaluated successfully\n");
+    } else {
+        printf("Lcl error: %s\n", error_msg ? error_msg : "unknown");
+    }
+
+    if (lcl_host_eval(ctx->app.lcl, "puts (str \"Annot info: \" [weft::annot::get $id])", &error_msg)) {
+        printf("Lcl: annot::get evaluated successfully\n");
+    } else {
+        printf("Lcl error: %s\n", error_msg ? error_msg : "unknown");
+    }
+
+    // Test layer execution with a simple inline script
+    const char *demo_layer =
+        ";; Simple demo layer - highlight 'Hello' in green\n"
+        "weft::annot::add 0 5 \"demo\" \"style:fg\" \"#00FF00\"\n";
+
+    if (lcl_host_run_layer(ctx->app.lcl, "demo", demo_layer, &error_msg)) {
+        printf("Lcl: demo layer executed successfully\n");
+    } else {
+        printf("Lcl layer error: %s\n", error_msg ? error_msg : "unknown");
+    }
+    printf("=== Lcl Test Complete ===\n\n");
+
+    // Create initial pane with the buffer (uses char_width, line_height from earlier)
     Pane *initial_pane = pane_new(initial_buffer, char_width, line_height);
     if (!initial_pane) {
         buffer_manager_free(ctx->app.buffers);
@@ -227,6 +350,9 @@ SDL_AppResult SDL_AppInit(void **app_state, int argc, char **argv) {
         free(ctx);
         return SDL_APP_FAILURE;
     }
+
+    // Apply indent settings based on file type
+    lcl_host_apply_indent(ctx->app.lcl, pane_get_editor(initial_pane));
 
     // Create layout root with the pane
     ctx->app.layout_root = layout_leaf_new(initial_pane);
@@ -434,6 +560,8 @@ SDL_AppResult SDL_AppEvent(void *app_state, SDL_Event *event) {
         platform_update_size(ctx->app.platform);
         SDL_Rect window_rect = { .x = 0, .y = 0, .w = event->window.data1, .h = event->window.data2 };
         layout_compute_bounds(ctx->app.layout_root, window_rect);
+        // Update Lcl host with new window dimensions
+        lcl_host_set_window_size(ctx->app.lcl, event->window.data1, event->window.data2);
     }
 
     // Handle app-level key commands (split/close/focus)
@@ -474,6 +602,30 @@ SDL_AppResult SDL_AppEvent(void *app_state, SDL_Event *event) {
             return SDL_APP_CONTINUE;
         }
 
+        // Ctrl+F: Open search bar
+        if (key == SDLK_F) {
+            if (ctx->app.focused_pane) {
+                pane_search_show(ctx->app.focused_pane);
+            }
+            return SDL_APP_CONTINUE;
+        }
+
+        // Ctrl+H: Toggle replace mode
+        if (key == SDLK_H) {
+            if (ctx->app.focused_pane) {
+                pane_search_toggle_replace(ctx->app.focused_pane);
+            }
+            return SDL_APP_CONTINUE;
+        }
+
+        // Ctrl+G: Go to line
+        if (key == SDLK_G) {
+            if (ctx->app.focused_pane) {
+                pane_goto_show(ctx->app.focused_pane);
+            }
+            return SDL_APP_CONTINUE;
+        }
+
         // Ctrl+W: Close current pane
         if (key == SDLK_W) {
             Pane *next = layout_next_pane(ctx->app.layout_root, ctx->app.focused_pane);
@@ -496,6 +648,71 @@ SDL_AppResult SDL_AppEvent(void *app_state, SDL_Event *event) {
             Pane *next = layout_next_pane(ctx->app.layout_root, ctx->app.focused_pane);
             if (next) {
                 ctx->app.focused_pane = next;
+            }
+            return SDL_APP_CONTINUE;
+        }
+
+        // Ctrl+Enter: Execute selection or line (keyboard middle-click)
+        if (key == SDLK_RETURN) {
+            if (ctx->app.focused_pane) {
+                Editor *editor = pane_get_editor(ctx->app.focused_pane);
+                Buffer *buffer = editor_get_buffer(editor);
+                if (editor && buffer) {
+                    char *text_to_execute = NULL;
+                    size_t text_len = 0;
+
+                    if (editor_has_selection(editor)) {
+                        // Use selected text
+                        size_t sel_start, sel_end;
+                        editor_get_selection(editor, &sel_start, &sel_end);
+                        text_len = sel_end - sel_start;
+                        text_to_execute = malloc(text_len + 1);
+                        if (text_to_execute) {
+                            document_get_text(buffer->document, sel_start, text_to_execute, text_len);
+                            text_to_execute[text_len] = '\0';
+                        }
+                    } else {
+                        // Use current line
+                        size_t cursor_pos = editor_get_cursor_pos(editor);
+                        size_t line_num = document_pos_to_line(buffer->document, cursor_pos);
+                        size_t line_start = document_line_start(buffer->document, line_num);
+                        size_t line_end = document_line_end(buffer->document, line_num);
+                        text_len = line_end - line_start;
+                        text_to_execute = malloc(text_len + 1);
+                        if (text_to_execute) {
+                            document_get_text(buffer->document, line_start, text_to_execute, text_len);
+                            text_to_execute[text_len] = '\0';
+                            // Trim trailing whitespace/newline
+                            while (text_len > 0 && (text_to_execute[text_len - 1] == '\n' ||
+                                                     text_to_execute[text_len - 1] == '\r' ||
+                                                     text_to_execute[text_len - 1] == ' ' ||
+                                                     text_to_execute[text_len - 1] == '\t')) {
+                                text_to_execute[--text_len] = '\0';
+                            }
+                        }
+                    }
+
+                    if (text_to_execute && text_len > 0) {
+                        // Create a virtual middle-click event
+                        InteractEvent *ie = interact_event_new(
+                            INTERACT_MIDDLE_CLICK,
+                            editor_get_cursor_pos(editor),
+                            0, 0,  // screen coords not needed
+                            event->key.mod
+                        );
+                        if (ie) {
+                            // Set the text as selected_text (takes priority in acme handler)
+                            ie->has_selection = true;
+                            ie->selected_text = text_to_execute;
+                            text_to_execute = NULL;  // ownership transferred
+
+                            // Dispatch through interaction system
+                            interaction_dispatch(ctx->app.lcl, editor, ie);
+                            interact_event_free(ie);
+                        }
+                    }
+                    free(text_to_execute);
+                }
             }
             return SDL_APP_CONTINUE;
         }
@@ -526,9 +743,10 @@ SDL_AppResult SDL_AppEvent(void *app_state, SDL_Event *event) {
         case SDL_EVENT_MOUSE_BUTTON_DOWN: {
             int x = (int)event->button.x;
             int y = (int)event->button.y;
+            int button = event->button.button;
 
-            if (event->button.button == 1) {  // Left click
-                // First check if clicking on a divider
+            // First check if clicking on a divider (left button only)
+            if (button == 1) {
                 LayoutNode *divider = layout_divider_at_point(ctx->app.layout_root, x, y);
                 if (divider) {
                     ctx->app.dragging_divider = true;
@@ -536,13 +754,15 @@ SDL_AppResult SDL_AppEvent(void *app_state, SDL_Event *event) {
                     ctx->app.drag_start_pos = (divider->type == LAYOUT_SPLIT_H) ? x : y;
                     break;
                 }
+            }
 
-                // Check for pane click
-                Pane *target = layout_pane_at_point(ctx->app.layout_root, x, y);
-                if (target) {
-                    ctx->app.focused_pane = target;
+            // Check for pane click
+            Pane *target = layout_pane_at_point(ctx->app.layout_root, x, y);
+            if (target) {
+                ctx->app.focused_pane = target;
 
-                    // Check for tag bar click
+                // Check for tag bar click (left button only)
+                if (button == 1) {
                     TagCommand cmd = pane_tag_bar_hit_test(target, x, y);
                     if (cmd != TAG_CMD_NONE) {
                         handle_tag_command(ctx, target, cmd);
@@ -554,15 +774,41 @@ SDL_AppResult SDL_AppEvent(void *app_state, SDL_Event *event) {
                         // Just focus the pane, don't pass to editor
                         break;
                     }
+                }
 
-                    // Translate coordinates to pane-local
-                    int local_x, local_y;
-                    pane_window_to_local(target, x, y, &local_x, &local_y);
+                // Get editor and translate coordinates
+                Editor *editor = pane_get_editor(target);
+                int local_x, local_y;
+                pane_window_to_local(target, x, y, &local_x, &local_y);
 
+                // For middle-click and right-click, try interaction dispatch
+                if (button == 2 || button == 3) {
+                    size_t doc_pos = editor_screen_to_pos(editor, local_x, local_y);
+                    InteractType itype = button_to_interact_type(button);
+
+                    InteractEvent *ie = interact_event_new(itype, doc_pos, x, y,
+                                                           SDL_GetModState());
+                    if (ie) {
+                        interact_event_populate_context(ie, editor);
+
+                        InteractResult result = interaction_dispatch(ctx->app.lcl, editor, ie);
+                        interact_event_free(ie);
+
+                        if (result == INTERACT_HANDLED) {
+                            // Recompute layout bounds in case new panes were added
+                            layout_compute_bounds(ctx->app.layout_root, get_window_rect(ctx));
+                            break;
+                        }
+                    }
+                    // If not handled, fall through to default behavior
+                }
+
+                // Left click: standard editor handling
+                if (button == 1) {
                     input_event.type = INPUT_MOUSE_DOWN;
                     input_event.mouse.x = local_x;
                     input_event.mouse.y = local_y;
-                    input_event.mouse.button = event->button.button;
+                    input_event.mouse.button = button;
                     input_event.mouse.mod = SDL_GetModState();
                 }
             }
@@ -632,6 +878,42 @@ SDL_AppResult SDL_AppEvent(void *app_state, SDL_Event *event) {
 
         default:
             break;
+    }
+
+    // If search bar is active, route events there first
+    if (input_event.type != INPUT_NONE && ctx->app.focused_pane &&
+        pane_search_is_active(ctx->app.focused_pane)) {
+
+        if (input_event.type == INPUT_KEY_DOWN) {
+            if (pane_search_handle_key(ctx->app.focused_pane,
+                                       input_event.key.key,
+                                       input_event.key.mod)) {
+                return SDL_APP_CONTINUE;
+            }
+        } else if (input_event.type == INPUT_TEXT) {
+            if (pane_search_handle_text(ctx->app.focused_pane,
+                                        input_event.text.text)) {
+                return SDL_APP_CONTINUE;
+            }
+        }
+    }
+
+    // If goto dialog is active, route events there first
+    if (input_event.type != INPUT_NONE && ctx->app.focused_pane &&
+        pane_goto_is_active(ctx->app.focused_pane)) {
+
+        if (input_event.type == INPUT_KEY_DOWN) {
+            if (pane_goto_handle_key(ctx->app.focused_pane,
+                                     input_event.key.key,
+                                     input_event.key.mod)) {
+                return SDL_APP_CONTINUE;
+            }
+        } else if (input_event.type == INPUT_TEXT) {
+            if (pane_goto_handle_text(ctx->app.focused_pane,
+                                      input_event.text.text)) {
+                return SDL_APP_CONTINUE;
+            }
+        }
     }
 
     // Dispatch to focused pane's editor
@@ -705,6 +987,9 @@ static void draw_dividers(LayoutNode *node, Renderer *r) {
     draw_dividers(node->split.second, r);
 }
 
+// Debounce delay for layer refresh (ms)
+#define LAYER_REFRESH_DEBOUNCE_MS 300
+
 SDL_AppResult SDL_AppIterate(void *app_state) {
     AppContext *ctx = (AppContext *)app_state;
 
@@ -713,6 +998,24 @@ SDL_AppResult SDL_AppIterate(void *app_state) {
     }
 
     uint64_t now = SDL_GetTicks();
+
+    // Check if layers need refresh (debounced)
+    if (lcl_host_has_dirty_layers(ctx->app.lcl)) {
+        if (ctx->app.last_edit_time == 0) {
+            // First time seeing dirty layers - record the time
+            ctx->app.last_edit_time = now;
+        } else if (now - ctx->app.last_edit_time >= LAYER_REFRESH_DEBOUNCE_MS) {
+            // Enough time has passed - refresh dirty layers
+            int refreshed = lcl_host_refresh_dirty_layers(ctx->app.lcl);
+            if (refreshed > 0) {
+                // printf("Refreshed %d layer(s)\n", refreshed);
+            }
+            ctx->app.last_edit_time = 0;  // Reset for next edit cycle
+        }
+    } else {
+        // No dirty layers - reset timer
+        ctx->app.last_edit_time = 0;
+    }
 
     // Update focused pane's editor (cursor blink)
     UpdateContext uc = { .time = now, .focused_pane = ctx->app.focused_pane };
@@ -734,6 +1037,9 @@ SDL_AppResult SDL_AppIterate(void *app_state) {
 
     renderer_present(ctx->app.renderer);
 
+    // Cap frame rate to ~60 FPS to avoid burning CPU
+    SDL_Delay(16);
+
     return SDL_APP_CONTINUE;
 }
 
@@ -747,6 +1053,7 @@ void SDL_AppQuit(void *app_state, SDL_AppResult result) {
 
     // layout_free frees all panes (which own their editors)
     layout_free(ctx->app.layout_root);
+    lcl_host_free(ctx->app.lcl);
     buffer_manager_free(ctx->app.buffers);
     renderer_free(ctx->app.renderer);
     platform_free(ctx->app.platform);

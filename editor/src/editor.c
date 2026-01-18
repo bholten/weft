@@ -26,6 +26,50 @@ static void update_target_column(Editor *e) {
     e->target_column = get_current_column(e);
 }
 
+// Helper: Convert document byte offset within line to visual column (accounting for tabs)
+static size_t doc_col_to_visual(const char *line_buf, size_t line_len,
+                                 size_t doc_col, int tab_size) {
+    if (tab_size <= 0) {
+        tab_size = 4;
+    }
+
+    size_t visual_col = 0;
+    for (size_t i = 0; i < line_len && i < doc_col; i++) {
+        if (line_buf[i] == '\t') {
+            // Advance to next tab stop
+            int spaces = tab_size - (int)(visual_col % (size_t)tab_size);
+            visual_col += (size_t)spaces;
+        } else {
+            visual_col++;
+        }
+    }
+    return visual_col;
+}
+
+// Helper: Convert visual column to document byte offset within line (accounting for tabs)
+static size_t visual_col_to_doc(const char *line_buf, size_t line_len,
+                                 size_t visual_col, int tab_size) {
+    if (tab_size <= 0) {
+        tab_size = 4;
+    }
+
+    size_t current_visual = 0;
+    size_t doc_col = 0;
+
+    for (doc_col = 0; doc_col < line_len; doc_col++) {
+        if (current_visual >= visual_col) {
+            break;
+        }
+        if (line_buf[doc_col] == '\t') {
+            int spaces = tab_size - (int)(current_visual % (size_t)tab_size);
+            current_visual += (size_t)spaces;
+        } else {
+            current_visual++;
+        }
+    }
+    return doc_col;
+}
+
 // Helper: Create a new edit operation
 static EditOp *editop_new(EditType type, size_t pos, const char *text, size_t len) {
     EditOp *op = malloc(sizeof(EditOp));
@@ -118,6 +162,10 @@ Editor *editor_new(Buffer *buffer) {
     e->text_offset_x = 10;
     e->text_offset_y = 10;
 
+    // Default indent settings
+    e->tab_size = 4;
+    e->use_tabs = true;
+
     return e;
 }
 
@@ -145,6 +193,14 @@ void editor_set_viewport_height(Editor *e, int height) {
         return;
     }
     e->viewport_height = height;
+}
+
+void editor_set_indent(Editor *e, int tab_size, bool use_tabs) {
+    if (!e) {
+        return;
+    }
+    e->tab_size = tab_size > 0 ? tab_size : 4;
+    e->use_tabs = use_tabs;
 }
 
 bool editor_handle_event(Editor *e, const InputEvent *event) {
@@ -278,6 +334,22 @@ bool editor_handle_event(Editor *e, const InputEvent *event) {
 
                 case SDLK_RETURN:
                     editor_insert_text(e, "\n", 1);
+                    reset_blink(e, now);
+                    return true;
+
+                case SDLK_TAB:
+                    if (e->use_tabs) {
+                        editor_insert_text(e, "\t", 1);
+                    } else {
+                        // Insert spaces instead of tab
+                        char spaces[16];
+                        int count = e->tab_size > 0 ? e->tab_size : 4;
+                        if (count > 16) {
+                            count = 16;
+                        }
+                        memset(spaces, ' ', (size_t)count);
+                        editor_insert_text(e, spaces, (size_t)count);
+                    }
                     reset_blink(e, now);
                     return true;
 
@@ -743,9 +815,21 @@ void editor_pos_to_screen(const Editor *e, size_t pos, int *x, int *y) {
 
     size_t line = document_pos_to_line(e->buffer->document, pos);
     size_t line_start = document_line_start(e->buffer->document, line);
-    size_t col = pos - line_start;
+    size_t line_end = document_line_end(e->buffer->document, line);
+    size_t doc_col = pos - line_start;
+    size_t line_len = line_end - line_start;
 
-    *x = e->text_offset_x + (int)col * e->char_width;
+    // Get line content for tab-aware column calculation
+    char line_buf[256];
+    if (line_len > sizeof(line_buf) - 1) {
+        line_len = sizeof(line_buf) - 1;
+    }
+    document_get_text(e->buffer->document, line_start, line_buf, line_len);
+
+    // Convert document column to visual column (accounting for tabs)
+    size_t visual_col = doc_col_to_visual(line_buf, line_len, doc_col, e->tab_size);
+
+    *x = e->text_offset_x + (int)visual_col * e->char_width;
     *y = e->text_offset_y + (int)line * e->line_height - e->scroll_y;
 }
 
@@ -767,23 +851,33 @@ size_t editor_screen_to_pos(const Editor *e, int x, int y) {
         line = line_count - 1;
     }
 
-    // Calculate column from x coordinate
+    // Calculate visual column from x coordinate
     int relative_x = x - e->text_offset_x;
-    size_t col = 0;
+    size_t visual_col = 0;
     if (relative_x > 0) {
-        col = (size_t)(relative_x / e->char_width);
+        visual_col = (size_t)(relative_x / e->char_width);
     }
 
-    // Get line bounds and clamp column
+    // Get line bounds and content
     size_t line_start = document_line_start(e->buffer->document, line);
     size_t line_end = document_line_end(e->buffer->document, line);
     size_t line_len = line_end - line_start;
 
-    if (col > line_len) {
-        col = line_len;
+    // Get line content for tab-aware column calculation
+    char line_buf[256];
+    if (line_len > sizeof(line_buf) - 1) {
+        line_len = sizeof(line_buf) - 1;
+    }
+    document_get_text(e->buffer->document, line_start, line_buf, line_len);
+
+    // Convert visual column to document column (accounting for tabs)
+    size_t doc_col = visual_col_to_doc(line_buf, line_len, visual_col, e->tab_size);
+
+    if (doc_col > line_len) {
+        doc_col = line_len;
     }
 
-    return line_start + col;
+    return line_start + doc_col;
 }
 
 size_t editor_get_cursor_pos(const Editor *e) {

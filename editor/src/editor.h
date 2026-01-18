@@ -50,6 +50,10 @@ typedef struct Editor {
     // Scroll state
     int scroll_y;               // Vertical scroll offset in pixels
     int viewport_height;        // Visible area height in pixels
+
+    // Indent settings
+    int tab_size;               // Tab width / spaces per indent (default 4)
+    bool use_tabs;              // Insert tabs vs spaces (default: tabs)
 } Editor;
 
 // Lifecycle
@@ -57,6 +61,7 @@ Editor *editor_new(Buffer *buffer);
 void editor_free(Editor *e);
 void editor_set_layout(Editor *e, int char_width, int line_height, int offset_x, int offset_y);
 void editor_set_viewport_height(Editor *e, int height);
+void editor_set_indent(Editor *e, int tab_size, bool use_tabs);
 
 // Input handling
 bool editor_handle_event(Editor *e, const InputEvent *event);

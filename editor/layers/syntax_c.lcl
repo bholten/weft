@@ -1,0 +1,222 @@
+;; ============================================================================
+;; C Syntax Highlighting Layer for Weft
+;; ============================================================================
+;;
+;; Highlighted elements:
+;;   - Keywords (if, while, for, return, etc.) - blue
+;;   - Types (int, void, char, size_t, etc.) - teal
+;;   - Comments (// and /* */) - green
+;;   - Strings ("...") - orange
+;;   - Preprocessor directives (#include, #define) - purple
+;;
+;; ============================================================================
+
+;; === Color Definitions ===
+
+let color_keyword   "#6699FF"
+let color_type      "#4EC9B0"
+let color_comment   "#6A9955"
+let color_string    "#CE9178"
+let color_preproc   "#C586C0"
+
+;; === Helper ===
+
+let word_chars "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+
+proc is_word_char {ch} {
+    return [>= [String::find $word_chars $ch] 0]
+}
+
+proc add_style {start end color} {
+    weft::annot::add $start $end "style" "style:fg" $color
+}
+
+;; === Keyword and Type Lists ===
+
+let keywords (if else while for do switch case default
+              break continue return goto
+              struct union enum typedef
+              sizeof static extern const volatile
+              inline register auto restrict)
+
+let types (void int char short long float double
+           signed unsigned bool true false NULL
+           size_t uint8_t uint16_t uint32_t uint64_t
+           int8_t int16_t int32_t int64_t
+           FILE ptrdiff_t intptr_t uintptr_t)
+
+;; === Main Highlighting Logic ===
+
+let doc_len [weft::doc::length]
+var pos 0
+
+while [< $pos $doc_len] {
+    let ch [weft::doc::text $pos 1]
+
+    ;; --- Line comments (// ...) ---
+    if [== $ch "/"] {
+        if [< [+ $pos 1] $doc_len] {
+            let next_ch [weft::doc::text [+ $pos 1] 1]
+            if [== $next_ch "/"] {
+                let comment_start $pos
+                var end_pos [+ $pos 2]
+                while [< $end_pos $doc_len] {
+                    let c [weft::doc::text $end_pos 1]
+                    if [== $c "\n"] { break }
+                    set! end_pos [+ $end_pos 1]
+                }
+                add_style $comment_start $end_pos $color_comment
+                set! pos $end_pos
+                continue
+            }
+            ;; --- Block comments (/* ... */) ---
+            if [== $next_ch "*"] {
+                let comment_start $pos
+                var end_pos [+ $pos 2]
+                var found 0
+                while [< $end_pos [- $doc_len 1]] {
+                    let c1 [weft::doc::text $end_pos 1]
+                    let c2 [weft::doc::text [+ $end_pos 1] 1]
+                    if [and [== $c1 "*"] [== $c2 "/"]] {
+                        set! end_pos [+ $end_pos 2]
+                        set! found 1
+                        break
+                    }
+                    set! end_pos [+ $end_pos 1]
+                }
+                if [not $found] {
+                    set! end_pos $doc_len
+                }
+                add_style $comment_start $end_pos $color_comment
+                set! pos $end_pos
+                continue
+            }
+        }
+    }
+
+    ;; --- Strings ("...") ---
+    if [== $ch "\""] {
+        let string_start $pos
+        var end_pos [+ $pos 1]
+        var escaped 0
+        while [< $end_pos $doc_len] {
+            let c [weft::doc::text $end_pos 1]
+            if [$escaped] {
+                set! escaped 0
+            } else {
+                if [== $c "\\"] {
+                    set! escaped 1
+                } else {
+                    if [== $c "\""] {
+                        set! end_pos [+ $end_pos 1]
+                        break
+                    }
+                    if [== $c "\n"] { break }
+                }
+            }
+            set! end_pos [+ $end_pos 1]
+        }
+        add_style $string_start $end_pos $color_string
+        set! pos $end_pos
+        continue
+    }
+
+    ;; --- Character literals ('...') ---
+    if [== $ch "'"] {
+        let char_start $pos
+        var end_pos [+ $pos 1]
+        var escaped 0
+        while [< $end_pos $doc_len] {
+            let c [weft::doc::text $end_pos 1]
+            if [$escaped] {
+                set! escaped 0
+            } else {
+                if [== $c "\\"] {
+                    set! escaped 1
+                } else {
+                    if [== $c "'"] {
+                        set! end_pos [+ $end_pos 1]
+                        break
+                    }
+                    if [== $c "\n"] { break }
+                }
+            }
+            set! end_pos [+ $end_pos 1]
+        }
+        add_style $char_start $end_pos $color_string
+        set! pos $end_pos
+        continue
+    }
+
+    ;; --- Preprocessor directives (#...) ---
+    if [== $ch "#"] {
+        let directive_start $pos
+        var end_pos [+ $pos 1]
+        while [< $end_pos $doc_len] {
+            let c [weft::doc::text $end_pos 1]
+            if [== $c "\n"] { break }
+            if [== $c "\\"] {
+                if [< [+ $end_pos 1] $doc_len] {
+                    let next [weft::doc::text [+ $end_pos 1] 1]
+                    if [== $next "\n"] {
+                        set! end_pos [+ $end_pos 2]
+                        continue
+                    }
+                }
+            }
+            set! end_pos [+ $end_pos 1]
+        }
+        add_style $directive_start $end_pos $color_preproc
+        set! pos $end_pos
+        continue
+    }
+
+    ;; --- Identifiers (keywords and types) ---
+    if [is_word_char $ch] {
+        var at_start 1
+        if [> $pos 0] {
+            let prev [weft::doc::text [- $pos 1] 1]
+            if [is_word_char $prev] {
+                set! at_start 0
+            }
+        }
+
+        if [$at_start] {
+            let word_start $pos
+            var word_end [+ $pos 1]
+            while [< $word_end $doc_len] {
+                let c [weft::doc::text $word_end 1]
+                if [not [is_word_char $c]] { break }
+                set! word_end [+ $word_end 1]
+            }
+            let word_len [- $word_end $word_start]
+            let word [weft::doc::text $word_start $word_len]
+
+            ;; Check keywords
+            var found 0
+            foreach kw $keywords {
+                if [== $word $kw] {
+                    add_style $word_start $word_end $color_keyword
+                    set! found 1
+                    break
+                }
+            }
+
+            ;; Check types
+            if [not $found] {
+                foreach t $types {
+                    if [== $word $t] {
+                        add_style $word_start $word_end $color_type
+                        set! found 1
+                        break
+                    }
+                }
+            }
+
+            set! pos $word_end
+            continue
+        }
+    }
+
+    set! pos [+ $pos 1]
+}

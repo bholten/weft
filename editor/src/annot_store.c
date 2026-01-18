@@ -665,6 +665,17 @@ void annot_store_set_layer_dirty(AnnotStore *s, const char *name) {
     }
 }
 
+void annot_store_set_layer_valid(AnnotStore *s, const char *name) {
+    if (!s || !name) {
+        return;
+    }
+
+    Layer *l = find_layer(s, name);
+    if (l) {
+        l->state = LAYER_VALID;
+    }
+}
+
 LayerState annot_store_layer_state(const AnnotStore *s, const char *name) {
     if (!s || !name) {
         return LAYER_DIRTY;

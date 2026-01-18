@@ -19,6 +19,8 @@ set(WEFT_SOURCES
   src/editor.c
   src/pane.c
   src/layout.c
+  src/lcl_host.c
+  src/interaction.c
 )
 
 set(CMAKE_C_STANDARD 11)
@@ -42,8 +44,13 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(SDL3_ttf)
 
-
-
+# Add Lcl scripting language (from submodule)
+set(LCL_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+set(LCL_BUILD_STATIC ON CACHE BOOL "" FORCE)
+set(LCL_BUILD_CLI OFF CACHE BOOL "" FORCE)
+set(LCL_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../submodules/lcl ${CMAKE_CURRENT_BINARY_DIR}/lcl)
 
 add_executable(weft ${WEFT_SOURCES})
-target_link_libraries(weft PRIVATE SDL3::SDL3 SDL3_ttf::SDL3_ttf m)
+target_link_libraries(weft PRIVATE SDL3::SDL3 SDL3_ttf::SDL3_ttf lcl_static m)
+target_include_directories(weft PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../submodules/lcl/include)

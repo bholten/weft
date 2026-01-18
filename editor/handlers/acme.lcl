@@ -1,0 +1,49 @@
+;; handlers/acme.lcl - Acme-like middle-click execution handler
+;;
+;; This handler is triggered on middle-click events and provides Acme-like
+;; behavior:
+;; - If there's a selection, use the selected text
+;; - Otherwise, use the word under the cursor
+;; - If the text looks like a file path (starts with /), open the file
+;; - Otherwise, execute it as a shell command and show output in a new buffer
+
+;; Get text to execute (selection takes priority over word at cursor)
+let sel [weft::interact::selection]
+var text ""
+
+if [> [len $sel] 0] {
+    ;; Use selected text
+    set! text [List::index $sel 2]
+} else {
+    ;; Use word under cursor
+    set! text [weft::interact::word-at-pos]
+}
+
+;; Nothing to execute
+if [== $text ""] {
+    return
+}
+
+;; Check for absolute file path (starts with /)
+if [== [String::index $text 0] "/"] {
+    weft::buffer::open $text
+    weft::interact::handled
+    return
+}
+
+;; Execute as shell command
+let result [weft::shell::exec $text]
+let status [List::index $result 1]
+let stdout [List::index $result 3]
+let stderr [List::index $result 5]
+
+;; Show output in new buffer if there is any
+if [> [len $stdout] 0] {
+    weft::buffer::open-output (str "+" $text) $stdout
+} else {
+    if [> [len $stderr] 0] {
+        weft::buffer::open-output (str "!" $text) $stderr
+    }
+}
+
+weft::interact::handled

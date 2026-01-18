@@ -126,6 +126,7 @@ void annot_store_on_delete(AnnotStore *s, size_t pos, size_t len);
 
 void annot_store_register_layer(AnnotStore *s, const char *name);
 void annot_store_set_layer_dirty(AnnotStore *s, const char *name);
+void annot_store_set_layer_valid(AnnotStore *s, const char *name);
 LayerState annot_store_layer_state(const AnnotStore *s, const char *name);
 uint64_t annot_store_layer_version(const AnnotStore *s, const char *name);
 
