@@ -662,6 +662,28 @@ SDL_AppResult SDL_AppEvent(void *app_state, SDL_Event *event) {
             return SDL_APP_CONTINUE;
         }
 
+        // Ctrl+I: Inspect annotations at cursor
+        if (key == SDLK_I) {
+            if (ctx->app.focused_pane) {
+                Editor *editor = pane_get_editor(ctx->app.focused_pane);
+                Buffer *buffer = editor_get_buffer(editor);
+                if (editor && buffer) {
+                    size_t cursor_pos = editor_get_cursor_pos(editor);
+                    lcl_host_set_buffer(ctx->app.lcl, buffer);
+
+                    char cmd[64];
+                    snprintf(cmd, sizeof(cmd), "weft::inspect::at %zu", cursor_pos);
+
+                    const char *error_msg = NULL;
+                    if (!lcl_host_eval(ctx->app.lcl, cmd, &error_msg)) {
+                        fprintf(stderr, "Failed to inspect: %s\n",
+                                error_msg ? error_msg : "unknown");
+                    }
+                }
+            }
+            return SDL_APP_CONTINUE;
+        }
+
         // Ctrl+Enter: Execute selection or line (keyboard middle-click)
         if (key == SDLK_RETURN) {
             if (ctx->app.focused_pane) {

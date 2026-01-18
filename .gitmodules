@@ -1,3 +1,6 @@
 [submodule "submodules/lcl"]
 	path = submodules/lcl
 	url = git@github.com:bholten/lcl.git
+[submodule "submodules/tree-sitter-lcl"]
+	path = submodules/tree-sitter-lcl
+	url = git@github.com:mazzilabs/tree-sitter-lcl.git

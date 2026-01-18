@@ -197,6 +197,7 @@ This means if you have "Hello" styled in red and insert "Dear " before it, "Hell
 | Ctrl+H | Find and Replace |
 | Ctrl+G | Go to line |
 | Ctrl+` | Open Lcl REPL |
+| Ctrl+I | Inspect annotations at cursor |
 | Ctrl+Enter | Execute selection or line |
 | Tab | Insert tab or spaces (per file type settings) |
 | Escape | Close search/dialogs |
@@ -229,6 +230,42 @@ Errors are shown in red:
 ;; ERROR: unknown command: undefined-command
 ```
 
+## Annotation Inspector
+
+Press **Ctrl+I** to inspect all annotations at the cursor position. This opens a new buffer showing:
+
+- Position information (byte offset, line, column)
+- Each annotation's ID, layer, and span
+- The annotated text (preview)
+- All metadata key/value pairs
+
+Example output:
+```
+;; Annotations at position 1234
+;; Line 45, Column 12
+;;
+;; Found 2 annotation(s):
+;;
+─────────────────────────────────────────
+Annotation #7
+  Layer: style
+  Span:  [1230, 1250) (20 bytes)
+  Text:  "function_name"
+  Metadata:
+    style:fg = "#88CC88"
+    style:underline = "true"
+
+─────────────────────────────────────────
+Annotation #12
+  Layer: action
+  Span:  [1230, 1250) (20 bytes)
+  Text:  "function_name"
+  Metadata:
+    action:on_middle_click = "weft::buffer::open-at \"/path/to/file.c\" 100"
+```
+
+You can also use `weft::inspect::at <position>` from the REPL or in scripts.
+
 ## Roadmap
 
 - [x] Core editor (cursor, selection, clipboard, undo)
@@ -246,6 +283,7 @@ Errors are shown in red:
 - [x] Indent settings per file type
 - [x] Plumber (file:line pattern detection)
 - [x] Lcl REPL for interactive scripting
+- [x] Annotation inspector (Ctrl+I)
 - [ ] More syntax highlighting layers
 - [ ] Auto-trigger layers on document change (with dirty tracking)
 - [ ] Fuel-limited sandboxing for untrusted layers

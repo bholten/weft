@@ -1155,6 +1155,186 @@ static int c_repl_open(lcl_interp *interp, int argc, lcl_value **argv,
     return LCL_RC_OK;
 }
 
+// weft::inspect::at pos -> show annotations at position in output buffer
+static int c_inspect_at(lcl_interp *interp, int argc, lcl_value **argv,
+                         lcl_value **out) {
+    LclHost *host = lcl_interp_get_user_data(interp);
+    if (!host || !host->current_buffer) {
+        lcl_set_error(interp, "no buffer set");
+        return LCL_RC_ERR;
+    }
+
+    if (argc < 1) {
+        lcl_set_error(interp, "inspect::at requires position");
+        return LCL_RC_ERR;
+    }
+
+    long pos;
+    if (lcl_value_to_int(argv[0], &pos) != LCL_OK || pos < 0) {
+        lcl_set_error(interp, "inspect::at: invalid position");
+        return LCL_RC_ERR;
+    }
+
+    Buffer *buffer = host->current_buffer;
+    AnnotStore *store = buffer->annots;
+    Document *doc = buffer->document;
+
+    // Query all annotations at this position (no layer filter)
+    AnnotQuery query = {0};
+    annot_store_at(store, (size_t)pos, NULL, &query);
+
+    // Build output string
+    size_t output_cap = 4096;
+    char *output = malloc(output_cap);
+    if (!output) {
+        annot_query_free(&query);
+        lcl_set_error(interp, "inspect::at: allocation failed");
+        return LCL_RC_ERR;
+    }
+    size_t output_len = 0;
+
+    // Header
+    output_len += snprintf(output + output_len, output_cap - output_len,
+                           ";; Annotations at position %ld\n", pos);
+
+    // Get line info for context
+    size_t line_num = document_pos_to_line(doc, (size_t)pos);
+    size_t line_start = document_line_start(doc, line_num);
+    size_t col = (size_t)pos - line_start;
+    output_len += snprintf(output + output_len, output_cap - output_len,
+                           ";; Line %zu, Column %zu\n", line_num + 1, col + 1);
+
+    if (query.count == 0) {
+        output_len += snprintf(output + output_len, output_cap - output_len,
+                               ";;\n;; No annotations found at this position.\n");
+    } else {
+        output_len += snprintf(output + output_len, output_cap - output_len,
+                               ";;\n;; Found %zu annotation(s):\n;;\n",
+                               query.count);
+
+        for (size_t i = 0; i < query.count; i++) {
+            uint32_t id = query.ids[i];
+            const AnnotRecord *rec = annot_store_get(store, id);
+            if (!rec) {
+                continue;
+            }
+
+            // Get span positions
+            size_t start_pos = 0, end_pos = 0;
+            annot_store_get_span(store, id, &start_pos, &end_pos);
+
+            // Extract the annotated text (up to 80 chars)
+            size_t text_len = end_pos - start_pos;
+            size_t preview_len = text_len > 80 ? 80 : text_len;
+            char *text_preview = malloc(preview_len + 4);  // +4 for "..." and null
+            if (text_preview) {
+                document_get_text(doc, start_pos, text_preview, preview_len);
+                text_preview[preview_len] = '\0';
+                // Replace newlines with visible markers
+                for (size_t j = 0; j < preview_len; j++) {
+                    if (text_preview[j] == '\n') {
+                        text_preview[j] = ' ';
+                    }
+                }
+                if (text_len > 80) {
+                    strcat(text_preview, "...");
+                }
+            }
+
+            // Ensure we have space - grow buffer if needed
+            size_t needed = output_len + 1024 + (rec->meta_count * 256);
+            if (needed > output_cap) {
+                output_cap = needed * 2;
+                char *new_output = realloc(output, output_cap);
+                if (!new_output) {
+                    free(text_preview);
+                    free(output);
+                    annot_query_free(&query);
+                    lcl_set_error(interp, "inspect::at: allocation failed");
+                    return LCL_RC_ERR;
+                }
+                output = new_output;
+            }
+
+            // Annotation header
+            output_len += snprintf(output + output_len, output_cap - output_len,
+                                   "─────────────────────────────────────────\n"
+                                   "Annotation #%u\n"
+                                   "  Layer: %s\n"
+                                   "  Span:  [%zu, %zu) (%zu bytes)\n"
+                                   "  Text:  \"%s\"\n",
+                                   id,
+                                   rec->layer ? rec->layer : "(none)",
+                                   start_pos, end_pos, text_len,
+                                   text_preview ? text_preview : "(error)");
+
+            free(text_preview);
+
+            // Metadata
+            if (rec->meta_count > 0) {
+                output_len += snprintf(output + output_len, output_cap - output_len,
+                                       "  Metadata:\n");
+                for (size_t j = 0; j < rec->meta_count; j++) {
+                    output_len += snprintf(output + output_len, output_cap - output_len,
+                                           "    %s = \"%s\"\n",
+                                           rec->keys[j], rec->values[j]);
+                }
+            }
+
+            output_len += snprintf(output + output_len, output_cap - output_len, "\n");
+        }
+    }
+
+    annot_query_free(&query);
+
+    // Open output buffer with the result
+    if (!host->buffer_manager || !host->layout_root_ptr) {
+        // No buffer manager - just return the output as string
+        *out = lcl_string_new(output);
+        free(output);
+        return LCL_RC_OK;
+    }
+
+    // Create new buffer
+    Buffer *new_buffer = buffer_manager_create(host->buffer_manager);
+    if (!new_buffer) {
+        free(output);
+        lcl_set_error(interp, "inspect::at: failed to create buffer");
+        return LCL_RC_ERR;
+    }
+
+    // Set content
+    document_insert(new_buffer->document, 0, output, output_len);
+    free(output);
+
+    // Set display name
+    char display_name[64];
+    snprintf(display_name, sizeof(display_name), "*inspect@%ld*", pos);
+    new_buffer->file_path = strdup(display_name);
+
+    // Create new pane
+    Pane *new_pane = pane_new(new_buffer, host->char_width, host->line_height);
+    if (!new_pane) {
+        buffer_manager_close(host->buffer_manager, new_buffer);
+        lcl_set_error(interp, "inspect::at: failed to create pane");
+        return LCL_RC_ERR;
+    }
+
+    // Split to show new pane
+    LayoutNode *root = *host->layout_root_ptr;
+    LayoutNode *new_split = layout_split_horizontal(root, new_pane);
+
+    if (new_split && !new_split->parent) {
+        *host->layout_root_ptr = new_split;
+    }
+
+    // Recompute layout bounds
+    recompute_layout_bounds(host);
+
+    *out = lcl_list_new();
+    return LCL_RC_OK;
+}
+
 // weft::buffer::open-at path line -> open file and jump to line
 static int c_buffer_open_at(lcl_interp *interp, int argc, lcl_value **argv,
                              lcl_value **out) {
@@ -1879,6 +2059,12 @@ static void register_weft_bindings(lcl_interp *interp) {
     lcl_ns_def(weft_ns, "repl", repl_ns);
 
     lcl_ns_def(repl_ns, "open", lcl_c_proc_new("weft::repl::open", c_repl_open));
+
+    // Create weft::inspect namespace for annotation inspection
+    lcl_value *inspect_ns = lcl_ns_new("inspect");
+    lcl_ns_def(weft_ns, "inspect", inspect_ns);
+
+    lcl_ns_def(inspect_ns, "at", lcl_c_proc_new("weft::inspect::at", c_inspect_at));
 
     // Create weft::config namespace for configuration
     lcl_value *config_ns = lcl_ns_new("config");
