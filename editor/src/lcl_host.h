@@ -69,6 +69,9 @@ typedef struct LclHost {
     InteractEvent *current_event;
     Editor *current_editor;
 
+    // Current script path (set during layer execution for provenance tracking)
+    char *current_script_path;
+
     // Buffer manager and layout for buffer operations
     BufferManager *buffer_manager;
     LayoutNode **layout_root_ptr;    // Pointer to layout root (for adding panes)

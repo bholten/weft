@@ -20,6 +20,7 @@
 #include "interaction.h"
 #include "pane.h"
 #include "layout.h"
+#include "tree_sitter_hl.h"
 
 #include <SDL3/SDL.h>
 
@@ -226,16 +227,23 @@ static int c_annot_add(lcl_interp *interp, int argc, lcl_value **argv,
     }
 
     // Parse key-value pairs (remaining arguments)
-    size_t meta_count = 0;
-    const char **keys = NULL;
-    const char **values = NULL;
-
+    size_t user_meta_count = 0;
     if (argc > 3) {
         if ((argc - 3) % 2 != 0) {
             lcl_set_error(interp, "annot::add: key-value pairs must be even");
             return LCL_RC_ERR;
         }
-        meta_count = (size_t)(argc - 3) / 2;
+        user_meta_count = (size_t)(argc - 3) / 2;
+    }
+
+    // Add space for provenance if we have a current script path
+    size_t prov_count = host->current_script_path ? 1 : 0;
+    size_t meta_count = user_meta_count + prov_count;
+
+    const char **keys = NULL;
+    const char **values = NULL;
+
+    if (meta_count > 0) {
         keys = malloc(meta_count * sizeof(const char *));
         values = malloc(meta_count * sizeof(const char *));
         if (!keys || !values) {
@@ -245,7 +253,8 @@ static int c_annot_add(lcl_interp *interp, int argc, lcl_value **argv,
             return LCL_RC_ERR;
         }
 
-        for (size_t i = 0; i < meta_count; i++) {
+        // Copy user-provided metadata
+        for (size_t i = 0; i < user_meta_count; i++) {
             keys[i] = lcl_value_to_string(argv[3 + i * 2]);
             values[i] = lcl_value_to_string(argv[3 + i * 2 + 1]);
             if (!keys[i] || !values[i]) {
@@ -254,6 +263,12 @@ static int c_annot_add(lcl_interp *interp, int argc, lcl_value **argv,
                 lcl_set_error(interp, "annot::add: keys and values must be strings");
                 return LCL_RC_ERR;
             }
+        }
+
+        // Add provenance metadata if available
+        if (host->current_script_path) {
+            keys[user_meta_count] = "prov:script";
+            values[user_meta_count] = host->current_script_path;
         }
     }
 
@@ -1132,6 +1147,36 @@ static int c_repl_open(lcl_interp *interp, int argc, lcl_value **argv,
     // Set special name to identify as REPL buffer
     new_buffer->file_path = strdup("*lcl*");
 
+    // Apply tree-sitter highlighting for Lcl
+    Buffer *prev_buffer = host->current_buffer;
+    host->current_buffer = new_buffer;
+
+    // Try to find highlights.scm
+    const char *highlights_path = NULL;
+    const char *paths[] = {
+        "/home/brennan/dev/weft/submodules/tree-sitter-lcl/queries/highlights.scm",
+        "../submodules/tree-sitter-lcl/queries/highlights.scm",
+        "../../submodules/tree-sitter-lcl/queries/highlights.scm",
+        NULL
+    };
+    for (const char **p = paths; *p; p++) {
+        FILE *f = fopen(*p, "r");
+        if (f) {
+            fclose(f);
+            highlights_path = *p;
+            break;
+        }
+    }
+
+    if (highlights_path) {
+        TSHighlighter *hl = ts_hl_get_lcl(highlights_path);
+        if (hl) {
+            ts_hl_apply_to_buffer(hl, new_buffer, highlights_path);
+        }
+    }
+
+    host->current_buffer = prev_buffer;
+
     // Create new pane using renderer metrics
     Pane *new_pane = pane_new(new_buffer, host->char_width, host->line_height);
     if (!new_pane) {
@@ -1256,6 +1301,15 @@ static int c_inspect_at(lcl_interp *interp, int argc, lcl_value **argv,
                 output = new_output;
             }
 
+            // Find provenance info first
+            const char *prov_script = NULL;
+            for (size_t j = 0; j < rec->meta_count; j++) {
+                if (strcmp(rec->keys[j], "prov:script") == 0) {
+                    prov_script = rec->values[j];
+                    break;
+                }
+            }
+
             // Annotation header
             output_len += snprintf(output + output_len, output_cap - output_len,
                                    "─────────────────────────────────────────\n"
@@ -1268,13 +1322,31 @@ static int c_inspect_at(lcl_interp *interp, int argc, lcl_value **argv,
                                    start_pos, end_pos, text_len,
                                    text_preview ? text_preview : "(error)");
 
+            // Show provenance if available
+            if (prov_script) {
+                output_len += snprintf(output + output_len, output_cap - output_len,
+                                       "  Source: %s\n", prov_script);
+            }
+
             free(text_preview);
 
-            // Metadata
-            if (rec->meta_count > 0) {
+            // Metadata (excluding prov:* keys)
+            bool has_non_prov_meta = false;
+            for (size_t j = 0; j < rec->meta_count; j++) {
+                if (strncmp(rec->keys[j], "prov:", 5) != 0) {
+                    has_non_prov_meta = true;
+                    break;
+                }
+            }
+
+            if (has_non_prov_meta) {
                 output_len += snprintf(output + output_len, output_cap - output_len,
                                        "  Metadata:\n");
                 for (size_t j = 0; j < rec->meta_count; j++) {
+                    // Skip provenance keys - they're shown separately
+                    if (strncmp(rec->keys[j], "prov:", 5) == 0) {
+                        continue;
+                    }
                     output_len += snprintf(output + output_len, output_cap - output_len,
                                            "    %s = \"%s\"\n",
                                            rec->keys[j], rec->values[j]);
@@ -1977,6 +2049,72 @@ static int c_config_indent(lcl_interp *interp, int argc, lcl_value **argv,
     return LCL_RC_OK;
 }
 
+// weft::ts::highlight ?highlights-path? -> apply tree-sitter highlighting to current buffer
+static int c_ts_highlight(lcl_interp *interp, int argc, lcl_value **argv,
+                           lcl_value **out) {
+    LclHost *host = lcl_interp_get_user_data(interp);
+    if (!host || !host->current_buffer) {
+        lcl_set_error(interp, "no buffer set");
+        return LCL_RC_ERR;
+    }
+
+    // Get highlights.scm path - use argument or default
+    const char *highlights_path = NULL;
+    if (argc > 0) {
+        highlights_path = lcl_value_to_string(argv[0]);
+    }
+
+    // Default to the tree-sitter-lcl queries path
+    char default_path[PATH_MAX];
+    if (!highlights_path && host->config_dir) {
+        // First try config dir
+        snprintf(default_path, sizeof(default_path),
+                 "%s/queries/lcl/highlights.scm", host->config_dir);
+        FILE *f = fopen(default_path, "r");
+        if (f) {
+            fclose(f);
+            highlights_path = default_path;
+        }
+    }
+
+    // Fall back to submodule path (for development)
+    if (!highlights_path) {
+        // Try relative to common locations
+        const char *paths[] = {
+            "../submodules/tree-sitter-lcl/queries/highlights.scm",
+            "../../submodules/tree-sitter-lcl/queries/highlights.scm",
+            "/home/brennan/dev/weft/submodules/tree-sitter-lcl/queries/highlights.scm",
+            NULL
+        };
+        for (const char **p = paths; *p; p++) {
+            FILE *f = fopen(*p, "r");
+            if (f) {
+                fclose(f);
+                highlights_path = *p;
+                break;
+            }
+        }
+    }
+
+    if (!highlights_path) {
+        lcl_set_error(interp, "ts::highlight: cannot find highlights.scm");
+        return LCL_RC_ERR;
+    }
+
+    // Get or create highlighter
+    TSHighlighter *hl = ts_hl_get_lcl(highlights_path);
+    if (!hl) {
+        lcl_set_error(interp, "ts::highlight: failed to create highlighter");
+        return LCL_RC_ERR;
+    }
+
+    // Apply highlighting to the buffer
+    ts_hl_apply_to_buffer(hl, host->current_buffer, highlights_path);
+
+    *out = lcl_list_new();
+    return LCL_RC_OK;
+}
+
 // === Internal: Register Weft Bindings ===
 
 static void register_weft_bindings(lcl_interp *interp) {
@@ -2074,6 +2212,12 @@ static void register_weft_bindings(lcl_interp *interp) {
     lcl_ns_def(config_ns, "handler", lcl_c_proc_new("weft::config::handler", c_config_handler));
     lcl_ns_def(config_ns, "dir", lcl_c_proc_new("weft::config::dir", c_config_dir));
     lcl_ns_def(config_ns, "indent", lcl_c_proc_new("weft::config::indent", c_config_indent));
+
+    // Create weft::ts namespace for tree-sitter operations
+    lcl_value *ts_ns = lcl_ns_new("ts");
+    lcl_ns_def(weft_ns, "ts", ts_ns);
+
+    lcl_ns_def(ts_ns, "highlight", lcl_c_proc_new("weft::ts::highlight", c_ts_highlight));
 }
 
 // === Public API ===
@@ -2192,6 +2336,9 @@ void lcl_host_free(LclHost *host) {
     free(host->indent_settings);
 
     free(host->config_dir);
+
+    // Cleanup tree-sitter highlighters
+    ts_hl_cleanup();
 
     if (host->interp) {
         lcl_interp_free(host->interp);
@@ -2358,9 +2505,17 @@ bool lcl_host_run_layer_file(LclHost *host, const char *layer_name,
     // Clear previous annotations from this layer
     annot_store_clear_layer(host->current_buffer->annots, layer_name);
 
+    // Set current script path for provenance tracking
+    char *prev_script_path = host->current_script_path;
+    host->current_script_path = strdup(path);
+
     // Execute the layer script file
     lcl_value *result = NULL;
     int rc = lcl_eval_file(host->interp, path, &result);
+
+    // Restore previous script path
+    free(host->current_script_path);
+    host->current_script_path = prev_script_path;
 
     if (result) {
         lcl_ref_dec(result);

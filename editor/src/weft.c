@@ -22,6 +22,7 @@
 #include "layout.h"
 #include "lcl_host.h"
 #include "interaction.h"
+#include "tree_sitter_hl.h"
 
 static void test_document(void) {
     printf("=== Document Tests ===\n");
@@ -765,7 +766,30 @@ SDL_AppResult SDL_AppEvent(void *app_state, SDL_Event *event) {
                                 size_t out_len = strlen(output);
                                 document_insert(buffer->document, insert_pos, output, out_len);
 
-                                // Add styling annotation for the result
+                                // Re-apply tree-sitter highlighting to the whole buffer
+                                // Try to find highlights.scm
+                                const char *hl_paths[] = {
+                                    "/home/brennan/dev/weft/submodules/tree-sitter-lcl/queries/highlights.scm",
+                                    "../submodules/tree-sitter-lcl/queries/highlights.scm",
+                                    NULL
+                                };
+                                const char *hl_path = NULL;
+                                for (const char **p = hl_paths; *p; p++) {
+                                    FILE *f = fopen(*p, "r");
+                                    if (f) {
+                                        fclose(f);
+                                        hl_path = *p;
+                                        break;
+                                    }
+                                }
+                                if (hl_path) {
+                                    TSHighlighter *hl = ts_hl_get_lcl(hl_path);
+                                    if (hl) {
+                                        ts_hl_apply_to_buffer(hl, buffer, hl_path);
+                                    }
+                                }
+
+                                // Add styling annotation for the result (overrides tree-sitter for this range)
                                 const char *keys[] = { "style:fg" };
                                 const char *vals[] = { success ? "#88CC88" : "#CC8888" };
                                 annot_store_add(buffer->annots,

@@ -1,0 +1,4 @@
+;; Tree-sitter based syntax highlighting for Lcl files
+;; Uses the tree-sitter-lcl parser for accurate, AST-based highlighting
+
+weft::ts::highlight "/home/brennan/dev/weft/submodules/tree-sitter-lcl/queries/highlights.scm"

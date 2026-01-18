@@ -34,7 +34,7 @@ cmake ..
 make
 ```
 
-SDL3 and SDL3_ttf are fetched automatically during the build.
+SDL3, SDL3_ttf, and tree-sitter are fetched automatically during the build.
 
 ### Run
 
@@ -211,6 +211,8 @@ Press **Ctrl+`** to open the Lcl scripting console. This is an interactive envir
 - Experimenting with annotation commands
 - Debugging layer scripts
 
+The REPL features **tree-sitter syntax highlighting** for Lcl code. Keywords, strings, comments, variables, and brackets are all colored appropriately.
+
 Type an expression and press **Ctrl+Enter** to evaluate. Results appear inline:
 
 ```
@@ -251,6 +253,7 @@ Annotation #7
   Layer: style
   Span:  [1230, 1250) (20 bytes)
   Text:  "function_name"
+  Source: ~/.config/weft/syntax_c.lcl
   Metadata:
     style:fg = "#88CC88"
     style:underline = "true"
@@ -260,11 +263,42 @@ Annotation #12
   Layer: action
   Span:  [1230, 1250) (20 bytes)
   Text:  "function_name"
+  Source: ~/.config/weft/syntax_c.lcl
   Metadata:
     action:on_middle_click = "weft::buffer::open-at \"/path/to/file.c\" 100"
 ```
 
+The **Source** field shows which script created each annotation (provenance tracking).
+
 You can also use `weft::inspect::at <position>` from the REPL or in scripts.
+
+## Tree-sitter Syntax Highlighting
+
+Weft integrates [tree-sitter](https://tree-sitter.github.io/) for fast, accurate AST-based syntax highlighting. Tree-sitter provides:
+
+- **Incremental parsing**: Only re-parses changed portions of the document
+- **AST-based highlighting**: Colors are based on actual syntax structure, not regex patterns
+- **Extensible**: Add new languages by providing a tree-sitter grammar and highlight queries
+
+### Using Tree-sitter
+
+The `weft::ts::highlight` command applies tree-sitter highlighting to the current buffer:
+
+```tcl
+;; In a layer script (e.g., syntax_lcl_ts.lcl)
+weft::ts::highlight "/path/to/queries/highlights.scm"
+```
+
+Currently supported languages:
+- **Lcl** (`.lcl` files) - Uses the tree-sitter-lcl parser
+
+### Adding New Languages
+
+To add tree-sitter support for a new language:
+1. Obtain or create a tree-sitter grammar for the language
+2. Create a `highlights.scm` query file mapping syntax nodes to highlight groups
+3. Create a layer script that calls `weft::ts::highlight` with the query path
+4. Register the layer in `~/.config/weft/init.lcl`
 
 ## Roadmap
 
@@ -284,6 +318,7 @@ You can also use `weft::inspect::at <position>` from the REPL or in scripts.
 - [x] Plumber (file:line pattern detection)
 - [x] Lcl REPL for interactive scripting
 - [x] Annotation inspector (Ctrl+I)
+- [x] Tree-sitter integration for AST-based syntax highlighting
 - [ ] More syntax highlighting layers
 - [ ] Auto-trigger layers on document change (with dirty tracking)
 - [ ] Fuel-limited sandboxing for untrusted layers
