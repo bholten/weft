@@ -28,6 +28,8 @@ set(WEFT_SOURCES
   src/annot_layer.c
   src/plumb_layer.c
   src/tree_sitter_layer.c
+  src/patch.c
+  src/transform.c
 )
 
 set(CMAKE_C_STANDARD 11)

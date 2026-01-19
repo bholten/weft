@@ -21,6 +21,9 @@
 #include "pane.h"
 #include "layout.h"
 #include "tree_sitter_hl.h"
+#include "transform.h"
+#include "patch.h"
+#include "layer_stack.h"
 
 #include <SDL3/SDL.h>
 
@@ -30,6 +33,8 @@
 // Forward declarations
 static int plumb_scan_buffer(Buffer *buf);
 static void recompute_layout_bounds(LclHost *host);
+static bool is_repl_buffer(const Buffer *buf);
+static Buffer *get_effective_doc_buffer(LclHost *host);
 
 // === Internal: Weft Bindings ===
 
@@ -50,12 +55,13 @@ static int c_doc_length(lcl_interp *interp, int argc, lcl_value **argv,
     (void)argv;
 
     LclHost *host = lcl_interp_get_user_data(interp);
-    if (!host || !host->current_buffer) {
+    Buffer *buffer = get_effective_doc_buffer(host);
+    if (!buffer) {
         lcl_set_error(interp, "no buffer set");
         return LCL_RC_ERR;
     }
 
-    size_t len = document_length(host->current_buffer->document);
+    size_t len = document_length(buffer->document);
     *out = lcl_int_new((long)len);
     return LCL_RC_OK;
 }
@@ -67,12 +73,13 @@ static int c_doc_line_count(lcl_interp *interp, int argc, lcl_value **argv,
     (void)argv;
 
     LclHost *host = lcl_interp_get_user_data(interp);
-    if (!host || !host->current_buffer) {
+    Buffer *buffer = get_effective_doc_buffer(host);
+    if (!buffer) {
         lcl_set_error(interp, "no buffer set");
         return LCL_RC_ERR;
     }
 
-    size_t count = document_line_count(host->current_buffer->document);
+    size_t count = document_line_count(buffer->document);
     *out = lcl_int_new((long)count);
     return LCL_RC_OK;
 }
@@ -81,7 +88,8 @@ static int c_doc_line_count(lcl_interp *interp, int argc, lcl_value **argv,
 static int c_doc_text(lcl_interp *interp, int argc, lcl_value **argv,
                       lcl_value **out) {
     LclHost *host = lcl_interp_get_user_data(interp);
-    if (!host || !host->current_buffer) {
+    Buffer *buffer = get_effective_doc_buffer(host);
+    if (!buffer) {
         lcl_set_error(interp, "no buffer set");
         return LCL_RC_ERR;
     }
@@ -101,7 +109,7 @@ static int c_doc_text(lcl_interp *interp, int argc, lcl_value **argv,
         return LCL_RC_ERR;
     }
 
-    Document *doc = host->current_buffer->document;
+    Document *doc = buffer->document;
     size_t doc_len = document_length(doc);
 
     // Clamp to document bounds
@@ -132,7 +140,8 @@ static int c_doc_text(lcl_interp *interp, int argc, lcl_value **argv,
 static int c_doc_line_start(lcl_interp *interp, int argc, lcl_value **argv,
                             lcl_value **out) {
     LclHost *host = lcl_interp_get_user_data(interp);
-    if (!host || !host->current_buffer) {
+    Buffer *buffer = get_effective_doc_buffer(host);
+    if (!buffer) {
         lcl_set_error(interp, "no buffer set");
         return LCL_RC_ERR;
     }
@@ -148,7 +157,7 @@ static int c_doc_line_start(lcl_interp *interp, int argc, lcl_value **argv,
         return LCL_RC_ERR;
     }
 
-    Document *doc = host->current_buffer->document;
+    Document *doc = buffer->document;
     size_t line_count = document_line_count(doc);
 
     if ((size_t)line >= line_count) {
@@ -165,7 +174,8 @@ static int c_doc_line_start(lcl_interp *interp, int argc, lcl_value **argv,
 static int c_doc_line_end(lcl_interp *interp, int argc, lcl_value **argv,
                           lcl_value **out) {
     LclHost *host = lcl_interp_get_user_data(interp);
-    if (!host || !host->current_buffer) {
+    Buffer *buffer = get_effective_doc_buffer(host);
+    if (!buffer) {
         lcl_set_error(interp, "no buffer set");
         return LCL_RC_ERR;
     }
@@ -181,7 +191,7 @@ static int c_doc_line_end(lcl_interp *interp, int argc, lcl_value **argv,
         return LCL_RC_ERR;
     }
 
-    Document *doc = host->current_buffer->document;
+    Document *doc = buffer->document;
     size_t line_count = document_line_count(doc);
 
     if ((size_t)line >= line_count) {
@@ -200,7 +210,8 @@ static int c_doc_line_end(lcl_interp *interp, int argc, lcl_value **argv,
 static int c_annot_add(lcl_interp *interp, int argc, lcl_value **argv,
                        lcl_value **out) {
     LclHost *host = lcl_interp_get_user_data(interp);
-    if (!host || !host->current_buffer) {
+    Buffer *buffer = get_effective_doc_buffer(host);
+    if (!buffer) {
         lcl_set_error(interp, "no buffer set");
         return LCL_RC_ERR;
     }
@@ -272,7 +283,7 @@ static int c_annot_add(lcl_interp *interp, int argc, lcl_value **argv,
         }
     }
 
-    uint32_t id = annot_store_add(host->current_buffer->annots,
+    uint32_t id = annot_store_add(buffer->annots,
                                   (size_t)start, (size_t)end,
                                   layer, keys, values, meta_count);
 
@@ -287,7 +298,8 @@ static int c_annot_add(lcl_interp *interp, int argc, lcl_value **argv,
 static int c_annot_remove(lcl_interp *interp, int argc, lcl_value **argv,
                           lcl_value **out) {
     LclHost *host = lcl_interp_get_user_data(interp);
-    if (!host || !host->current_buffer) {
+    Buffer *buffer = get_effective_doc_buffer(host);
+    if (!buffer) {
         lcl_set_error(interp, "no buffer set");
         return LCL_RC_ERR;
     }
@@ -303,7 +315,7 @@ static int c_annot_remove(lcl_interp *interp, int argc, lcl_value **argv,
         return LCL_RC_ERR;
     }
 
-    bool removed = annot_store_remove(host->current_buffer->annots, (uint32_t)id);
+    bool removed = annot_store_remove(buffer->annots, (uint32_t)id);
     *out = lcl_int_new(removed ? 1 : 0);
     return LCL_RC_OK;
 }
@@ -312,7 +324,8 @@ static int c_annot_remove(lcl_interp *interp, int argc, lcl_value **argv,
 static int c_annot_at(lcl_interp *interp, int argc, lcl_value **argv,
                       lcl_value **out) {
     LclHost *host = lcl_interp_get_user_data(interp);
-    if (!host || !host->current_buffer) {
+    Buffer *buffer = get_effective_doc_buffer(host);
+    if (!buffer) {
         lcl_set_error(interp, "no buffer set");
         return LCL_RC_ERR;
     }
@@ -334,7 +347,7 @@ static int c_annot_at(lcl_interp *interp, int argc, lcl_value **argv,
     }
 
     AnnotQuery query = {0};
-    annot_store_at(host->current_buffer->annots, (size_t)pos, layer, &query);
+    annot_store_at(buffer->annots, (size_t)pos, layer, &query);
 
     // Build result list
     lcl_value *list = lcl_list_new();
@@ -351,7 +364,8 @@ static int c_annot_at(lcl_interp *interp, int argc, lcl_value **argv,
 static int c_annot_in_range(lcl_interp *interp, int argc, lcl_value **argv,
                             lcl_value **out) {
     LclHost *host = lcl_interp_get_user_data(interp);
-    if (!host || !host->current_buffer) {
+    Buffer *buffer = get_effective_doc_buffer(host);
+    if (!buffer) {
         lcl_set_error(interp, "no buffer set");
         return LCL_RC_ERR;
     }
@@ -377,7 +391,7 @@ static int c_annot_in_range(lcl_interp *interp, int argc, lcl_value **argv,
     }
 
     AnnotQuery query = {0};
-    annot_store_in_range(host->current_buffer->annots, (size_t)start, (size_t)end,
+    annot_store_in_range(buffer->annots, (size_t)start, (size_t)end,
                          layer, &query);
 
     // Build result list
@@ -395,7 +409,8 @@ static int c_annot_in_range(lcl_interp *interp, int argc, lcl_value **argv,
 static int c_annot_get(lcl_interp *interp, int argc, lcl_value **argv,
                        lcl_value **out) {
     LclHost *host = lcl_interp_get_user_data(interp);
-    if (!host || !host->current_buffer) {
+    Buffer *buffer = get_effective_doc_buffer(host);
+    if (!buffer) {
         lcl_set_error(interp, "no buffer set");
         return LCL_RC_ERR;
     }
@@ -411,14 +426,14 @@ static int c_annot_get(lcl_interp *interp, int argc, lcl_value **argv,
         return LCL_RC_ERR;
     }
 
-    const AnnotRecord *rec = annot_store_get(host->current_buffer->annots, (uint32_t)id);
+    const AnnotRecord *rec = annot_store_get(buffer->annots, (uint32_t)id);
     if (!rec) {
         *out = lcl_list_new();
         return LCL_RC_OK;
     }
 
     // Get the anchor positions
-    AnnotStore *store = host->current_buffer->annots;
+    AnnotStore *store = buffer->annots;
     size_t start_pos = 0, end_pos = 0;
     for (size_t i = 0; i < store->anchor_count; i++) {
         if (store->anchors[i].id == rec->start_anchor) {
@@ -454,7 +469,8 @@ static int c_annot_get(lcl_interp *interp, int argc, lcl_value **argv,
 static int c_annot_clear_layer(lcl_interp *interp, int argc, lcl_value **argv,
                                lcl_value **out) {
     LclHost *host = lcl_interp_get_user_data(interp);
-    if (!host || !host->current_buffer) {
+    Buffer *buffer = get_effective_doc_buffer(host);
+    if (!buffer) {
         lcl_set_error(interp, "no buffer set");
         return LCL_RC_ERR;
     }
@@ -470,7 +486,7 @@ static int c_annot_clear_layer(lcl_interp *interp, int argc, lcl_value **argv,
         return LCL_RC_ERR;
     }
 
-    annot_store_clear_layer(host->current_buffer->annots, layer);
+    annot_store_clear_layer(buffer->annots, layer);
     *out = lcl_list_new();
     return LCL_RC_OK;
 }
@@ -1215,11 +1231,287 @@ static int c_repl_open(lcl_interp *interp, int argc, lcl_value **argv,
     return LCL_RC_OK;
 }
 
-// weft::inspect::at pos -> show annotations at position in output buffer
+// Helper: Check if a buffer is the REPL buffer
+static bool is_repl_buffer(const Buffer *buf) {
+    return buf && buf->file_path && strcmp(buf->file_path, "*lcl*") == 0;
+}
+
+// Helper: Get the effective buffer for doc commands
+// If in REPL and attached to another buffer, use that buffer
+static Buffer *get_effective_doc_buffer(LclHost *host) {
+    if (!host || !host->current_buffer) {
+        return NULL;
+    }
+
+    // If current buffer is REPL and we have an attached buffer, use it
+    if (is_repl_buffer(host->current_buffer) && host->repl_attached_buffer) {
+        return host->repl_attached_buffer;
+    }
+
+    return host->current_buffer;
+}
+
+// weft::repl::attach -> attach REPL to the previously focused buffer
+static int c_repl_attach(lcl_interp *interp, int argc, lcl_value **argv,
+                          lcl_value **out) {
+    (void)argc;
+    (void)argv;
+
+    LclHost *host = lcl_interp_get_user_data(interp);
+    if (!host) {
+        lcl_set_error(interp, "no host context");
+        return LCL_RC_ERR;
+    }
+
+    if (!host->current_buffer) {
+        lcl_set_error(interp, "no current buffer");
+        return LCL_RC_ERR;
+    }
+
+    // Don't attach to the REPL itself
+    if (is_repl_buffer(host->current_buffer)) {
+        // If we're in the REPL and there's no attachment yet, this is a no-op
+        // User needs to call this from a non-REPL buffer
+        if (!host->repl_attached_buffer) {
+            lcl_set_error(interp, "repl::attach must be called from the target buffer, not the REPL");
+            return LCL_RC_ERR;
+        }
+        // Already attached - return info
+        *out = lcl_string_new(host->repl_attached_buffer->file_path ?
+                              host->repl_attached_buffer->file_path : "(untitled)");
+        return LCL_RC_OK;
+    }
+
+    // Attach to current buffer
+    host->repl_attached_buffer = host->current_buffer;
+
+    *out = lcl_string_new(host->current_buffer->file_path ?
+                          host->current_buffer->file_path : "(untitled)");
+    return LCL_RC_OK;
+}
+
+// weft::repl::detach -> detach REPL from attached buffer
+static int c_repl_detach(lcl_interp *interp, int argc, lcl_value **argv,
+                          lcl_value **out) {
+    (void)argc;
+    (void)argv;
+
+    LclHost *host = lcl_interp_get_user_data(interp);
+    if (!host) {
+        lcl_set_error(interp, "no host context");
+        return LCL_RC_ERR;
+    }
+
+    if (!host->repl_attached_buffer) {
+        *out = lcl_string_new("not attached");
+        return LCL_RC_OK;
+    }
+
+    const char *name = host->repl_attached_buffer->file_path ?
+                       host->repl_attached_buffer->file_path : "(untitled)";
+    char msg[256];
+    snprintf(msg, sizeof(msg), "detached from %s", name);
+
+    host->repl_attached_buffer = NULL;
+
+    *out = lcl_string_new(msg);
+    return LCL_RC_OK;
+}
+
+// weft::repl::target -> get info about attached buffer
+static int c_repl_target(lcl_interp *interp, int argc, lcl_value **argv,
+                          lcl_value **out) {
+    (void)argc;
+    (void)argv;
+
+    LclHost *host = lcl_interp_get_user_data(interp);
+    if (!host) {
+        lcl_set_error(interp, "no host context");
+        return LCL_RC_ERR;
+    }
+
+    if (!host->repl_attached_buffer) {
+        *out = lcl_list_new();  // Empty list = not attached
+        return LCL_RC_OK;
+    }
+
+    Buffer *buf = host->repl_attached_buffer;
+    Document *doc = buf->document;
+
+    // Return a list with buffer info
+    lcl_value *result = lcl_list_new();
+    lcl_list_push(&result, lcl_string_new("path"));
+    lcl_list_push(&result, lcl_string_new(buf->file_path ? buf->file_path : "(untitled)"));
+    lcl_list_push(&result, lcl_string_new("length"));
+    lcl_list_push(&result, lcl_int_new((long)document_length(doc)));
+    lcl_list_push(&result, lcl_string_new("lines"));
+    lcl_list_push(&result, lcl_int_new((long)document_line_count(doc)));
+    lcl_list_push(&result, lcl_string_new("modified"));
+    lcl_list_push(&result, lcl_int_new(buf->modified ? 1 : 0));
+
+    *out = result;
+    return LCL_RC_OK;
+}
+
+// Helper struct for finding pane by buffer
+typedef struct {
+    Buffer *target;
+    Pane *found;
+} FindPaneByBufferData;
+
+// Callback for layout traversal to find pane by buffer
+static void find_pane_by_buffer_cb(Pane *pane, void *data) {
+    FindPaneByBufferData *d = data;
+    if (d->found) return;  // Already found
+    if (pane_get_buffer(pane) == d->target) {
+        d->found = pane;
+    }
+}
+
+// Find pane containing a specific buffer
+static Pane *find_pane_for_buffer(LclHost *host, Buffer *buffer) {
+    if (!host || !host->layout_root_ptr || !*host->layout_root_ptr || !buffer) {
+        return NULL;
+    }
+    FindPaneByBufferData data = { .target = buffer, .found = NULL };
+    layout_for_each_pane(*host->layout_root_ptr, find_pane_by_buffer_cb, &data);
+    return data.found;
+}
+
+// weft::repl::target-selection -> get selection from attached buffer
+static int c_repl_target_selection(lcl_interp *interp, int argc, lcl_value **argv,
+                                    lcl_value **out) {
+    (void)argc;
+    (void)argv;
+
+    LclHost *host = lcl_interp_get_user_data(interp);
+    if (!host) {
+        lcl_set_error(interp, "no host context");
+        return LCL_RC_ERR;
+    }
+
+    if (!host->repl_attached_buffer) {
+        // Not attached - return empty list
+        *out = lcl_list_new();
+        return LCL_RC_OK;
+    }
+
+    // Find the pane containing the attached buffer
+    Pane *pane = find_pane_for_buffer(host, host->repl_attached_buffer);
+    if (!pane || !pane->view) {
+        // Buffer exists but no pane - maybe it was closed
+        *out = lcl_list_new();
+        return LCL_RC_OK;
+    }
+
+    Editor *editor = pane->view;
+    size_t sel_start, sel_end;
+    editor_get_selection(editor, &sel_start, &sel_end);
+
+    if (sel_start == sel_end) {
+        // No selection - return empty list
+        *out = lcl_list_new();
+        return LCL_RC_OK;
+    }
+
+    // Get selection text
+    size_t sel_len = sel_end - sel_start;
+    char *text = malloc(sel_len + 1);
+    if (!text) {
+        lcl_set_error(interp, "allocation failed");
+        return LCL_RC_ERR;
+    }
+    document_get_text(host->repl_attached_buffer->document, sel_start, text, sel_len);
+    text[sel_len] = '\0';
+
+    // Return {start end text}
+    lcl_value *result = lcl_list_new();
+    lcl_list_push(&result, lcl_int_new((long)sel_start));
+    lcl_list_push(&result, lcl_int_new((long)sel_end));
+    lcl_list_push(&result, lcl_string_new(text));
+    free(text);
+
+    *out = result;
+    return LCL_RC_OK;
+}
+
+// weft::repl::target-cursor -> get cursor position in attached buffer
+static int c_repl_target_cursor(lcl_interp *interp, int argc, lcl_value **argv,
+                                 lcl_value **out) {
+    (void)argc;
+    (void)argv;
+
+    LclHost *host = lcl_interp_get_user_data(interp);
+    if (!host) {
+        lcl_set_error(interp, "no host context");
+        return LCL_RC_ERR;
+    }
+
+    if (!host->repl_attached_buffer) {
+        *out = lcl_int_new(-1);  // Not attached
+        return LCL_RC_OK;
+    }
+
+    Pane *pane = find_pane_for_buffer(host, host->repl_attached_buffer);
+    if (!pane || !pane->view) {
+        *out = lcl_int_new(-1);  // No pane
+        return LCL_RC_OK;
+    }
+
+    size_t cursor = editor_get_cursor_pos(pane->view);
+    *out = lcl_int_new((long)cursor);
+    return LCL_RC_OK;
+}
+
+// weft::repl::goto pos -> move cursor in attached buffer
+static int c_repl_goto(lcl_interp *interp, int argc, lcl_value **argv,
+                        lcl_value **out) {
+    LclHost *host = lcl_interp_get_user_data(interp);
+    if (!host) {
+        lcl_set_error(interp, "no host context");
+        return LCL_RC_ERR;
+    }
+
+    if (!host->repl_attached_buffer) {
+        lcl_set_error(interp, "not attached to a buffer");
+        return LCL_RC_ERR;
+    }
+
+    if (argc < 1) {
+        lcl_set_error(interp, "repl::goto requires position");
+        return LCL_RC_ERR;
+    }
+
+    long pos;
+    if (lcl_value_to_int(argv[0], &pos) != LCL_OK || pos < 0) {
+        lcl_set_error(interp, "repl::goto: invalid position");
+        return LCL_RC_ERR;
+    }
+
+    Pane *pane = find_pane_for_buffer(host, host->repl_attached_buffer);
+    if (!pane || !pane->view) {
+        lcl_set_error(interp, "target buffer has no pane");
+        return LCL_RC_ERR;
+    }
+
+    // Clamp to document length
+    size_t doc_len = document_length(host->repl_attached_buffer->document);
+    if ((size_t)pos > doc_len) {
+        pos = (long)doc_len;
+    }
+
+    editor_set_cursor_pos(pane->view, (size_t)pos);
+
+    *out = lcl_int_new(pos);
+    return LCL_RC_OK;
+}
+
+// weft::inspect::at pos -> show annotations and decorations at position in output buffer
 static int c_inspect_at(lcl_interp *interp, int argc, lcl_value **argv,
                          lcl_value **out) {
     LclHost *host = lcl_interp_get_user_data(interp);
-    if (!host || !host->current_buffer) {
+    Buffer *buffer = get_effective_doc_buffer(host);
+    if (!buffer) {
         lcl_set_error(interp, "no buffer set");
         return LCL_RC_ERR;
     }
@@ -1235,7 +1527,6 @@ static int c_inspect_at(lcl_interp *interp, int argc, lcl_value **argv,
         return LCL_RC_ERR;
     }
 
-    Buffer *buffer = host->current_buffer;
     AnnotStore *store = buffer->annots;
     Document *doc = buffer->document;
 
@@ -1243,8 +1534,31 @@ static int c_inspect_at(lcl_interp *interp, int argc, lcl_value **argv,
     AnnotQuery query = {0};
     annot_store_at(store, (size_t)pos, NULL, &query);
 
+    // Try to get layer decorations from the focused pane
+    const Decoration *decors[32];
+    size_t decor_count = 0;
+    Pane *pane = host->focused_pane_ptr ? *host->focused_pane_ptr : NULL;
+
+    // If REPL is attached, find the pane for the attached buffer
+    if (is_repl_buffer(host->current_buffer) && host->repl_attached_buffer) {
+        // We need to find the pane for the attached buffer
+        // For now, we can't easily do this, so skip decorations
+        pane = NULL;
+    }
+
+    if (pane && pane->view && editor_get_buffer(pane->view) == buffer && pane->layer_stack) {
+        // Ensure decorations are rendered for this position
+        size_t doc_len = document_length(doc);
+        size_t vp_start = (size_t)pos > 256 ? (size_t)pos - 256 : 0;
+        size_t vp_end = (size_t)pos + 256;
+        if (vp_end > doc_len) vp_end = doc_len;
+
+        layer_stack_render(pane->layer_stack, buffer, vp_start, vp_end);
+        decor_count = layer_stack_decorations_at(pane->layer_stack, (size_t)pos, decors, 32);
+    }
+
     // Build output string
-    size_t output_cap = 4096;
+    size_t output_cap = 8192;
     char *output = malloc(output_cap);
     if (!output) {
         annot_query_free(&query);
@@ -1255,7 +1569,7 @@ static int c_inspect_at(lcl_interp *interp, int argc, lcl_value **argv,
 
     // Header
     output_len += snprintf(output + output_len, output_cap - output_len,
-                           ";; Annotations at position %ld\n", pos);
+                           ";; Inspection at position %ld\n", pos);
 
     // Get line info for context
     size_t line_num = document_pos_to_line(doc, (size_t)pos);
@@ -1370,6 +1684,90 @@ static int c_inspect_at(lcl_interp *interp, int argc, lcl_value **argv,
 
             output_len += snprintf(output + output_len, output_cap - output_len, "\n");
         }
+    }
+
+    // Display layer decorations (ephemeral styling from ViewLayers)
+    if (decor_count > 0) {
+        // Ensure we have space for decorations
+        size_t needed = output_len + 512 + (decor_count * 512);
+        if (needed > output_cap) {
+            output_cap = needed * 2;
+            char *new_output = realloc(output, output_cap);
+            if (!new_output) {
+                free(output);
+                annot_query_free(&query);
+                lcl_set_error(interp, "inspect::at: allocation failed");
+                return LCL_RC_ERR;
+            }
+            output = new_output;
+        }
+
+        output_len += snprintf(output + output_len, output_cap - output_len,
+                               ";;\n;; Found %zu layer decoration(s):\n;;\n",
+                               decor_count);
+
+        for (size_t i = 0; i < decor_count; i++) {
+            const Decoration *d = decors[i];
+
+            // Extract the decorated text (up to 80 chars)
+            size_t text_len = d->end - d->start;
+            size_t preview_len = text_len > 80 ? 80 : text_len;
+            char *text_preview = malloc(preview_len + 4);
+            if (text_preview) {
+                document_get_text(doc, d->start, text_preview, preview_len);
+                text_preview[preview_len] = '\0';
+                for (size_t j = 0; j < preview_len; j++) {
+                    if (text_preview[j] == '\n') {
+                        text_preview[j] = ' ';
+                    }
+                }
+                if (text_len > 80) {
+                    strcat(text_preview, "...");
+                }
+            }
+
+            output_len += snprintf(output + output_len, output_cap - output_len,
+                                   "─────────────────────────────────────────\n"
+                                   "Decoration (ephemeral)\n"
+                                   "  Layer: %s\n"
+                                   "  Span:  [%zu, %zu) (%zu bytes)\n"
+                                   "  Text:  \"%s\"\n",
+                                   d->layer_name ? d->layer_name : "(none)",
+                                   d->start, d->end, text_len,
+                                   text_preview ? text_preview : "(error)");
+
+            // Show style info
+            if (d->has_fg || d->has_bg || d->underline) {
+                output_len += snprintf(output + output_len, output_cap - output_len,
+                                       "  Style:\n");
+                if (d->has_fg) {
+                    output_len += snprintf(output + output_len, output_cap - output_len,
+                                           "    fg = #%02X%02X%02X\n",
+                                           d->fg.r, d->fg.g, d->fg.b);
+                }
+                if (d->has_bg) {
+                    output_len += snprintf(output + output_len, output_cap - output_len,
+                                           "    bg = #%02X%02X%02X\n",
+                                           d->bg.r, d->bg.g, d->bg.b);
+                }
+                if (d->underline) {
+                    output_len += snprintf(output + output_len, output_cap - output_len,
+                                           "    underline = true\n");
+                }
+            }
+
+            // Show action if present
+            if (d->action_script) {
+                output_len += snprintf(output + output_len, output_cap - output_len,
+                                       "  Action: %s\n", d->action_script);
+            }
+
+            free(text_preview);
+            output_len += snprintf(output + output_len, output_cap - output_len, "\n");
+        }
+    } else if (query.count == 0) {
+        // Only show "no decorations" if also no annotations
+        // (already shown "no annotations" above)
     }
 
     annot_query_free(&query);
@@ -2415,6 +2813,214 @@ static int c_ts_highlight(lcl_interp *interp, int argc, lcl_value **argv,
     return LCL_RC_OK;
 }
 
+// === Transform Bindings ===
+
+// Helper: Create and display a diff buffer for a patch
+static void show_patch_buffer(LclHost *host, Patch *patch, Buffer *target) {
+    if (!host || !patch || !target || !host->buffer_manager || !host->layout_root_ptr) {
+        return;
+    }
+
+    // Generate diff text
+    char *diff = patch_to_diff(patch, target->document, 3);
+    if (!diff) {
+        return;
+    }
+
+    // Create a diff buffer
+    Buffer *diff_buf = buffer_manager_create(host->buffer_manager);
+    if (!diff_buf) {
+        free(diff);
+        return;
+    }
+
+    // Set buffer content
+    document_insert(diff_buf->document, 0, diff, strlen(diff));
+    free(diff);
+
+    // Add header with actions
+    char header[512];
+    size_t additions, deletions, edit_count;
+    patch_stats(patch, &additions, &deletions, &edit_count);
+    snprintf(header, sizeof(header),
+             ";; Patch: %s\n"
+             ";; %zu edit(s), +%zu/-%zu bytes\n"
+             ";; [weft::transform::apply] [weft::transform::reject]\n"
+             ";;\n",
+             patch->transform_name ? patch->transform_name : "unnamed",
+             edit_count, additions, deletions);
+
+    document_insert(diff_buf->document, 0, header, strlen(header));
+
+    // Create a pane for the diff buffer
+    Pane *new_pane = pane_new(diff_buf, host->char_width, host->line_height);
+    if (!new_pane) {
+        buffer_manager_close(host->buffer_manager, diff_buf);
+        return;
+    }
+
+    // Split current layout horizontally to show new pane
+    LayoutNode *root = *host->layout_root_ptr;
+    LayoutNode *new_split = layout_split_horizontal(root, new_pane);
+
+    if (new_split && !new_split->parent) {
+        *host->layout_root_ptr = new_split;
+    }
+
+    // Recompute layout bounds
+    recompute_layout_bounds(host);
+
+    // Focus the new pane
+    if (host->focused_pane_ptr) {
+        *host->focused_pane_ptr = new_pane;
+    }
+}
+
+// weft::transform::run name ?args...? -> run transform on selection
+static int c_transform_run(lcl_interp *interp, int argc, lcl_value **argv,
+                            lcl_value **out) {
+    if (argc < 1) {
+        lcl_set_error(interp, "transform::run requires a transform name");
+        return LCL_RC_ERR;
+    }
+
+    LclHost *host = lcl_interp_get_user_data(interp);
+    if (!host || !host->current_buffer || !host->current_editor) {
+        lcl_set_error(interp, "no buffer/editor context");
+        return LCL_RC_ERR;
+    }
+
+    const char *name = lcl_value_to_string(argv[0]);
+    if (!name) {
+        lcl_set_error(interp, "transform name must be a string");
+        return LCL_RC_ERR;
+    }
+
+    // Get selection range
+    size_t start, end;
+    if (editor_has_selection(host->current_editor)) {
+        editor_get_selection(host->current_editor, &start, &end);
+    } else {
+        // No selection - use entire document
+        start = 0;
+        end = document_length(host->current_buffer->document);
+    }
+
+    // Collect additional args (if any)
+    const char **args = NULL;
+    if (argc > 1) {
+        args = calloc(argc, sizeof(char *));
+        if (args) {
+            for (int i = 1; i < argc; i++) {
+                args[i - 1] = lcl_value_to_string(argv[i]);
+            }
+            args[argc - 1] = NULL;
+        }
+    }
+
+    // Run the transform
+    Patch *patch = transform_run(name, host->current_buffer, start, end, args);
+    free(args);
+
+    if (!patch) {
+        lcl_set_error(interp, "transform failed or not found");
+        return LCL_RC_ERR;
+    }
+
+    // Store pending patch
+    if (host->pending_patch) {
+        patch_free(host->pending_patch);
+    }
+    host->pending_patch = patch;
+    host->patch_target_buffer = host->current_buffer;
+
+    // Show the diff buffer
+    show_patch_buffer(host, patch, host->current_buffer);
+
+    *out = lcl_string_new("patch created");
+    return LCL_RC_OK;
+}
+
+// weft::transform::apply -> apply the pending patch
+static int c_transform_apply(lcl_interp *interp, int argc, lcl_value **argv,
+                              lcl_value **out) {
+    (void)argc;
+    (void)argv;
+
+    LclHost *host = lcl_interp_get_user_data(interp);
+    if (!host) {
+        lcl_set_error(interp, "no host context");
+        return LCL_RC_ERR;
+    }
+
+    if (!host->pending_patch || !host->patch_target_buffer) {
+        lcl_set_error(interp, "no pending patch to apply");
+        return LCL_RC_ERR;
+    }
+
+    // Apply the patch
+    PatchResult result = patch_apply(host->pending_patch, host->patch_target_buffer);
+
+    // Clean up
+    patch_free(host->pending_patch);
+    host->pending_patch = NULL;
+    host->patch_target_buffer = NULL;
+
+    if (result != PATCH_OK) {
+        lcl_set_error(interp, "failed to apply patch");
+        return LCL_RC_ERR;
+    }
+
+    *out = lcl_string_new("patch applied");
+    return LCL_RC_OK;
+}
+
+// weft::transform::reject -> reject the pending patch
+static int c_transform_reject(lcl_interp *interp, int argc, lcl_value **argv,
+                               lcl_value **out) {
+    (void)argc;
+    (void)argv;
+
+    LclHost *host = lcl_interp_get_user_data(interp);
+    if (!host) {
+        lcl_set_error(interp, "no host context");
+        return LCL_RC_ERR;
+    }
+
+    if (!host->pending_patch) {
+        *out = lcl_string_new("no pending patch");
+        return LCL_RC_OK;
+    }
+
+    // Clean up
+    patch_free(host->pending_patch);
+    host->pending_patch = NULL;
+    host->patch_target_buffer = NULL;
+
+    *out = lcl_string_new("patch rejected");
+    return LCL_RC_OK;
+}
+
+// weft::transform::list -> list available transforms
+static int c_transform_list(lcl_interp *interp, int argc, lcl_value **argv,
+                             lcl_value **out) {
+    (void)argc;
+    (void)argv;
+    (void)interp;
+
+    // Get list of transforms
+    const char *names[64];
+    size_t count = transform_list(names, 64);
+
+    lcl_value *result = lcl_list_new();
+    for (size_t i = 0; i < count; i++) {
+        lcl_list_push(&result, lcl_string_new(names[i]));
+    }
+
+    *out = result;
+    return LCL_RC_OK;
+}
+
 // === Internal: Register Weft Bindings ===
 
 static void register_weft_bindings(lcl_interp *interp) {
@@ -2505,6 +3111,12 @@ static void register_weft_bindings(lcl_interp *interp) {
     lcl_ns_def(weft_ns, "repl", repl_ns);
 
     lcl_ns_def(repl_ns, "open", lcl_c_proc_new("weft::repl::open", c_repl_open));
+    lcl_ns_def(repl_ns, "attach", lcl_c_proc_new("weft::repl::attach", c_repl_attach));
+    lcl_ns_def(repl_ns, "detach", lcl_c_proc_new("weft::repl::detach", c_repl_detach));
+    lcl_ns_def(repl_ns, "target", lcl_c_proc_new("weft::repl::target", c_repl_target));
+    lcl_ns_def(repl_ns, "target-selection", lcl_c_proc_new("weft::repl::target-selection", c_repl_target_selection));
+    lcl_ns_def(repl_ns, "target-cursor", lcl_c_proc_new("weft::repl::target-cursor", c_repl_target_cursor));
+    lcl_ns_def(repl_ns, "goto", lcl_c_proc_new("weft::repl::goto", c_repl_goto));
 
     // Create weft::inspect namespace for annotation inspection
     lcl_value *inspect_ns = lcl_ns_new("inspect");
@@ -2527,6 +3139,15 @@ static void register_weft_bindings(lcl_interp *interp) {
     lcl_ns_def(weft_ns, "ts", ts_ns);
 
     lcl_ns_def(ts_ns, "highlight", lcl_c_proc_new("weft::ts::highlight", c_ts_highlight));
+
+    // Create weft::transform namespace for transform operations
+    lcl_value *transform_ns = lcl_ns_new("transform");
+    lcl_ns_def(weft_ns, "transform", transform_ns);
+
+    lcl_ns_def(transform_ns, "run", lcl_c_proc_new("weft::transform::run", c_transform_run));
+    lcl_ns_def(transform_ns, "apply", lcl_c_proc_new("weft::transform::apply", c_transform_apply));
+    lcl_ns_def(transform_ns, "reject", lcl_c_proc_new("weft::transform::reject", c_transform_reject));
+    lcl_ns_def(transform_ns, "list", lcl_c_proc_new("weft::transform::list", c_transform_list));
 }
 
 // === Public API ===
@@ -2622,6 +3243,10 @@ LclHost *lcl_host_new(void) {
     // Register Weft-specific bindings
     register_weft_bindings(host->interp);
 
+    // Initialize transform registry and built-in transforms
+    transform_registry_init();
+    transform_register_builtins();
+
     return host;
 }
 
@@ -2668,6 +3293,14 @@ void lcl_host_free(LclHost *host) {
 
     // Cleanup tree-sitter highlighters
     ts_hl_cleanup();
+
+    // Free pending patch
+    if (host->pending_patch) {
+        patch_free(host->pending_patch);
+    }
+
+    // Cleanup transform registry
+    transform_registry_cleanup();
 
     if (host->interp) {
         lcl_interp_free(host->interp);
@@ -3497,4 +4130,18 @@ bool lcl_host_dispatch_keybind(LclHost *host, int keycode, int modifiers) {
     }
 
     return false;
+}
+
+// === Accessors for interaction dispatch ===
+
+BufferManager *lcl_host_get_buffer_manager(LclHost *host) {
+    return host ? host->buffer_manager : NULL;
+}
+
+Buffer *lcl_host_get_repl_attached_buffer(LclHost *host) {
+    return host ? host->repl_attached_buffer : NULL;
+}
+
+LayoutNode *lcl_host_get_layout_root(LclHost *host) {
+    return (host && host->layout_root_ptr) ? *host->layout_root_ptr : NULL;
 }

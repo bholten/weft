@@ -35,6 +35,9 @@ Buffer *buffer_manager_create(BufferManager *bm);
 Buffer *buffer_manager_open_file(BufferManager *bm, const char *path);
 void buffer_manager_close(BufferManager *bm, Buffer *buf);
 
+// Find buffer by file path (returns NULL if not found)
+Buffer *buffer_manager_find_by_path(BufferManager *bm, const char *path);
+
 // Buffer reference counting
 void buffer_ref(Buffer *buf);
 void buffer_unref(Buffer *buf);

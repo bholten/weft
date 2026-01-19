@@ -12,6 +12,7 @@ typedef struct InteractEvent InteractEvent;
 typedef struct BufferManager BufferManager;
 typedef struct LayoutNode LayoutNode;
 typedef struct Pane Pane;
+typedef struct Patch Patch;
 
 // Interaction type enum (mirrors InteractType from interaction.h)
 typedef enum {
@@ -117,6 +118,13 @@ typedef struct LclHost {
 
     // Config directory path
     char *config_dir;
+
+    // Pending patch for transform preview
+    Patch *pending_patch;
+    Buffer *patch_target_buffer;
+
+    // REPL attachment - when set, doc commands in REPL operate on this buffer
+    Buffer *repl_attached_buffer;
 } LclHost;
 
 // === Lifecycle ===
@@ -255,5 +263,16 @@ void lcl_host_register_keybind(LclHost *host, int keycode, int modifiers,
 // Try to dispatch a keybinding for a key event
 // Returns true if a keybinding was found and executed
 bool lcl_host_dispatch_keybind(LclHost *host, int keycode, int modifiers);
+
+// === Accessors for interaction dispatch ===
+
+// Get the buffer manager
+BufferManager *lcl_host_get_buffer_manager(LclHost *host);
+
+// Get the REPL attached buffer (NULL if not attached)
+Buffer *lcl_host_get_repl_attached_buffer(LclHost *host);
+
+// Get the layout root (for finding panes)
+LayoutNode *lcl_host_get_layout_root(LclHost *host);
 
 #endif // WEFT_LCL_HOST_H

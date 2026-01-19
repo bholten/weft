@@ -90,6 +90,7 @@ size_t editor_screen_to_pos(const Editor *e, int x, int y);
 
 // Query
 size_t editor_get_cursor_pos(const Editor *e);
+void editor_set_cursor_pos(Editor *e, size_t pos);    // Set cursor to position
 bool editor_cursor_is_visible(const Editor *e);
 
 // Selection

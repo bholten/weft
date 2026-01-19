@@ -887,6 +887,22 @@ size_t editor_get_cursor_pos(const Editor *e) {
     return e->cursor_pos;
 }
 
+void editor_set_cursor_pos(Editor *e, size_t pos) {
+    if (!e) {
+        return;
+    }
+
+    // Clamp to document length
+    size_t doc_len = document_length(e->buffer->document);
+    if (pos > doc_len) {
+        pos = doc_len;
+    }
+
+    e->cursor_pos = pos;
+    update_target_column(e);
+    editor_scroll_to_cursor(e);
+}
+
 bool editor_cursor_is_visible(const Editor *e) {
     if (!e) {
         return false;

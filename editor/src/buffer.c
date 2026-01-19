@@ -144,6 +144,21 @@ void buffer_manager_close(BufferManager *bm, Buffer *buf) {
     }
 }
 
+Buffer *buffer_manager_find_by_path(BufferManager *bm, const char *path) {
+    if (!bm || !path) {
+        return NULL;
+    }
+
+    for (size_t i = 0; i < bm->count; i++) {
+        Buffer *buf = bm->buffers[i];
+        if (buf->file_path && strcmp(buf->file_path, path) == 0) {
+            return buf;
+        }
+    }
+
+    return NULL;
+}
+
 void buffer_ref(Buffer *buf) {
     if (buf) {
         buf->ref_count++;

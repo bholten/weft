@@ -149,6 +149,21 @@ Weft embeds [Lcl](submodules/lcl), a Tcl-like language with lexical scoping, for
 - `weft::buffer::open-at path line` - Open file and jump to line
 - `weft::buffer::open-output name content` - Create scratch buffer
 
+**REPL bindings:**
+- `weft::repl::open` - Open the Lcl REPL
+- `weft::repl::attach` - Attach REPL to current buffer
+- `weft::repl::detach` - Detach from buffer
+- `weft::repl::target` - Get attached buffer info
+- `weft::repl::target-selection` - Get selection from attached buffer
+- `weft::repl::target-cursor` - Get cursor position in attached buffer
+- `weft::repl::goto pos` - Move cursor in attached buffer
+
+**Transform bindings:**
+- `weft::transform::run name start end` - Run transform, show diff preview
+- `weft::transform::apply` - Apply pending patch
+- `weft::transform::reject` - Reject pending patch
+- `weft::transform::list` - List available transforms
+
 **Shell bindings:**
 - `weft::shell::exec cmd` - Execute shell command, returns `{status stdout stderr}`
 
@@ -157,6 +172,9 @@ Weft embeds [Lcl](submodules/lcl), a Tcl-like language with lexical scoping, for
 
 **Plumber bindings:**
 - `weft::plumb::scan` - Scan buffer for file:line patterns, add clickable annotations
+
+**Inspector bindings:**
+- `weft::inspect::at pos` - Show annotations and decorations at position
 
 ## Architecture
 
@@ -252,18 +270,102 @@ Errors are shown in red:
 ;; ERROR: unknown command: undefined-command
 ```
 
+### REPL Buffer Attachment
+
+The REPL can **attach** to another buffer, turning it into a powerful lens for exploring and manipulating that buffer's contents. When attached:
+
+- `weft::doc::*` commands operate on the **attached buffer**, not the REPL
+- `weft::annot::*` commands operate on the **attached buffer**
+- Middle-click on selected text in the attached buffer **inserts it into the REPL** (quoted)
+
+**Attachment commands:**
+
+| Command | Description |
+|---------|-------------|
+| `weft::repl::attach` | Attach REPL to the current buffer (run from target buffer) |
+| `weft::repl::detach` | Detach from buffer |
+| `weft::repl::target` | Show info about attached buffer |
+| `weft::repl::target-selection` | Get selection from attached buffer as `{start end "text"}` |
+| `weft::repl::target-cursor` | Get cursor position in attached buffer |
+| `weft::repl::goto <pos>` | Move cursor in attached buffer |
+
+### REPL Tutorial: Exploring a Buffer
+
+Here's a quick workflow demonstrating REPL attachment:
+
+**1. Open a file and attach the REPL:**
+```
+;; Focus on the file you want to explore, then run:
+weft::repl::attach
+;; => myfile.c
+```
+
+**2. Query the document from the REPL:**
+```
+;; Now doc commands work on myfile.c, not the REPL:
+weft::doc::length
+;; => 4523
+
+weft::doc::line-count
+;; => 156
+
+;; Get text from the attached buffer:
+weft::doc::text 0 50
+;; => "#include <stdio.h>\n\nint main(int argc..."
+```
+
+**3. Navigate via the REPL:**
+```
+;; Jump to a specific position:
+weft::repl::goto 100
+
+;; Get current cursor position:
+weft::repl::target-cursor
+;; => 100
+```
+
+**4. Work with selections:**
+```
+;; Select some text in the target buffer, then:
+weft::repl::target-selection
+;; => {45 67 "selected text here"}
+
+;; Or middle-click on selected text to insert it into the REPL!
+```
+
+**5. Add annotations from the REPL:**
+```
+;; Highlight a range in the attached buffer:
+weft::annot::add 100 120 "highlight" style:bg yellow
+
+;; Query annotations:
+weft::annot::at 110
+;; => {42}
+```
+
+**6. Detach when done:**
+```
+weft::repl::detach
+;; => detached from myfile.c
+```
+
+This workflow is especially powerful for:
+- **Debugging**: Inspect document structure and annotations interactively
+- **Batch operations**: Add annotations across multiple positions
+- **Learning**: Understand how Weft's document model works
+
 ## Annotation Inspector
 
 Press **Ctrl+I** to inspect all annotations at the cursor position. This opens a new buffer showing:
 
 - Position information (byte offset, line, column)
-- Each annotation's ID, layer, and span
-- The annotated text (preview)
-- All metadata key/value pairs
+- **Persistent annotations** from the AnnotStore (with ID, layer, span, metadata)
+- **Ephemeral decorations** from ViewLayers (like tree-sitter highlighting)
+- The annotated/decorated text (preview)
 
 Example output:
 ```
-;; Annotations at position 1234
+;; Inspection at position 1234
 ;; Line 45, Column 12
 ;;
 ;; Found 2 annotation(s):
@@ -286,11 +388,66 @@ Annotation #12
   Source: ~/.config/weft/syntax_c.lcl
   Metadata:
     action:on_middle_click = "weft::buffer::open-at \"/path/to/file.c\" 100"
+
+;;
+;; Found 1 layer decoration(s):
+;;
+─────────────────────────────────────────
+Decoration (ephemeral)
+  Layer: tree-sitter
+  Span:  [1230, 1250) (20 bytes)
+  Text:  "function_name"
+  Style:
+    fg = #88CC88
 ```
 
-The **Source** field shows which script created each annotation (provenance tracking).
+The **Source** field shows which script created each annotation (provenance tracking). Decorations are computed on-the-fly by view layers and don't persist.
 
-You can also use `weft::inspect::at <position>` from the REPL or in scripts.
+You can also use `weft::inspect::at <position>` from the REPL or in scripts. When the REPL is attached to a buffer, the inspector operates on that buffer.
+
+## Transforms
+
+Transforms are structured text operations that produce a **patch** (a diff) which you can preview before applying. This provides a safe, reviewable way to make bulk changes.
+
+### Built-in Transforms
+
+| Transform | Description |
+|-----------|-------------|
+| `upper` | Convert text to UPPERCASE |
+| `lower` | Convert text to lowercase |
+| `sort-lines` | Sort lines alphabetically |
+| `reverse-lines` | Reverse line order |
+
+### Using Transforms
+
+**From the REPL:**
+```tcl
+;; Select some text, then run a transform on the selection:
+let sel [weft::repl::target-selection]
+weft::transform::run "upper" [List::get $sel 0] [List::get $sel 1]
+```
+
+**Transform commands:**
+
+| Command | Description |
+|---------|-------------|
+| `weft::transform::run name start end` | Run transform, opens diff preview |
+| `weft::transform::apply` | Apply the pending patch |
+| `weft::transform::reject` | Reject the pending patch |
+| `weft::transform::list` | List available transforms |
+
+**Diff preview:**
+
+When you run a transform, a diff buffer opens showing the proposed changes:
+```diff
+--- original
++++ modified
+@@ -1,3 +1,3 @@
+-hello world
++HELLO WORLD
+```
+
+Review the diff, then use middle-click on `[Apply]` or `[Reject]` in the diff buffer (or run `weft::transform::apply`/`weft::transform::reject` from the REPL).
 
 ## Tree-sitter Syntax Highlighting
 
@@ -339,6 +496,9 @@ To add tree-sitter support for a new language:
 - [x] Lcl REPL for interactive scripting
 - [x] Annotation inspector (Ctrl+I)
 - [x] Tree-sitter integration for AST-based syntax highlighting
+- [x] REPL buffer attachment (lens into other buffers)
+- [x] Transform system with diff preview
+- [x] Enhanced inspector with layer decorations
 - [ ] More syntax highlighting layers
 - [ ] Auto-trigger layers on document change (with dirty tracking)
 - [ ] Fuel-limited sandboxing for untrusted layers

@@ -1390,17 +1390,7 @@ void pane_goto_execute(Pane *p) {
     // Move cursor there
     Editor *e = pane_get_editor(p);
     editor_clear_selection(e);
-
-    // Navigate to position (this is a bit hacky - should have editor_set_cursor_pos)
-    size_t current = editor_get_cursor_pos(e);
-    while (editor_get_cursor_pos(e) > target_pos) {
-        editor_move_cursor_left(e);
-    }
-    while (editor_get_cursor_pos(e) < target_pos) {
-        editor_move_cursor_right(e);
-    }
-
-    editor_scroll_to_cursor(e);
+    editor_set_cursor_pos(e, target_pos);
     pane_goto_hide(p);
 }
 

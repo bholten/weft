@@ -125,6 +125,52 @@ void interact_event_free(InteractEvent *ie) {
 
 // === Dispatch ===
 
+// Helper: Find the REPL buffer by name
+static Buffer *find_repl_buffer(LclHost *lcl) {
+    BufferManager *bm = lcl_host_get_buffer_manager(lcl);
+    if (!bm) {
+        return NULL;
+    }
+    return buffer_manager_find_by_path(bm, "*lcl*");
+}
+
+// Helper: Find the pane for a buffer and insert text at cursor
+static bool insert_into_repl(LclHost *lcl, Buffer *repl_buf, const char *text) {
+    if (!lcl || !repl_buf || !text) {
+        return false;
+    }
+
+    // Find the pane for the REPL buffer
+    LayoutNode *root = lcl_host_get_layout_root(lcl);
+    if (!root) {
+        return false;
+    }
+
+    // We need to find the pane and insert into its editor
+    // For now, just insert at end of document as a simple approach
+    Document *doc = repl_buf->document;
+    size_t doc_len = document_length(doc);
+
+    // Insert the text (quoted) at the end
+    size_t text_len = strlen(text);
+    char *quoted = malloc(text_len + 3);  // "text"
+    if (!quoted) {
+        return false;
+    }
+    quoted[0] = '"';
+    memcpy(quoted + 1, text, text_len);
+    quoted[text_len + 1] = '"';
+    quoted[text_len + 2] = '\0';
+
+    document_insert(doc, doc_len, quoted, text_len + 2);
+    free(quoted);
+
+    // Mark buffer modified
+    buffer_set_modified(repl_buf, true);
+
+    return true;
+}
+
 InteractResult interaction_dispatch(LclHost *lcl, Editor *editor, InteractEvent *ie,
                                      LayerStack *layer_stack) {
     if (!lcl || !editor || !ie) {
@@ -134,6 +180,20 @@ InteractResult interaction_dispatch(LclHost *lcl, Editor *editor, InteractEvent 
     Buffer *buffer = editor_get_buffer(editor);
     if (!buffer || !buffer->annots) {
         return INTERACT_UNHANDLED;
+    }
+
+    // Check for REPL insertion: middle-click with selection on attached buffer
+    if (ie->type == INTERACT_MIDDLE_CLICK && ie->has_selection && ie->selected_text) {
+        Buffer *attached = lcl_host_get_repl_attached_buffer(lcl);
+        if (attached == buffer) {
+            // This buffer is the REPL's attachment target
+            // Insert the selection into the REPL
+            Buffer *repl_buf = find_repl_buffer(lcl);
+            if (repl_buf && insert_into_repl(lcl, repl_buf, ie->selected_text)) {
+                ie->handled = true;
+                return INTERACT_HANDLED;
+            }
+        }
     }
 
     // First, check LayerStack decorations for actions (computed layers like plumber)
