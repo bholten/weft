@@ -110,6 +110,24 @@ weft::config::handler "my-handler" "middle-click" {
 }
 ```
 
+**Keybindings**:
+```tcl
+;; Override Ctrl+W to close pane via script
+weft::config::keybind "ctrl+w" { weft::pane::close }
+
+;; Pane navigation
+weft::config::keybind "ctrl+tab" { weft::pane::next }
+weft::config::keybind "ctrl+shift+tab" { weft::pane::prev }
+
+;; Function key shortcuts
+weft::config::keybind "f5" {
+    let result [weft::shell::exec "make"]
+    weft::buffer::open-output "*build*" [List::get $result 1]
+}
+```
+
+Keybinding key-string format: `modifier+modifier+key` where modifiers are `ctrl`, `shift`, `alt` and keys can be `a`-`z`, `0`-`9`, `f1`-`f12`, or named keys like `return`, `escape`, `tab`, `space`, etc.
+
 ### Lcl Scripting
 
 Weft embeds [Lcl](submodules/lcl), a Tcl-like language with lexical scoping, for scriptable annotation layers and interaction handlers.
@@ -196,6 +214,8 @@ This means if you have "Hello" styled in red and insert "Dear " before it, "Hell
 | Ctrl+F | Find |
 | Ctrl+H | Find and Replace |
 | Ctrl+G | Go to line |
+| Ctrl+W | Close current pane |
+| Ctrl+Tab | Cycle focus between panes |
 | Ctrl+` | Open Lcl REPL |
 | Ctrl+I | Inspect annotations at cursor |
 | Ctrl+Enter | Execute selection or line |

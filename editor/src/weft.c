@@ -237,7 +237,8 @@ SDL_AppResult SDL_AppInit(void **app_state, int argc, char **argv) {
     int win_w, win_h;
     SDL_GetWindowSize(platform_get_window(ctx->app.platform), &win_w, &win_h);
     lcl_host_set_app_context(ctx->app.lcl, ctx->app.buffers,
-                              &ctx->app.layout_root, ctx,
+                              &ctx->app.layout_root, &ctx->app.focused_pane,
+                              ctx,
                               char_width, line_height,
                               win_w, win_h);
 
@@ -249,45 +250,8 @@ SDL_AppResult SDL_AppInit(void **app_state, int argc, char **argv) {
     // Apply file type associations to initial buffer (syntax highlighting, etc.)
     lcl_host_apply_filetypes(ctx->app.lcl, initial_buffer);
 
-    // Register default Acme-like middle-click handler
-    // Recognizes:
-    //   /path/to/file -> open file
-    //   weft::* -> evaluate as Lcl command
-    //   anything else -> execute as shell command
-    const char *acme_handler =
-        "let sel [weft::interact::selection]\n"
-        "var text \"\"\n"
-        "if [> [len $sel] 0] {\n"
-        "    set! text [List::index $sel 2]\n"
-        "} else {\n"
-        "    set! text [weft::interact::word-at-pos]\n"
-        "}\n"
-        "if [== $text \"\"] { return }\n"
-        "puts (str \"acme: executing '\" $text \"'\")\n"
-        "if [== [String::index $text 0] \"/\"] {\n"
-        "    weft::buffer::open $text\n"
-        "    weft::interact::handled\n"
-        "    return\n"
-        "}\n"
-        "if [== [String::range $text 0 6] \"weft::\"] {\n"
-        "    eval $text\n"
-        "    weft::interact::handled\n"
-        "    return\n"
-        "}\n"
-        "let result [weft::shell::exec $text]\n"
-        "let stdout [List::index $result 3]\n"
-        "let stderr [List::index $result 5]\n"
-        "if [> [len $stdout] 0] {\n"
-        "    weft::buffer::open-output (str \"+\" $text) $stdout\n"
-        "} else {\n"
-        "    if [> [len $stderr] 0] {\n"
-        "        weft::buffer::open-output (str \"!\" $text) $stderr\n"
-        "    }\n"
-        "}\n"
-        "weft::interact::handled\n";
-
-    lcl_host_register_handler(ctx->app.lcl, "acme-middle-click",
-                               HANDLER_MIDDLE_CLICK, acme_handler, 0);
+    // Note: Acme-like middle-click handler is now configured in ~/.config/weft/init.lcl
+    // This allows users to customize the behavior without recompiling.
 
     // Test Lcl evaluation
     const char *error_msg = NULL;
@@ -565,6 +529,37 @@ SDL_AppResult SDL_AppEvent(void *app_state, SDL_Event *event) {
         lcl_host_set_window_size(ctx->app.lcl, event->window.data1, event->window.data2);
     }
 
+    // Try custom keybindings for any key event
+    if (event->type == SDL_EVENT_KEY_DOWN) {
+        SDL_Keycode key = event->key.key;
+        SDL_Keymod mod = event->key.mod;
+
+        // Build modifier flags
+        int keybind_mods = 0;
+        if (mod & SDL_KMOD_CTRL) {
+            keybind_mods |= KEYBIND_CTRL;
+        }
+        if (mod & SDL_KMOD_SHIFT) {
+            keybind_mods |= KEYBIND_SHIFT;
+        }
+        if (mod & SDL_KMOD_ALT) {
+            keybind_mods |= KEYBIND_ALT;
+        }
+
+        // Set current buffer context for keybinding scripts
+        if (ctx->app.focused_pane) {
+            Editor *editor = pane_get_editor(ctx->app.focused_pane);
+            Buffer *buffer = editor_get_buffer(editor);
+            lcl_host_set_buffer(ctx->app.lcl, buffer);
+        }
+
+        if (lcl_host_dispatch_keybind(ctx->app.lcl, key, keybind_mods)) {
+            // Recompute layout in case panes were added/removed
+            layout_compute_bounds(ctx->app.layout_root, get_window_rect(ctx));
+            return SDL_APP_CONTINUE;
+        }
+    }
+
     // Handle app-level key commands (split/close/focus)
     if (event->type == SDL_EVENT_KEY_DOWN && (event->key.mod & SDL_KMOD_CTRL)) {
         SDL_Keycode key = event->key.key;
@@ -649,6 +644,38 @@ SDL_AppResult SDL_AppEvent(void *app_state, SDL_Event *event) {
             Pane *next = layout_next_pane(ctx->app.layout_root, ctx->app.focused_pane);
             if (next) {
                 ctx->app.focused_pane = next;
+            }
+            return SDL_APP_CONTINUE;
+        }
+
+        // Ctrl+W: Close current pane
+        if (key == SDLK_W) {
+            if (ctx->app.focused_pane && ctx->app.layout_root) {
+                // Find the next pane to focus before closing
+                Pane *next = layout_next_pane(ctx->app.layout_root, ctx->app.focused_pane);
+                if (next == ctx->app.focused_pane) {
+                    next = NULL;  // Only one pane, will become NULL
+                }
+
+                // Close the pane
+                LayoutNode *new_root = layout_close_pane(ctx->app.layout_root,
+                                                          ctx->app.focused_pane);
+
+                if (new_root) {
+                    // Update root and focus
+                    ctx->app.layout_root = new_root;
+                    ctx->app.focused_pane = next ? next : layout_first_pane(new_root);
+
+                    // Recompute layout bounds
+                    int win_w, win_h;
+                    SDL_GetWindowSize(platform_get_window(ctx->app.platform), &win_w, &win_h);
+                    SDL_Rect available = { 0, 0, win_w, win_h };
+                    layout_compute_bounds(ctx->app.layout_root, available);
+                } else {
+                    // No panes left - exit
+                    ctx->app.running = false;
+                    return SDL_APP_SUCCESS;
+                }
             }
             return SDL_APP_CONTINUE;
         }

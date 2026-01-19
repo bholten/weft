@@ -338,6 +338,35 @@ Pane *layout_next_pane(LayoutNode *root, Pane *current) {
     return result;
 }
 
+Pane *layout_prev_pane(LayoutNode *root, Pane *current) {
+    if (!root) {
+        return NULL;
+    }
+
+    Pane **panes = NULL;
+    size_t count = 0;
+    size_t cap = 0;
+
+    collect_panes(root, &panes, &count, &cap);
+
+    if (count == 0) {
+        free(panes);
+        return NULL;
+    }
+
+    // Find current pane and return previous
+    Pane *result = panes[count - 1];  // Default to last
+    for (size_t i = 0; i < count; i++) {
+        if (panes[i] == current) {
+            result = panes[(i + count - 1) % count];
+            break;
+        }
+    }
+
+    free(panes);
+    return result;
+}
+
 LayoutNode *layout_divider_at_point(LayoutNode *node, int x, int y) {
     if (!node || node->type == LAYOUT_LEAF) {
         return NULL;

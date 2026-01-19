@@ -4,6 +4,7 @@
 ;; behavior:
 ;; - If there's a selection, use the selected text
 ;; - Otherwise, use the word under the cursor
+;; - If the text starts with "weft::" or "load" or "[", execute as Lcl
 ;; - If the text looks like a file path (starts with /), open the file
 ;; - Otherwise, execute it as a shell command and show output in a new buffer
 
@@ -21,6 +22,27 @@ if [> [len $sel] 0] {
 
 ;; Nothing to execute
 if [== $text ""] {
+    return
+}
+
+;; Check for weft:: command (execute as Lcl)
+if [== [String::find $text "weft::"] 0] {
+    eval $text
+    weft::interact::handled
+    return
+}
+
+;; Check for load command (execute as Lcl)
+if [== [String::find $text "load "] 0] {
+    eval $text
+    weft::interact::handled
+    return
+}
+
+;; Check for Lcl expression [...]
+if [== [String::index $text 0] "\["] {
+    eval $text
+    weft::interact::handled
     return
 }
 

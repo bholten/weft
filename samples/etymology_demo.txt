@@ -1,0 +1,85 @@
+Etymology Demo - Word Origin Highlighting
+==========================================
+
+>>> SELECT the next line, then press Ctrl+Enter (or middle-click) <<<
+>>> This simple test should turn the first 10 characters red <<<
+load "/home/brennan/dev/weft/layers/test_simple.lcl"
+
+>>> SELECT the next line, then press Ctrl+Enter to apply etymology <<<
+load "/home/brennan/dev/weft/layers/etymology.lcl"
+
+This sample demonstrates how word origins affect the "feel" of prose.
+Germanic words (amber) feel direct and visceral.
+Latin words (blue) feel formal and intellectual.
+Greek words (purple) feel scholarly and technical.
+
+Try pressing Ctrl+I on any word to inspect its etymology annotation!
+
+
+PASSAGE 1: Germanic Style (direct, visceral, earthy)
+----------------------------------------------------
+
+The man walked through the cold night. His heart beat fast. Fear gripped
+his gut. The wind howled and bit at his skin. He thought of home, of
+fire and warmth, of his wife and children asleep in their beds.
+
+He had to go on. Death followed him. The dark wood stretched out before
+him, endless and deep. Trees stood like ghosts in the moonlight. An owl
+called out. Something stirred in the brush.
+
+He ran. His feet pounded the hard earth. Blood rushed in his ears. Breath
+came sharp and fast. He did not look back. He could not stop.
+
+
+PASSAGE 2: Latinate Style (formal, intellectual, abstract)
+----------------------------------------------------------
+
+The individual proceeded through the nocturnal environment. His cardiac
+function accelerated considerably. Apprehension dominated his emotional
+state. The atmospheric conditions presented significant challenges to his
+physical comfort.
+
+He contemplated his residence, the thermal regulations and familial
+relationships that characterized his domestic situation. His spouse and
+offspring remained in a state of repose.
+
+Continuation was imperative. Mortality pursued his position. The arboreal
+region extended infinitely, demonstrating considerable depth. The vegetation
+assumed spectral qualities in the lunar illumination.
+
+
+PASSAGE 3: Mixed (natural prose uses both)
+------------------------------------------
+
+The old professor sat in his study, surrounded by books. He had spent
+his life in pursuit of knowledge, searching for truth in ancient texts.
+
+His students often asked him: what is the secret to understanding?
+
+He would smile and say: "Use simple words when you can. The heart knows
+what the mind cannot explain. But when you need to be precise, when the
+idea demands it, then reach for the longer words. They carry the weight
+of centuries of thought."
+
+Good writing, he believed, was a dance between the gut and the intellect,
+between the earthy and the abstract. Neither alone was sufficient.
+
+
+PASSAGE 4: Technical/Greek (scholarly, scientific)
+--------------------------------------------------
+
+The analysis of the phenomenon required systematic methodology. The
+hypothesis suggested a paradigm shift in our understanding of atomic
+physics. Through careful diagnosis, the researchers identified the
+underlying mechanism.
+
+Philosophy and psychology both contributed to the theoretical framework.
+The synthesis of biology and chemistry opened new avenues of investigation.
+Mathematical models provided the basis for experimental validation.
+
+
+TRY IT YOURSELF
+---------------
+
+Write some text here and see how the colors reveal its character!
+

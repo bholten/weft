@@ -54,9 +54,10 @@ LayoutNode *layout_find_pane(LayoutNode *root, Pane *pane);
 // Traversal
 void layout_for_each_pane(LayoutNode *node, LayoutPaneCallback cb, void *data);
 
-// Get first/next pane for focus cycling
+// Get first/next/prev pane for focus cycling
 Pane *layout_first_pane(LayoutNode *node);
 Pane *layout_next_pane(LayoutNode *root, Pane *current);
+Pane *layout_prev_pane(LayoutNode *root, Pane *current);
 
 // Divider hit testing (returns the split node if hit, NULL otherwise)
 // 4px divider zones between panes

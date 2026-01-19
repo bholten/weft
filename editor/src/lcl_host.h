@@ -11,6 +11,7 @@ typedef struct Editor Editor;
 typedef struct InteractEvent InteractEvent;
 typedef struct BufferManager BufferManager;
 typedef struct LayoutNode LayoutNode;
+typedef struct Pane Pane;
 
 // Interaction type enum (mirrors InteractType from interaction.h)
 typedef enum {
@@ -50,6 +51,19 @@ typedef struct {
     bool use_tabs;        // true = insert tabs, false = insert spaces
 } IndentSettings;
 
+// Registered keybinding: maps a key combination to an Lcl script
+typedef struct {
+    int keycode;          // SDL_Keycode (e.g., SDLK_W)
+    int modifiers;        // Modifier flags: KEYBIND_CTRL, KEYBIND_SHIFT, KEYBIND_ALT
+    char *script;         // Lcl script to execute
+    bool enabled;
+} RegisteredKeybind;
+
+// Keybinding modifier flags
+#define KEYBIND_CTRL   0x01
+#define KEYBIND_SHIFT  0x02
+#define KEYBIND_ALT    0x04
+
 // Lcl host context - manages the Lcl interpreter for Weft
 typedef struct LclHost {
     lcl_interp *interp;     // The Lcl interpreter
@@ -75,6 +89,7 @@ typedef struct LclHost {
     // Buffer manager and layout for buffer operations
     BufferManager *buffer_manager;
     LayoutNode **layout_root_ptr;    // Pointer to layout root (for adding panes)
+    Pane **focused_pane_ptr;         // Pointer to focused pane (for setting focus on new panes)
     void *app_context;               // Opaque pointer to app context
 
     // Renderer metrics for creating panes
@@ -94,6 +109,11 @@ typedef struct LclHost {
     IndentSettings *indent_settings;
     size_t indent_count;
     size_t indent_cap;
+
+    // Keybindings
+    RegisteredKeybind *keybindings;
+    size_t keybind_count;
+    size_t keybind_cap;
 
     // Config directory path
     char *config_dir;
@@ -191,7 +211,8 @@ bool lcl_host_dispatch_global_handlers(LclHost *host, InteractEvent *event, Edit
 
 // Set the buffer manager and layout root for buffer operations
 void lcl_host_set_app_context(LclHost *host, BufferManager *bm,
-                               LayoutNode **layout_root, void *app_ctx,
+                               LayoutNode **layout_root, Pane **focused_pane,
+                               void *app_ctx,
                                int char_width, int line_height,
                                int window_width, int window_height);
 
@@ -224,5 +245,15 @@ const IndentSettings *lcl_host_get_indent(LclHost *host, const char *extension);
 
 // Get the config directory path
 const char *lcl_host_get_config_dir(LclHost *host);
+
+// === Keybinding Registration ===
+
+// Register a keybinding (modifiers: KEYBIND_CTRL, KEYBIND_SHIFT, KEYBIND_ALT)
+void lcl_host_register_keybind(LclHost *host, int keycode, int modifiers,
+                                const char *script);
+
+// Try to dispatch a keybinding for a key event
+// Returns true if a keybinding was found and executed
+bool lcl_host_dispatch_keybind(LclHost *host, int keycode, int modifiers);
 
 #endif // WEFT_LCL_HOST_H

@@ -1,0 +1,4 @@
+;; Simple test layer - just add one annotation
+puts "Test layer starting..."
+weft::annot::add 0 10 "test" "style:fg" "#FF0000"
+puts "Test layer done!"

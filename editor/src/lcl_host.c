@@ -1040,6 +1040,11 @@ static int c_buffer_open(lcl_interp *interp, int argc, lcl_value **argv,
     // Recompute layout bounds
     recompute_layout_bounds(host);
 
+    // Focus the new pane
+    if (host->focused_pane_ptr) {
+        *host->focused_pane_ptr = new_pane;
+    }
+
     *out = lcl_list_new();
     return LCL_RC_OK;
 }
@@ -1106,6 +1111,11 @@ static int c_buffer_open_output(lcl_interp *interp, int argc, lcl_value **argv,
 
     // Recompute layout bounds
     recompute_layout_bounds(host);
+
+    // Focus the new pane
+    if (host->focused_pane_ptr) {
+        *host->focused_pane_ptr = new_pane;
+    }
 
     *out = lcl_list_new();
     return LCL_RC_OK;
@@ -1195,6 +1205,11 @@ static int c_repl_open(lcl_interp *interp, int argc, lcl_value **argv,
 
     // Recompute layout bounds
     recompute_layout_bounds(host);
+
+    // Focus the new pane
+    if (host->focused_pane_ptr) {
+        *host->focused_pane_ptr = new_pane;
+    }
 
     *out = lcl_list_new();
     return LCL_RC_OK;
@@ -1403,6 +1418,11 @@ static int c_inspect_at(lcl_interp *interp, int argc, lcl_value **argv,
     // Recompute layout bounds
     recompute_layout_bounds(host);
 
+    // Focus the new pane
+    if (host->focused_pane_ptr) {
+        *host->focused_pane_ptr = new_pane;
+    }
+
     *out = lcl_list_new();
     return LCL_RC_OK;
 }
@@ -1466,6 +1486,11 @@ static int c_buffer_open_at(lcl_interp *interp, int argc, lcl_value **argv,
     // Recompute layout bounds
     recompute_layout_bounds(host);
 
+    // Focus the new pane
+    if (host->focused_pane_ptr) {
+        *host->focused_pane_ptr = new_pane;
+    }
+
     // Jump to the specified line (1-indexed)
     if (editor && new_buffer->document) {
         // Convert 1-indexed line to 0-indexed
@@ -1485,6 +1510,114 @@ static int c_buffer_open_at(lcl_interp *interp, int argc, lcl_value **argv,
     }
 
     *out = lcl_list_new();
+    return LCL_RC_OK;
+}
+
+// === Internal: Pane Commands ===
+
+// weft::pane::close -> close the currently focused pane
+static int c_pane_close(lcl_interp *interp, int argc, lcl_value **argv,
+                         lcl_value **out) {
+    (void)argc;
+    (void)argv;
+
+    LclHost *host = lcl_interp_get_user_data(interp);
+    if (!host || !host->layout_root_ptr || !host->focused_pane_ptr) {
+        lcl_set_error(interp, "no app context");
+        return LCL_RC_ERR;
+    }
+
+    LayoutNode *root = *host->layout_root_ptr;
+    Pane *focused = *host->focused_pane_ptr;
+
+    if (!root || !focused) {
+        *out = lcl_int_new(0);  // Nothing to close
+        return LCL_RC_OK;
+    }
+
+    // Find the next pane to focus before closing
+    Pane *next = layout_next_pane(root, focused);
+    if (next == focused) {
+        next = NULL;  // Only one pane
+    }
+
+    // Close the pane
+    LayoutNode *new_root = layout_close_pane(root, focused);
+
+    if (new_root) {
+        *host->layout_root_ptr = new_root;
+        *host->focused_pane_ptr = next ? next : layout_first_pane(new_root);
+        recompute_layout_bounds(host);
+        *out = lcl_int_new(1);  // Success
+    } else {
+        // Last pane closed - return 0 to indicate app should quit
+        *host->layout_root_ptr = NULL;
+        *host->focused_pane_ptr = NULL;
+        *out = lcl_int_new(0);
+    }
+
+    return LCL_RC_OK;
+}
+
+// weft::pane::next -> focus the next pane (cycle)
+static int c_pane_next(lcl_interp *interp, int argc, lcl_value **argv,
+                        lcl_value **out) {
+    (void)argc;
+    (void)argv;
+
+    LclHost *host = lcl_interp_get_user_data(interp);
+    if (!host || !host->layout_root_ptr || !host->focused_pane_ptr) {
+        lcl_set_error(interp, "no app context");
+        return LCL_RC_ERR;
+    }
+
+    LayoutNode *root = *host->layout_root_ptr;
+    Pane *focused = *host->focused_pane_ptr;
+
+    if (!root || !focused) {
+        *out = lcl_int_new(0);
+        return LCL_RC_OK;
+    }
+
+    Pane *next = layout_next_pane(root, focused);
+    if (next && next != focused) {
+        *host->focused_pane_ptr = next;
+        *out = lcl_int_new(1);  // Changed focus
+    } else {
+        *out = lcl_int_new(0);  // No other pane
+    }
+
+    return LCL_RC_OK;
+}
+
+// weft::pane::prev -> focus the previous pane (cycle backward)
+static int c_pane_prev(lcl_interp *interp, int argc, lcl_value **argv,
+                        lcl_value **out) {
+    (void)argc;
+    (void)argv;
+
+    LclHost *host = lcl_interp_get_user_data(interp);
+    if (!host || !host->layout_root_ptr || !host->focused_pane_ptr) {
+        lcl_set_error(interp, "no app context");
+        return LCL_RC_ERR;
+    }
+
+    LayoutNode *root = *host->layout_root_ptr;
+    Pane *focused = *host->focused_pane_ptr;
+
+    if (!root || !focused) {
+        *out = lcl_int_new(0);
+        return LCL_RC_OK;
+    }
+
+    Pane *prev = layout_prev_pane(root, focused);
+    if (prev && prev != focused) {
+        *host->focused_pane_ptr = prev;
+        *out = lcl_int_new(1);  // Changed focus
+    } else {
+        *out = lcl_int_new(0);  // No other pane
+    }
+
     return LCL_RC_OK;
 }
 
@@ -1767,6 +1900,11 @@ static int c_fs_ls(lcl_interp *interp, int argc, lcl_value **argv,
     // Recompute layout bounds
     recompute_layout_bounds(host);
 
+    // Focus the new pane
+    if (host->focused_pane_ptr) {
+        *host->focused_pane_ptr = new_pane;
+    }
+
     *out = lcl_list_new();
     return LCL_RC_OK;
 }
@@ -2032,18 +2170,180 @@ static int c_config_indent(lcl_interp *interp, int argc, lcl_value **argv,
     }
 
     int64_t tab_size = 0;
-    if (!lcl_value_to_int(argv[1], &tab_size)) {
+    if (lcl_value_to_int(argv[1], &tab_size) != LCL_OK) {
         lcl_set_error(interp, "config::indent: tab-size must be an integer");
         return LCL_RC_ERR;
     }
 
     int64_t use_tabs = 0;
-    if (!lcl_value_to_int(argv[2], &use_tabs)) {
+    if (lcl_value_to_int(argv[2], &use_tabs) != LCL_OK) {
         lcl_set_error(interp, "config::indent: use-tabs must be an integer (0 or 1)");
         return LCL_RC_ERR;
     }
 
     lcl_host_register_indent(host, ext, (int)tab_size, use_tabs != 0);
+
+    *out = lcl_list_new();
+    return LCL_RC_OK;
+}
+
+// Helper to parse a key name to SDL keycode
+static int parse_keycode(const char *name) {
+    // Common single-character keys
+    if (strlen(name) == 1) {
+        char c = name[0];
+        if (c >= 'a' && c <= 'z') {
+            return SDLK_A + (c - 'a');
+        }
+        if (c >= 'A' && c <= 'Z') {
+            return SDLK_A + (c - 'A');
+        }
+        if (c >= '0' && c <= '9') {
+            return SDLK_0 + (c - '0');
+        }
+        // Special single chars
+        switch (c) {
+            case '`': return SDLK_GRAVE;
+            case '-': return SDLK_MINUS;
+            case '=': return SDLK_EQUALS;
+            case '[': return SDLK_LEFTBRACKET;
+            case ']': return SDLK_RIGHTBRACKET;
+            case '\\': return SDLK_BACKSLASH;
+            case ';': return SDLK_SEMICOLON;
+            case '\'': return SDLK_APOSTROPHE;
+            case ',': return SDLK_COMMA;
+            case '.': return SDLK_PERIOD;
+            case '/': return SDLK_SLASH;
+        }
+    }
+
+    // Named keys (case-insensitive)
+    if (strcasecmp(name, "return") == 0 || strcasecmp(name, "enter") == 0) {
+        return SDLK_RETURN;
+    }
+    if (strcasecmp(name, "escape") == 0 || strcasecmp(name, "esc") == 0) {
+        return SDLK_ESCAPE;
+    }
+    if (strcasecmp(name, "backspace") == 0) {
+        return SDLK_BACKSPACE;
+    }
+    if (strcasecmp(name, "tab") == 0) {
+        return SDLK_TAB;
+    }
+    if (strcasecmp(name, "space") == 0) {
+        return SDLK_SPACE;
+    }
+    if (strcasecmp(name, "delete") == 0 || strcasecmp(name, "del") == 0) {
+        return SDLK_DELETE;
+    }
+    if (strcasecmp(name, "insert") == 0 || strcasecmp(name, "ins") == 0) {
+        return SDLK_INSERT;
+    }
+    if (strcasecmp(name, "home") == 0) {
+        return SDLK_HOME;
+    }
+    if (strcasecmp(name, "end") == 0) {
+        return SDLK_END;
+    }
+    if (strcasecmp(name, "pageup") == 0 || strcasecmp(name, "pgup") == 0) {
+        return SDLK_PAGEUP;
+    }
+    if (strcasecmp(name, "pagedown") == 0 || strcasecmp(name, "pgdn") == 0) {
+        return SDLK_PAGEDOWN;
+    }
+    if (strcasecmp(name, "up") == 0) {
+        return SDLK_UP;
+    }
+    if (strcasecmp(name, "down") == 0) {
+        return SDLK_DOWN;
+    }
+    if (strcasecmp(name, "left") == 0) {
+        return SDLK_LEFT;
+    }
+    if (strcasecmp(name, "right") == 0) {
+        return SDLK_RIGHT;
+    }
+    // Function keys
+    if (name[0] == 'f' || name[0] == 'F') {
+        int num = atoi(name + 1);
+        if (num >= 1 && num <= 12) {
+            return SDLK_F1 + (num - 1);
+        }
+    }
+
+    return 0;  // Unknown key
+}
+
+// weft::config::keybind key-string script -> register a keybinding
+// key-string is like "ctrl+w", "ctrl+shift+s", "f5", etc.
+static int c_config_keybind(lcl_interp *interp, int argc, lcl_value **argv,
+                             lcl_value **out) {
+    LclHost *host = lcl_interp_get_user_data(interp);
+    if (!host) {
+        lcl_set_error(interp, "no host context");
+        return LCL_RC_ERR;
+    }
+
+    if (argc < 2) {
+        lcl_set_error(interp, "config::keybind requires key-string and script");
+        return LCL_RC_ERR;
+    }
+
+    const char *key_str = lcl_value_to_string(argv[0]);
+    const char *script = lcl_value_to_string(argv[1]);
+
+    if (!key_str || !script) {
+        lcl_set_error(interp, "config::keybind: arguments must be strings");
+        return LCL_RC_ERR;
+    }
+
+    // Parse the key string (e.g., "ctrl+w", "ctrl+shift+s")
+    int modifiers = 0;
+    int keycode = 0;
+
+    // Make a mutable copy to tokenize
+    char *key_copy = strdup(key_str);
+    if (!key_copy) {
+        lcl_set_error(interp, "out of memory");
+        return LCL_RC_ERR;
+    }
+
+    // Split by '+' and parse each part
+    char *saveptr;
+    char *token = strtok_r(key_copy, "+", &saveptr);
+    while (token) {
+        // Trim whitespace
+        while (*token == ' ') token++;
+        char *end = token + strlen(token) - 1;
+        while (end > token && *end == ' ') *end-- = '\0';
+
+        if (strcasecmp(token, "ctrl") == 0 || strcasecmp(token, "control") == 0) {
+            modifiers |= KEYBIND_CTRL;
+        } else if (strcasecmp(token, "shift") == 0) {
+            modifiers |= KEYBIND_SHIFT;
+        } else if (strcasecmp(token, "alt") == 0) {
+            modifiers |= KEYBIND_ALT;
+        } else {
+            // This should be the key itself
+            keycode = parse_keycode(token);
+            if (keycode == 0) {
+                free(key_copy);
+                char err[128];
+                snprintf(err, sizeof(err), "config::keybind: unknown key '%s'", token);
+                lcl_set_error(interp, err);
+                return LCL_RC_ERR;
+            }
+        }
+        token = strtok_r(NULL, "+", &saveptr);
+    }
+    free(key_copy);
+
+    if (keycode == 0) {
+        lcl_set_error(interp, "config::keybind: no key specified in key-string");
+        return LCL_RC_ERR;
+    }
+
+    lcl_host_register_keybind(host, keycode, modifiers, script);
 
     *out = lcl_list_new();
     return LCL_RC_OK;
@@ -2180,6 +2480,14 @@ static void register_weft_bindings(lcl_interp *interp) {
     lcl_ns_def(buffer_ns, "open-output", lcl_c_proc_new("weft::buffer::open-output", c_buffer_open_output));
     lcl_ns_def(buffer_ns, "open-at", lcl_c_proc_new("weft::buffer::open-at", c_buffer_open_at));
 
+    // Create weft::pane namespace for pane operations
+    lcl_value *pane_ns = lcl_ns_new("pane");
+    lcl_ns_def(weft_ns, "pane", pane_ns);
+
+    lcl_ns_def(pane_ns, "close", lcl_c_proc_new("weft::pane::close", c_pane_close));
+    lcl_ns_def(pane_ns, "next", lcl_c_proc_new("weft::pane::next", c_pane_next));
+    lcl_ns_def(pane_ns, "prev", lcl_c_proc_new("weft::pane::prev", c_pane_prev));
+
     // Create weft::fs namespace for filesystem operations
     lcl_value *fs_ns = lcl_ns_new("fs");
     lcl_ns_def(weft_ns, "fs", fs_ns);
@@ -2212,6 +2520,7 @@ static void register_weft_bindings(lcl_interp *interp) {
     lcl_ns_def(config_ns, "handler", lcl_c_proc_new("weft::config::handler", c_config_handler));
     lcl_ns_def(config_ns, "dir", lcl_c_proc_new("weft::config::dir", c_config_dir));
     lcl_ns_def(config_ns, "indent", lcl_c_proc_new("weft::config::indent", c_config_indent));
+    lcl_ns_def(config_ns, "keybind", lcl_c_proc_new("weft::config::keybind", c_config_keybind));
 
     // Create weft::ts namespace for tree-sitter operations
     lcl_value *ts_ns = lcl_ns_new("ts");
@@ -2280,6 +2589,20 @@ LclHost *lcl_host_new(void) {
     host->indent_cap = INITIAL_LAYER_CAP;
     host->indent_count = 0;
 
+    // Initialize keybindings array
+    host->keybindings = calloc(INITIAL_HANDLER_CAP, sizeof(RegisteredKeybind));
+    if (!host->keybindings) {
+        free(host->indent_settings);
+        free(host->filetypes);
+        free(host->handlers);
+        free(host->registered_layers);
+        lcl_interp_free(host->interp);
+        free(host);
+        return NULL;
+    }
+    host->keybind_cap = INITIAL_HANDLER_CAP;
+    host->keybind_count = 0;
+
     // Set up config directory path (~/.config/weft)
     const char *home = getenv("HOME");
     if (home) {
@@ -2335,6 +2658,12 @@ void lcl_host_free(LclHost *host) {
     }
     free(host->indent_settings);
 
+    // Free keybindings
+    for (size_t i = 0; i < host->keybind_count; i++) {
+        free(host->keybindings[i].script);
+    }
+    free(host->keybindings);
+
     free(host->config_dir);
 
     // Cleanup tree-sitter highlighters
@@ -2362,7 +2691,8 @@ bool lcl_host_eval(LclHost *host, const char *code, const char **error_msg) {
         lcl_ref_dec(result);
     }
 
-    if (rc != LCL_RC_OK) {
+    // Treat LCL_RC_RETURN as success (scripts can use 'return' to exit early)
+    if (rc != LCL_RC_OK && rc != LCL_RC_RETURN) {
         if (error_msg) {
             *error_msg = lcl_interp_error_msg(host->interp);
         }
@@ -2387,7 +2717,8 @@ bool lcl_host_eval_file(LclHost *host, const char *path, const char **error_msg)
         lcl_ref_dec(result);
     }
 
-    if (rc != LCL_RC_OK) {
+    // Treat LCL_RC_RETURN as success (scripts can use 'return' to exit early)
+    if (rc != LCL_RC_OK && rc != LCL_RC_RETURN) {
         if (error_msg) {
             *error_msg = lcl_interp_error_msg(host->interp);
         }
@@ -2408,7 +2739,8 @@ char *lcl_host_eval_to_string(LclHost *host, const char *code, const char **erro
     lcl_value *result = NULL;
     int rc = lcl_eval_string(host->interp, code, &result);
 
-    if (rc != LCL_RC_OK) {
+    // Treat LCL_RC_RETURN as success (scripts can use 'return' to exit early)
+    if (rc != LCL_RC_OK && rc != LCL_RC_RETURN) {
         if (error_msg) {
             *error_msg = lcl_interp_error_msg(host->interp);
         }
@@ -2851,8 +3183,13 @@ bool lcl_host_dispatch_global_handlers(LclHost *host, InteractEvent *event, Edit
         bool ok = lcl_host_eval(host, handler->script, &error_msg);
 
         if (!ok) {
-            fprintf(stderr, "Handler '%s' error: %s\n",
-                    handler->name, error_msg ? error_msg : "unknown");
+            const char *err_file = lcl_interp_error_file(host->interp);
+            int err_line = lcl_interp_error_line(host->interp);
+            fprintf(stderr, "Handler '%s' error at %s:%d: %s\n",
+                    handler->name,
+                    err_file ? err_file : "<unknown>",
+                    err_line,
+                    error_msg ? error_msg : "unknown");
         }
 
         // Check if handler marked event as handled
@@ -2869,7 +3206,8 @@ bool lcl_host_dispatch_global_handlers(LclHost *host, InteractEvent *event, Edit
 // === App Context ===
 
 void lcl_host_set_app_context(LclHost *host, BufferManager *bm,
-                               LayoutNode **layout_root, void *app_ctx,
+                               LayoutNode **layout_root, Pane **focused_pane,
+                               void *app_ctx,
                                int char_width, int line_height,
                                int window_width, int window_height) {
     if (!host) {
@@ -2877,6 +3215,7 @@ void lcl_host_set_app_context(LclHost *host, BufferManager *bm,
     }
     host->buffer_manager = bm;
     host->layout_root_ptr = layout_root;
+    host->focused_pane_ptr = focused_pane;
     host->app_context = app_ctx;
     host->char_width = char_width;
     host->line_height = line_height;
@@ -3092,4 +3431,70 @@ const IndentSettings *lcl_host_get_indent(LclHost *host, const char *extension) 
     }
 
     return NULL;
+}
+
+// === Keybinding Functions ===
+
+void lcl_host_register_keybind(LclHost *host, int keycode, int modifiers,
+                                const char *script) {
+    if (!host || !script) {
+        return;
+    }
+
+    // Check if we already have a binding for this key combo (update if so)
+    for (size_t i = 0; i < host->keybind_count; i++) {
+        if (host->keybindings[i].keycode == keycode &&
+            host->keybindings[i].modifiers == modifiers) {
+            free(host->keybindings[i].script);
+            host->keybindings[i].script = strdup(script);
+            host->keybindings[i].enabled = true;
+            return;
+        }
+    }
+
+    // Check if we need to grow the array
+    if (host->keybind_count >= host->keybind_cap) {
+        size_t new_cap = host->keybind_cap * 2;
+        RegisteredKeybind *new_arr = realloc(host->keybindings,
+                                              new_cap * sizeof(RegisteredKeybind));
+        if (!new_arr) {
+            return;
+        }
+        host->keybindings = new_arr;
+        host->keybind_cap = new_cap;
+    }
+
+    // Add the new keybinding
+    RegisteredKeybind *kb = &host->keybindings[host->keybind_count];
+    kb->keycode = keycode;
+    kb->modifiers = modifiers;
+    kb->script = strdup(script);
+    if (!kb->script) {
+        return;
+    }
+    kb->enabled = true;
+
+    host->keybind_count++;
+}
+
+bool lcl_host_dispatch_keybind(LclHost *host, int keycode, int modifiers) {
+    if (!host) {
+        return false;
+    }
+
+    // Find matching keybinding
+    for (size_t i = 0; i < host->keybind_count; i++) {
+        RegisteredKeybind *kb = &host->keybindings[i];
+        if (kb->enabled && kb->keycode == keycode && kb->modifiers == modifiers) {
+            // Execute the script
+            const char *error_msg = NULL;
+            bool success = lcl_host_eval(host, kb->script, &error_msg);
+            if (!success && error_msg) {
+                fprintf(stderr, "Keybinding script error: %s\n", error_msg);
+            }
+            return true;  // Keybinding matched (regardless of success)
+        }
+    }
+
+    return false;
 }
