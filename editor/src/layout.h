@@ -9,23 +9,23 @@
 
 // Layout node types
 typedef enum {
-    LAYOUT_LEAF,              // Contains a Pane
-    LAYOUT_SPLIT_H,           // Horizontal split (left | right)
-    LAYOUT_SPLIT_V            // Vertical split (top / bottom)
+  LAYOUT_LEAF,    // Contains a Pane
+  LAYOUT_SPLIT_H, // Horizontal split (left | right)
+  LAYOUT_SPLIT_V  // Vertical split (top / bottom)
 } LayoutNodeType;
 
 // Layout tree node
 typedef struct LayoutNode {
-    LayoutNodeType type;
-    struct LayoutNode *parent;
-    union {
-        Pane *pane;           // For LAYOUT_LEAF
-        struct {
-            struct LayoutNode *first;   // Left or Top
-            struct LayoutNode *second;  // Right or Bottom
-            float split_ratio;          // 0.0-1.0
-        } split;
-    };
+  LayoutNodeType type;
+  struct LayoutNode *parent;
+  union {
+    Pane *pane; // For LAYOUT_LEAF
+    struct {
+      struct LayoutNode *first;  // Left or Top
+      struct LayoutNode *second; // Right or Bottom
+      float split_ratio;         // 0.0-1.0
+    } split;
+  };
 } LayoutNode;
 
 // Callback type for layout traversal

@@ -13,41 +13,41 @@ typedef struct LayerStack LayerStack;
 
 // Interaction event types
 typedef enum {
-    INTERACT_LEFT_CLICK,
-    INTERACT_MIDDLE_CLICK,
-    INTERACT_RIGHT_CLICK,
-    INTERACT_HOVER
+  INTERACT_LEFT_CLICK,
+  INTERACT_MIDDLE_CLICK,
+  INTERACT_RIGHT_CLICK,
+  INTERACT_HOVER
 } InteractType;
 
 // Interaction dispatch result
 typedef enum {
-    INTERACT_UNHANDLED,     // Event was not handled, fall through to default
-    INTERACT_HANDLED        // Event was handled by a handler
+  INTERACT_UNHANDLED, // Event was not handled, fall through to default
+  INTERACT_HANDLED    // Event was handled by a handler
 } InteractResult;
 
 // Interaction event context
 typedef struct InteractEvent {
-    InteractType type;
-    size_t doc_pos;           // Position in document
-    int screen_x, screen_y;   // Screen coordinates (window-local)
-    SDL_Keymod modifiers;     // Ctrl, Shift, Alt
+  InteractType type;
+  size_t doc_pos;         // Position in document
+  int screen_x, screen_y; // Screen coordinates (window-local)
+  SDL_Keymod modifiers;   // Ctrl, Shift, Alt
 
-    // Context (populated before dispatch)
-    bool has_selection;
-    size_t sel_start, sel_end;
-    char *selected_text;      // Owned, NULL if no selection
-    char *word_at_pos;        // Owned, word under cursor
+  // Context (populated before dispatch)
+  bool has_selection;
+  size_t sel_start, sel_end;
+  char *selected_text; // Owned, NULL if no selection
+  char *word_at_pos;   // Owned, word under cursor
 
-    // Internal state
-    bool handled;             // Set by handler to mark event as consumed
+  // Internal state
+  bool handled; // Set by handler to mark event as consumed
 } InteractEvent;
 
 // === InteractEvent lifecycle ===
 
 // Create a new interaction event
 InteractEvent *interact_event_new(InteractType type, size_t doc_pos,
-                                   int screen_x, int screen_y,
-                                   SDL_Keymod modifiers);
+                                  int screen_x, int screen_y,
+                                  SDL_Keymod modifiers);
 
 // Populate context fields (selection, word at cursor) from editor
 void interact_event_populate_context(InteractEvent *ie, Editor *editor);
@@ -59,12 +59,14 @@ void interact_event_free(InteractEvent *ie);
 
 // Dispatch an interaction event to handlers
 // Checks in order:
-//   1. LayerStack decorations with actions (if layer_stack is provided and cache is valid)
+//   1. LayerStack decorations with actions (if layer_stack is provided and
+//   cache is valid)
 //   2. Annotation handlers in the "action" layer
 //   3. Global handlers registered with LclHost
-// Returns INTERACT_HANDLED if a handler consumed the event, INTERACT_UNHANDLED otherwise
-InteractResult interaction_dispatch(LclHost *lcl, Editor *editor, InteractEvent *ie,
-                                     LayerStack *layer_stack);
+// Returns INTERACT_HANDLED if a handler consumed the event, INTERACT_UNHANDLED
+// otherwise
+InteractResult interaction_dispatch(LclHost *lcl, Editor *editor,
+                                    InteractEvent *ie, LayerStack *layer_stack);
 
 // === Helper: Convert SDL button to InteractType ===
 InteractType button_to_interact_type(int button);

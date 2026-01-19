@@ -7,66 +7,63 @@
 
 // Anchor bias: how an anchor behaves when text is inserted at its position
 typedef enum {
-    ANCHOR_LEFT,   // Stays at position (text inserted after)
-    ANCHOR_RIGHT   // Moves with insert (text inserted before)
+  ANCHOR_LEFT, // Stays at position (text inserted after)
+  ANCHOR_RIGHT // Moves with insert (text inserted before)
 } AnchorBias;
 
 // Anchor: a position that survives document edits
 typedef struct {
-    size_t pos;           // Current byte offset
-    AnchorBias bias;      // Behavior on insert at this position
-    uint32_t id;          // Unique identifier
+  size_t pos;      // Current byte offset
+  AnchorBias bias; // Behavior on insert at this position
+  uint32_t id;     // Unique identifier
 } Anchor;
 
 // Annotation record: a span with metadata
 typedef struct {
-    uint32_t id;              // Unique identifier
-    uint32_t start_anchor;    // Anchor ID for start
-    uint32_t end_anchor;      // Anchor ID for end
-    char *layer;              // Layer name (owned, e.g., "style", "lint")
-    char **keys;              // Metadata keys "namespace:key" (owned)
-    char **values;            // Metadata values (owned)
-    size_t meta_count;        // Number of key/value pairs
-    uint64_t doc_rev;         // Document revision when created
+  uint32_t id;           // Unique identifier
+  uint32_t start_anchor; // Anchor ID for start
+  uint32_t end_anchor;   // Anchor ID for end
+  char *layer;           // Layer name (owned, e.g., "style", "lint")
+  char **keys;           // Metadata keys "namespace:key" (owned)
+  char **values;         // Metadata values (owned)
+  size_t meta_count;     // Number of key/value pairs
+  uint64_t doc_rev;      // Document revision when created
 } AnnotRecord;
 
 // Layer state
-typedef enum {
-    LAYER_VALID,
-    LAYER_DIRTY
-} LayerState;
+typedef enum { LAYER_VALID, LAYER_DIRTY } LayerState;
 
 // Layer: grouping and dirty tracking for annotations
 typedef struct {
-    char *name;           // Layer name (owned)
-    LayerState state;     // Current state
-    uint64_t version;     // Incremented on changes
+  char *name;       // Layer name (owned)
+  LayerState state; // Current state
+  uint64_t version; // Incremented on changes
 } Layer;
 
 // Query result: list of annotation IDs
 typedef struct {
-    uint32_t *ids;
-    size_t count;
-    size_t capacity;
+  uint32_t *ids;
+  size_t count;
+  size_t capacity;
 } AnnotQuery;
 
 // Annotation Store
 typedef struct {
-    Anchor *anchors;
-    size_t anchor_count;
-    size_t anchor_cap;
-    uint32_t next_anchor_id;
+  Anchor *anchors;
+  size_t anchor_count;
+  size_t anchor_cap;
+  uint32_t next_anchor_id;
 
-    AnnotRecord *records;
-    size_t record_count;
-    size_t record_cap;
-    uint32_t next_record_id;
+  AnnotRecord *records;
+  size_t record_count;
+  size_t record_cap;
+  uint32_t next_record_id;
 
-    Layer *layers;
-    size_t layer_count;
-    size_t layer_cap;
+  Layer *layers;
+  size_t layer_count;
+  size_t layer_cap;
 
-    uint64_t doc_rev;   // Current document revision
+  uint64_t doc_rev; // Current document revision
 } AnnotStore;
 
 // === Lifecycle ===
@@ -91,8 +88,8 @@ bool annot_store_remove(AnnotStore *s, uint32_t id);
 const AnnotRecord *annot_store_get(const AnnotStore *s, uint32_t id);
 
 // Get the current span of an annotation (resolves anchors to positions)
-bool annot_store_get_span(const AnnotStore *s, uint32_t id,
-                          size_t *start, size_t *end);
+bool annot_store_get_span(const AnnotStore *s, uint32_t id, size_t *start,
+                          size_t *end);
 
 // Get metadata value for a key from an annotation
 const char *annot_store_get_meta(const AnnotStore *s, uint32_t id,
@@ -106,8 +103,8 @@ void annot_query_free(AnnotQuery *q);
 void annot_query_clear(AnnotQuery *q);
 
 // Find annotations containing position
-void annot_store_at(const AnnotStore *s, size_t pos,
-                    const char *layer, AnnotQuery *out);
+void annot_store_at(const AnnotStore *s, size_t pos, const char *layer,
+                    AnnotQuery *out);
 
 // Find annotations overlapping range [start, end)
 void annot_store_in_range(const AnnotStore *s, size_t start, size_t end,

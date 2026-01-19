@@ -14,26 +14,26 @@ typedef struct Buffer Buffer;
 
 // Highlight capture - a single syntax highlight match
 typedef struct {
-    size_t start;           // Start byte offset
-    size_t end;             // End byte offset
-    const char *capture;    // Capture name (e.g., "keyword", "string")
+  size_t start;        // Start byte offset
+  size_t end;          // End byte offset
+  const char *capture; // Capture name (e.g., "keyword", "string")
 } TSHighlight;
 
 // Highlight result - list of all highlights
 typedef struct {
-    TSHighlight *highlights;
-    size_t count;
-    size_t capacity;
+  TSHighlight *highlights;
+  size_t count;
+  size_t capacity;
 } TSHighlightResult;
 
 // Tree-sitter highlighter for a specific language
 typedef struct TSHighlighter {
-    TSParser *parser;
-    TSTree *tree;
-    TSQuery *query;
-    const TSLanguage *language;
-    char *language_name;
-    char *query_source;     // Keep query source for error reporting
+  TSParser *parser;
+  TSTree *tree;
+  TSQuery *query;
+  const TSLanguage *language;
+  char *language_name;
+  char *query_source; // Keep query source for error reporting
 } TSHighlighter;
 
 // === Lifecycle ===
@@ -41,7 +41,7 @@ typedef struct TSHighlighter {
 // Create a new highlighter for a language
 // query_source is the contents of a highlights.scm file
 TSHighlighter *ts_hl_new(const TSLanguage *language, const char *language_name,
-                          const char *query_source);
+                         const char *query_source);
 
 // Free the highlighter
 void ts_hl_free(TSHighlighter *hl);

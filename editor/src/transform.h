@@ -19,13 +19,13 @@ typedef struct LclHost LclHost;
 //   buffer    - The buffer to transform
 //   start     - Start of the range to transform
 //   end       - End of the range (exclusive)
-//   args      - Optional transform-specific arguments (NULL-terminated array, can be NULL)
-//   user_data - User data passed at registration
+//   args      - Optional transform-specific arguments (NULL-terminated array,
+//   can be NULL) user_data - User data passed at registration
 // Returns:
 //   A newly allocated Patch, or NULL on error
 //   Caller takes ownership of the returned Patch
 typedef Patch *(*TransformFn)(Buffer *buffer, size_t start, size_t end,
-                               const char **args, void *user_data);
+                              const char **args, void *user_data);
 
 // Transform cleanup function (optional)
 typedef void (*TransformCleanupFn)(void *user_data);
@@ -45,9 +45,11 @@ void transform_registry_cleanup(void);
 //   fn          - The transform function
 //   cleanup     - Optional cleanup function for user_data (NULL if not needed)
 //   user_data   - Arbitrary data passed to fn
-// Returns true on success, false if name already registered or allocation failed
+// Returns true on success, false if name already registered or allocation
+// failed
 bool transform_register(const char *name, const char *description,
-                        TransformFn fn, TransformCleanupFn cleanup, void *user_data);
+                        TransformFn fn, TransformCleanupFn cleanup,
+                        void *user_data);
 
 // Unregister a transform by name
 // Calls the cleanup function if one was provided
@@ -84,7 +86,8 @@ Patch *transform_run(const char *name, Buffer *buffer, size_t start, size_t end,
 
 // Register a transform that runs an Lcl script
 // The script receives variables: $start, $end, $text (the range text)
-// The script should return a patch-like structure (list of {start end insert} lists)
+// The script should return a patch-like structure (list of {start end insert}
+// lists)
 bool transform_register_lcl(const char *name, const char *description,
                             LclHost *host, const char *script);
 

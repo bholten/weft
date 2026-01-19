@@ -24,8 +24,8 @@ typedef struct ViewLayer ViewLayer;
 // The callback should append decorations to 'out' for the given viewport.
 // Decorations outside the viewport may be ignored by the renderer.
 typedef void (*ViewLayerRenderFn)(ViewLayer *layer, Buffer *buffer,
-                                   size_t viewport_start, size_t viewport_end,
-                                   DecorationList *out);
+                                  size_t viewport_start, size_t viewport_end,
+                                  DecorationList *out);
 
 // ViewLayer update callback: react to document edits (optional)
 // Called after the document is modified.
@@ -38,30 +38,33 @@ typedef void (*ViewLayerRenderFn)(ViewLayer *layer, Buffer *buffer,
 //   new_len     - Length of text that was inserted (0 for pure delete)
 //
 // This callback can update internal layer state/caches.
-// Return true if the layer needs a full re-render, false if incremental update suffices.
+// Return true if the layer needs a full re-render, false if incremental update
+// suffices.
 typedef bool (*ViewLayerUpdateFn)(ViewLayer *layer, Buffer *buffer,
-                                   size_t edit_pos, size_t old_len, size_t new_len);
+                                  size_t edit_pos, size_t old_len,
+                                  size_t new_len);
 
 // ViewLayer cleanup callback: free layer-specific resources
 typedef void (*ViewLayerCleanupFn)(ViewLayer *layer);
 
 // ViewLayer: a projection that computes decorations over buffer text
-// Named ViewLayer to distinguish from annot_store.h's Layer (annotation namespaces)
+// Named ViewLayer to distinguish from annot_store.h's Layer (annotation
+// namespaces)
 typedef struct ViewLayer {
-    char *name;               // Layer name (owned)
-    int priority;             // Higher priority = rendered on top (default: 0)
+  char *name;   // Layer name (owned)
+  int priority; // Higher priority = rendered on top (default: 0)
 
-    // Callbacks
-    ViewLayerRenderFn render;     // Required: produce decorations
-    ViewLayerUpdateFn update;     // Optional: react to edits
-    ViewLayerCleanupFn cleanup;   // Optional: free resources
+  // Callbacks
+  ViewLayerRenderFn render;   // Required: produce decorations
+  ViewLayerUpdateFn update;   // Optional: react to edits
+  ViewLayerCleanupFn cleanup; // Optional: free resources
 
-    // User data for callbacks (e.g., Lcl thunk, tree-sitter state)
-    void *user_data;
+  // User data for callbacks (e.g., Lcl thunk, tree-sitter state)
+  void *user_data;
 
-    // Cache state
-    uint64_t last_doc_rev;    // Document revision when last rendered
-    bool needs_rerender;      // Hint that full rerender is needed
+  // Cache state
+  uint64_t last_doc_rev; // Document revision when last rendered
+  bool needs_rerender;   // Hint that full rerender is needed
 } ViewLayer;
 
 // === ViewLayer Lifecycle ===
@@ -87,14 +90,13 @@ void view_layer_set_user_data(ViewLayer *layer, void *data);
 // === ViewLayer Operations ===
 
 // Render the layer for a viewport, appending decorations to out
-void view_layer_render(ViewLayer *layer, Buffer *buffer,
-                       size_t viewport_start, size_t viewport_end,
-                       DecorationList *out);
+void view_layer_render(ViewLayer *layer, Buffer *buffer, size_t viewport_start,
+                       size_t viewport_end, DecorationList *out);
 
 // Notify layer of a document edit
 // Returns true if layer needs full rerender
-bool view_layer_notify_edit(ViewLayer *layer, Buffer *buffer,
-                            size_t edit_pos, size_t old_len, size_t new_len);
+bool view_layer_notify_edit(ViewLayer *layer, Buffer *buffer, size_t edit_pos,
+                            size_t old_len, size_t new_len);
 
 // Mark layer as needing rerender
 void view_layer_invalidate(ViewLayer *layer);

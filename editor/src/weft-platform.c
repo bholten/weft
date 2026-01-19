@@ -23,7 +23,8 @@ SDL_Renderer route (simpler)
 
 SDL GPU route (more control)
 
-Either way, render should accept “draw lists” (glyph quads + rectangles + lines), not call into editor internals.
+Either way, render should accept “draw lists” (glyph quads + rectangles +
+lines), not call into editor internals.
 */
 
 struct platform {
@@ -47,7 +48,6 @@ platform *weft_platform_new(int width, int height) {
   if (!win) {
     return NULL;
   }
-
 
   SDL_Renderer *renderer = SDL_CreateRenderer(win, NULL);
 

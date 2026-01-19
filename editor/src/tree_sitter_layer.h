@@ -25,9 +25,8 @@ typedef struct TSLanguage TSLanguage;
 //   priority       - Layer priority (higher = rendered later/on top)
 // Returns NULL on failure (invalid language or query)
 ViewLayer *tree_sitter_layer_new(const char *language_name,
-                                  const TSLanguage *language,
-                                  const char *query_source,
-                                  int priority);
+                                 const TSLanguage *language,
+                                 const char *query_source, int priority);
 
 // Get the language name for a TreeSitterLayer
 // Returns NULL if not a tree-sitter layer

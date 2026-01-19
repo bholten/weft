@@ -4,11 +4,11 @@
 #include <SDL3/SDL.h>
 
 typedef struct Platform {
-    SDL_Window *window;
-    SDL_Renderer *sdl_renderer;
-    int width;
-    int height;
-    float dpi_scale;
+  SDL_Window *window;
+  SDL_Renderer *sdl_renderer;
+  int width;
+  int height;
+  float dpi_scale;
 } Platform;
 
 // Lifecycle

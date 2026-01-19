@@ -13,27 +13,28 @@
 // Unlike persistent annotations, decorations are recomputed freely
 // and do not survive document edits.
 typedef struct {
-    size_t start;             // Start byte offset
-    size_t end;               // End byte offset (exclusive)
+  size_t start; // Start byte offset
+  size_t end;   // End byte offset (exclusive)
 
-    // Style attributes
-    SDL_Color fg;
-    SDL_Color bg;
-    bool has_fg;
-    bool has_bg;
-    bool underline;
+  // Style attributes
+  SDL_Color fg;
+  SDL_Color bg;
+  bool has_fg;
+  bool has_bg;
+  bool underline;
 
-    // Action (optional) - script to execute on interaction
-    InteractType action_type; // Which event triggers this action
-    char *action_script;      // Lcl script to execute (owned, NULL if none)
+  // Action (optional) - script to execute on interaction
+  InteractType action_type; // Which event triggers this action
+  char *action_script;      // Lcl script to execute (owned, NULL if none)
 
-    // Metadata (optional) - arbitrary key/value pairs
-    char **meta_keys;         // Keys (owned array of owned strings)
-    char **meta_values;       // Values (owned array of owned strings)
-    size_t meta_count;
+  // Metadata (optional) - arbitrary key/value pairs
+  char **meta_keys;   // Keys (owned array of owned strings)
+  char **meta_values; // Values (owned array of owned strings)
+  size_t meta_count;
 
-    // Provenance (for inspection)
-    const char *layer_name;   // Which layer produced this (not owned, points to layer)
+  // Provenance (for inspection)
+  const char
+      *layer_name; // Which layer produced this (not owned, points to layer)
 } Decoration;
 
 // === Decoration Lifecycle ===
@@ -57,9 +58,9 @@ const char *decoration_get_meta(const Decoration *d, const char *key);
 
 // Dynamic array of decorations for layer output
 typedef struct {
-    Decoration *items;
-    size_t count;
-    size_t capacity;
+  Decoration *items;
+  size_t count;
+  size_t capacity;
 } DecorationList;
 
 // Initialize a decoration list
@@ -77,12 +78,12 @@ Decoration *decoration_list_add(DecorationList *list, size_t start, size_t end);
 
 // Query decorations overlapping a range
 // Returns count of matching decorations, fills out_indices with their indices
-size_t decoration_list_in_range(const DecorationList *list,
-                                 size_t start, size_t end,
-                                 size_t *out_indices, size_t max_indices);
+size_t decoration_list_in_range(const DecorationList *list, size_t start,
+                                size_t end, size_t *out_indices,
+                                size_t max_indices);
 
 // Query decorations at a specific position
 size_t decoration_list_at(const DecorationList *list, size_t pos,
-                           size_t *out_indices, size_t max_indices);
+                          size_t *out_indices, size_t max_indices);
 
 #endif // WEFT_DECORATION_H
