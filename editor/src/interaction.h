@@ -9,6 +9,7 @@
 // Forward declarations
 typedef struct Editor Editor;
 typedef struct LclHost LclHost;
+typedef struct LayerStack LayerStack;
 
 // Interaction event types
 typedef enum {
@@ -57,8 +58,13 @@ void interact_event_free(InteractEvent *ie);
 // === Dispatch ===
 
 // Dispatch an interaction event to handlers
+// Checks in order:
+//   1. LayerStack decorations with actions (if layer_stack is provided and cache is valid)
+//   2. Annotation handlers in the "action" layer
+//   3. Global handlers registered with LclHost
 // Returns INTERACT_HANDLED if a handler consumed the event, INTERACT_UNHANDLED otherwise
-InteractResult interaction_dispatch(LclHost *lcl, Editor *editor, InteractEvent *ie);
+InteractResult interaction_dispatch(LclHost *lcl, Editor *editor, InteractEvent *ie,
+                                     LayerStack *layer_stack);
 
 // === Helper: Convert SDL button to InteractType ===
 InteractType button_to_interact_type(int button);

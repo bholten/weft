@@ -9,6 +9,7 @@
 #include "buffer.h"
 #include "document.h"
 #include "annot_store.h"
+#include "layer_stack.h"
 #include "lcl_host.h"
 
 // === Helper: Check if character is a word character ===
@@ -124,7 +125,8 @@ void interact_event_free(InteractEvent *ie) {
 
 // === Dispatch ===
 
-InteractResult interaction_dispatch(LclHost *lcl, Editor *editor, InteractEvent *ie) {
+InteractResult interaction_dispatch(LclHost *lcl, Editor *editor, InteractEvent *ie,
+                                     LayerStack *layer_stack) {
     if (!lcl || !editor || !ie) {
         return INTERACT_UNHANDLED;
     }
@@ -134,7 +136,29 @@ InteractResult interaction_dispatch(LclHost *lcl, Editor *editor, InteractEvent 
         return INTERACT_UNHANDLED;
     }
 
-    // First, check for annotation handlers at this position
+    // First, check LayerStack decorations for actions (computed layers like plumber)
+    if (layer_stack) {
+        const char *action_script = layer_stack_resolve_action(layer_stack, ie->doc_pos,
+                                                                ie->type, NULL);
+        if (action_script) {
+            // Set up context and run the handler
+            lcl_host_set_current_event(lcl, ie, editor);
+            const char *error_msg = NULL;
+            bool ok = lcl_host_eval(lcl, action_script, &error_msg);
+            lcl_host_clear_current_event(lcl);
+
+            if (!ok) {
+                fprintf(stderr, "Layer action handler error: %s\n",
+                        error_msg ? error_msg : "unknown");
+            }
+
+            if (ie->handled) {
+                return INTERACT_HANDLED;
+            }
+        }
+    }
+
+    // Second, check for annotation handlers at this position (persistent annotations)
     // Look for annotations with action:on_* metadata
     const char *action_key = NULL;
     switch (ie->type) {
@@ -192,7 +216,7 @@ InteractResult interaction_dispatch(LclHost *lcl, Editor *editor, InteractEvent 
     }
     annot_query_free(&query);
 
-    // Next, try global handlers registered with the Lcl host
+    // Third, try global handlers registered with the Lcl host
     if (lcl_host_dispatch_global_handlers(lcl, ie, editor)) {
         return INTERACT_HANDLED;
     }

@@ -5,9 +5,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "annot_layer.h"
 #include "annot_store.h"
 #include "document.h"
+#include "plumb_layer.h"
 #include "renderer.h"
+#include "tree_sitter_layer.h"
 
 #define TEXT_PADDING 10
 #define MAX_STYLED_SPANS 64
@@ -195,6 +198,60 @@ Pane *pane_new(Buffer *buffer, int char_width, int line_height) {
         return NULL;
     }
 
+    // Create layer stack for rendering
+    p->layer_stack = layer_stack_new();
+    if (!p->layer_stack) {
+        editor_free(p->view);
+        free(p);
+        return NULL;
+    }
+
+    // Add layers in priority order:
+    // - style (0): syntax highlighting from annotations (only if no tree-sitter)
+    // - ts:* (2): tree-sitter syntax highlighting (if file type detected)
+    // - plumb (5): clickable file:line patterns
+    // - search (10): search result highlights (on top)
+    ViewLayer *plumb_layer = plumb_layer_new(5);
+    ViewLayer *search_layer = annot_layer_new("search", 10);
+
+    // Check if we should use tree-sitter for syntax highlighting
+    bool use_tree_sitter = false;
+    const char *file_path = buffer_get_file_path(buffer);
+    if (file_path) {
+        size_t len = strlen(file_path);
+        // Check for .lcl extension or *lcl* buffer name (REPL)
+        bool is_lcl = (len > 4 && strcmp(file_path + len - 4, ".lcl") == 0) ||
+                      strcmp(file_path, "*lcl*") == 0;
+        if (is_lcl) {
+            ViewLayer *ts_layer = tree_sitter_layer_new_lcl(2);
+            if (ts_layer) {
+                layer_stack_add(p->layer_stack, ts_layer);
+                use_tree_sitter = true;
+
+                // Clear any existing style annotations to avoid conflicts
+                if (buffer->annots) {
+                    annot_store_clear_layer(buffer->annots, "style");
+                }
+            }
+        }
+    }
+
+    // Only add style annotation layer if not using tree-sitter
+    // (tree-sitter computes highlighting, annotations would conflict)
+    if (!use_tree_sitter) {
+        ViewLayer *style_layer = annot_layer_new("style", 0);
+        if (style_layer) {
+            layer_stack_add(p->layer_stack, style_layer);
+        }
+    }
+
+    if (plumb_layer) {
+        layer_stack_add(p->layer_stack, plumb_layer);
+    }
+    if (search_layer) {
+        layer_stack_add(p->layer_stack, search_layer);
+    }
+
     p->char_width = char_width;
     p->line_height = line_height;
     p->text_offset_x = TEXT_PADDING;
@@ -212,6 +269,14 @@ Pane *pane_new(Buffer *buffer, int char_width, int line_height) {
 
 void pane_free(Pane *p) {
     if (p) {
+        // Free layers in the stack (we own them)
+        if (p->layer_stack) {
+            for (size_t i = 0; i < layer_stack_count(p->layer_stack); i++) {
+                ViewLayer *layer = layer_stack_get(p->layer_stack, i);
+                view_layer_free(layer);
+            }
+            layer_stack_free(p->layer_stack);
+        }
         editor_free(p->view);
         free(p->matches);
         free(p);
@@ -525,12 +590,6 @@ void pane_render(Pane *p, Renderer *r, bool focused) {
     int y = text_y - scroll_y;
     char line_buf[256];
 
-    // Query annotations for style and search layers in visible range
-    AnnotQuery style_annots;
-    AnnotQuery search_annots;
-    annot_query_init(&style_annots);
-    annot_query_init(&search_annots);
-
     // Calculate visible document range
     size_t first_vis_line = (scroll_y > 0) ? (size_t)(scroll_y / line_height) : 0;
     if (first_vis_line > 0 && first_vis_line > 0) {
@@ -544,8 +603,8 @@ void pane_render(Pane *p, Renderer *r, bool focused) {
     size_t vis_start = document_line_start(doc, first_vis_line);
     size_t vis_end = document_line_end(doc, last_vis_line);
 
-    annot_store_in_range(buf->annots, vis_start, vis_end, "style", &style_annots);
-    annot_store_in_range(buf->annots, vis_start, vis_end, "search", &search_annots);
+    // Render all layers for the visible range
+    const DecorationList *decorations = layer_stack_render(p->layer_stack, buf, vis_start, vis_end);
 
     // Line number colors
     SDL_Color linenum_color = { .r = 100, .g = 100, .b = 110, .a = 255 };
@@ -590,60 +649,40 @@ void pane_render(Pane *p, Renderer *r, bool focused) {
                                          tab_size, doc_to_visual);
         (void)visual_len;  // Used implicitly in rendering
 
-        // Collect styled spans for this line
+        // Collect styled spans for this line from decorations
         StyledSpan spans[MAX_STYLED_SPANS];
         size_t span_count = 0;
 
-        // Find style annotations that overlap this line
-        for (size_t ai = 0; ai < style_annots.count && span_count < MAX_STYLED_SPANS; ai++) {
-            size_t ann_start, ann_end;
-            if (!annot_store_get_span(buf->annots, style_annots.ids[ai], &ann_start, &ann_end)) {
-                continue;
+        // Find decorations that overlap this line
+        if (decorations) {
+            for (size_t di = 0; di < decorations->count && span_count < MAX_STYLED_SPANS; di++) {
+                const Decoration *d = &decorations->items[di];
+
+                // Check overlap with this line
+                if (d->start >= line_end || d->end <= line_start) {
+                    continue;
+                }
+
+                // Clamp to line bounds
+                size_t span_start = (d->start > line_start) ? d->start : line_start;
+                size_t span_end = (d->end < line_end) ? d->end : line_end;
+
+                if (span_end - span_start > line_len) {
+                    span_end = line_start + line_len;
+                }
+
+                spans[span_count].start = span_start;
+                spans[span_count].end = span_end;
+
+                // Copy style from decoration
+                spans[span_count].style.fg = d->fg;
+                spans[span_count].style.bg = d->bg;
+                spans[span_count].style.has_fg = d->has_fg;
+                spans[span_count].style.has_bg = d->has_bg;
+                spans[span_count].style.underline = d->underline;
+
+                span_count++;
             }
-
-            // Check overlap with this line
-            if (ann_start >= line_end || ann_end <= line_start) {
-                continue;
-            }
-
-            // Clamp to line bounds
-            size_t span_start = (ann_start > line_start) ? ann_start : line_start;
-            size_t span_end = (ann_end < line_end) ? ann_end : line_end;
-
-            if (span_end - span_start > line_len) {
-                span_end = line_start + line_len;
-            }
-
-            spans[span_count].start = span_start;
-            spans[span_count].end = span_end;
-            style_from_annot(buf->annots, style_annots.ids[ai], &spans[span_count].style);
-            span_count++;
-        }
-
-        // Find search annotations that overlap this line (rendered on top)
-        for (size_t ai = 0; ai < search_annots.count && span_count < MAX_STYLED_SPANS; ai++) {
-            size_t ann_start, ann_end;
-            if (!annot_store_get_span(buf->annots, search_annots.ids[ai], &ann_start, &ann_end)) {
-                continue;
-            }
-
-            // Check overlap with this line
-            if (ann_start >= line_end || ann_end <= line_start) {
-                continue;
-            }
-
-            // Clamp to line bounds
-            size_t span_start = (ann_start > line_start) ? ann_start : line_start;
-            size_t span_end = (ann_end < line_end) ? ann_end : line_end;
-
-            if (span_end - span_start > line_len) {
-                span_end = line_start + line_len;
-            }
-
-            spans[span_count].start = span_start;
-            spans[span_count].end = span_end;
-            style_from_annot(buf->annots, search_annots.ids[ai], &spans[span_count].style);
-            span_count++;
         }
 
         if (span_count == 0) {
@@ -730,9 +769,6 @@ void pane_render(Pane *p, Renderer *r, bool focused) {
 
         y += line_height;
     }
-
-    annot_query_free(&style_annots);
-    annot_query_free(&search_annots);
 
     // Draw goto line dialog if visible
     if (p->goto_visible) {

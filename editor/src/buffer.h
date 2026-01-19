@@ -49,4 +49,7 @@ const char *buffer_get_file_path(const Buffer *buf);
 bool buffer_is_modified(const Buffer *buf);
 void buffer_set_modified(Buffer *buf, bool modified);
 
+// Get document revision (from annotation store, used for cache invalidation)
+uint64_t buffer_get_doc_rev(const Buffer *buf);
+
 #endif // WEFT_BUFFER_H

@@ -22,6 +22,12 @@ set(WEFT_SOURCES
   src/lcl_host.c
   src/interaction.c
   src/tree_sitter_hl.c
+  src/decoration.c
+  src/layer.c
+  src/layer_stack.c
+  src/annot_layer.c
+  src/plumb_layer.c
+  src/tree_sitter_layer.c
 )
 
 set(CMAKE_C_STANDARD 11)

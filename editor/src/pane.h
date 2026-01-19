@@ -7,6 +7,7 @@
 
 #include "buffer.h"
 #include "editor.h"
+#include "layer_stack.h"
 
 // Forward declarations
 typedef struct Renderer Renderer;
@@ -20,6 +21,7 @@ typedef struct {
 // Pane: a view into a buffer with screen bounds
 typedef struct Pane {
     Editor *view;             // Per-pane editor state (owned)
+    LayerStack *layer_stack;  // View layer stack for rendering (owned)
     SDL_Rect bounds;          // Screen position and size
     int char_width;           // Cached from renderer
     int line_height;          // Cached from renderer

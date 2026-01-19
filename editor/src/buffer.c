@@ -273,3 +273,10 @@ void buffer_set_modified(Buffer *buf, bool modified) {
         buf->modified = modified;
     }
 }
+
+uint64_t buffer_get_doc_rev(const Buffer *buf) {
+    if (!buf || !buf->annots) {
+        return 0;
+    }
+    return annot_store_get_doc_rev(buf->annots);
+}

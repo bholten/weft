@@ -844,7 +844,8 @@ SDL_AppResult SDL_AppEvent(void *app_state, SDL_Event *event) {
                                 text_to_execute = NULL;  // ownership transferred
 
                                 // Dispatch through interaction system
-                                interaction_dispatch(ctx->app.lcl, editor, ie);
+                                interaction_dispatch(ctx->app.lcl, editor, ie,
+                                                     ctx->app.focused_pane->layer_stack);
                                 interact_event_free(ie);
                             }
                         }
@@ -929,7 +930,8 @@ SDL_AppResult SDL_AppEvent(void *app_state, SDL_Event *event) {
                     if (ie) {
                         interact_event_populate_context(ie, editor);
 
-                        InteractResult result = interaction_dispatch(ctx->app.lcl, editor, ie);
+                        InteractResult result = interaction_dispatch(ctx->app.lcl, editor, ie,
+                                                                       target->layer_stack);
                         interact_event_free(ie);
 
                         if (result == INTERACT_HANDLED) {
