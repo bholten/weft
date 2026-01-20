@@ -162,6 +162,7 @@ Document *document_new(void) {
   doc->original = NULL;
   doc->original_len = 0;
   doc->total_len = 0;
+  doc->revision = 1;
 
   return doc;
 }
@@ -408,6 +409,7 @@ bool document_insert(Document *doc, size_t pos, const char *text, size_t len) {
   }
 
   doc->total_len += len;
+  doc->revision++;
   rebuild_line_index(doc);
 
   return true;
@@ -515,6 +517,7 @@ bool document_delete(Document *doc, size_t pos, size_t len) {
   }
 
   doc->total_len -= len;
+  doc->revision++;
   rebuild_line_index(doc);
 
   return true;

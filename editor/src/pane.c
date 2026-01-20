@@ -285,6 +285,20 @@ void pane_render(Pane *p, Renderer *r, bool focused) {
   int line_height = p->line_height;
   int char_width = p->char_width;
 
+  // Calculate text area dimensions
+  int header_height_early = pane_header_height(p);
+  int gutter_width_early = pane_gutter_width(p);
+  int text_area_width = p->bounds.w - gutter_width_early - p->text_offset_x * 2;
+  int pane_chars = text_area_width / char_width;
+  if (pane_chars < 10) {
+    pane_chars = 10;
+  }
+
+  // Ensure wrap cache is up to date (if wrapping enabled)
+  if (editor_get_wrap_enabled(e)) {
+    editor_ensure_wrap_cache(e, pane_chars);
+  }
+
   // Draw pane background
   SDL_Color bg_color = {.r = 30, .g = 30, .b = 30, .a = 255};
   renderer_draw_rect(r, p->bounds.x, p->bounds.y, p->bounds.w, p->bounds.h,
@@ -471,44 +485,93 @@ void pane_render(Pane *p, Renderer *r, bool focused) {
     size_t sel_start, sel_end;
     editor_get_selection(e, &sel_start, &sel_end);
 
-    size_t start_line = document_pos_to_line(doc, sel_start);
-    size_t end_line = document_pos_to_line(doc, sel_end);
-
     SDL_Color sel_color = {.r = 70, .g = 130, .b = 180, .a = 180};
 
-    for (size_t line = start_line; line <= end_line; line++) {
-      size_t line_start_pos = document_line_start(doc, line);
-      size_t line_end_pos = document_line_end(doc, line);
+    bool sel_wrap_mode = editor_get_wrap_enabled(e) && e->visual_line_count > 0;
 
-      // Get line text for tab-aware column calculation
-      char sel_line_buf[256];
-      size_t line_len = line_end_pos - line_start_pos;
-      if (line_len > sizeof(sel_line_buf) - 1) {
-        line_len = sizeof(sel_line_buf) - 1;
+    if (sel_wrap_mode) {
+      // Wrapped mode: iterate over visual lines
+      size_t start_vline = editor_pos_to_visual_line(e, sel_start);
+      size_t end_vline = editor_pos_to_visual_line(e, sel_end);
+
+      for (size_t vline = start_vline; vline <= end_vline; vline++) {
+        size_t vline_start = e->visual_line_starts[vline];
+        size_t vline_end = (vline + 1 < e->visual_line_count)
+                               ? e->visual_line_starts[vline + 1]
+                               : document_length(doc);
+
+        // Get visual line text for tab-aware column calculation
+        char sel_line_buf[256];
+        size_t vline_len = vline_end - vline_start;
+        if (vline_len > sizeof(sel_line_buf) - 1) {
+          vline_len = sizeof(sel_line_buf) - 1;
+        }
+        document_get_text(doc, vline_start, sel_line_buf, vline_len);
+
+        // Determine highlight start/end within this visual line
+        size_t highlight_start =
+            (sel_start > vline_start) ? sel_start : vline_start;
+        size_t highlight_end = (sel_end < vline_end) ? sel_end : vline_end;
+
+        if (highlight_start < highlight_end) {
+          // Convert offsets to visual columns (tab-aware)
+          size_t start_offset = highlight_start - vline_start;
+          size_t end_offset = highlight_end - vline_start;
+          int start_col = (int)doc_offset_to_visual_col(sel_line_buf, vline_len,
+                                                        start_offset, tab_size);
+          int end_col = (int)doc_offset_to_visual_col(sel_line_buf, vline_len,
+                                                      end_offset, tab_size);
+
+          int x = text_x + start_col * char_width;
+          int y = text_y + (int)vline * line_height - scroll_y;
+          int width = (end_col - start_col) * char_width;
+
+          // Clip to pane bounds
+          if (y >= p->bounds.y && y < p->bounds.y + p->bounds.h) {
+            renderer_draw_rect(r, x, y, width, line_height, sel_color);
+          }
+        }
       }
-      document_get_text(doc, line_start_pos, sel_line_buf, line_len);
+    } else {
+      // Non-wrapped mode: iterate over document lines
+      size_t start_line = document_pos_to_line(doc, sel_start);
+      size_t end_line = document_pos_to_line(doc, sel_end);
 
-      // Determine highlight start/end within this line
-      size_t highlight_start =
-          (sel_start > line_start_pos) ? sel_start : line_start_pos;
-      size_t highlight_end = (sel_end < line_end_pos) ? sel_end : line_end_pos;
+      for (size_t line = start_line; line <= end_line; line++) {
+        size_t line_start_pos = document_line_start(doc, line);
+        size_t line_end_pos = document_line_end(doc, line);
 
-      if (highlight_start < highlight_end) {
-        // Convert document offsets to visual columns (tab-aware)
-        size_t start_offset = highlight_start - line_start_pos;
-        size_t end_offset = highlight_end - line_start_pos;
-        int start_col = (int)doc_offset_to_visual_col(sel_line_buf, line_len,
-                                                      start_offset, tab_size);
-        int end_col = (int)doc_offset_to_visual_col(sel_line_buf, line_len,
-                                                    end_offset, tab_size);
+        // Get line text for tab-aware column calculation
+        char sel_line_buf[256];
+        size_t line_len = line_end_pos - line_start_pos;
+        if (line_len > sizeof(sel_line_buf) - 1) {
+          line_len = sizeof(sel_line_buf) - 1;
+        }
+        document_get_text(doc, line_start_pos, sel_line_buf, line_len);
 
-        int x = text_x + start_col * char_width;
-        int y = text_y + (int)line * line_height - scroll_y;
-        int width = (end_col - start_col) * char_width;
+        // Determine highlight start/end within this line
+        size_t highlight_start =
+            (sel_start > line_start_pos) ? sel_start : line_start_pos;
+        size_t highlight_end =
+            (sel_end < line_end_pos) ? sel_end : line_end_pos;
 
-        // Clip to pane bounds
-        if (y >= p->bounds.y && y < p->bounds.y + p->bounds.h) {
-          renderer_draw_rect(r, x, y, width, line_height, sel_color);
+        if (highlight_start < highlight_end) {
+          // Convert document offsets to visual columns (tab-aware)
+          size_t start_offset = highlight_start - line_start_pos;
+          size_t end_offset = highlight_end - line_start_pos;
+          int start_col = (int)doc_offset_to_visual_col(sel_line_buf, line_len,
+                                                        start_offset, tab_size);
+          int end_col = (int)doc_offset_to_visual_col(sel_line_buf, line_len,
+                                                      end_offset, tab_size);
+
+          int x = text_x + start_col * char_width;
+          int y = text_y + (int)line * line_height - scroll_y;
+          int width = (end_col - start_col) * char_width;
+
+          // Clip to pane bounds
+          if (y >= p->bounds.y && y < p->bounds.y + p->bounds.h) {
+            renderer_draw_rect(r, x, y, width, line_height, sel_color);
+          }
         }
       }
     }
@@ -519,19 +582,32 @@ void pane_render(Pane *p, Renderer *r, bool focused) {
   int y = text_y - scroll_y;
   char line_buf[256];
 
-  // Calculate visible document range
+  // Check if wrapping is enabled and we have valid visual line cache
+  bool wrap_mode = editor_get_wrap_enabled(e) && e->visual_line_count > 0;
+  size_t total_lines = wrap_mode ? e->visual_line_count : line_count;
+
+  // Calculate visible range
   size_t first_vis_line = (scroll_y > 0) ? (size_t)(scroll_y / line_height) : 0;
-  if (first_vis_line > 0 && first_vis_line > 0) {
+  if (first_vis_line > 0) {
     first_vis_line--; // Include one line before for partial visibility
   }
   size_t last_vis_line =
       first_vis_line + (size_t)(p->bounds.h / line_height) + 2;
-  if (last_vis_line >= line_count) {
-    last_vis_line = line_count > 0 ? line_count - 1 : 0;
+  if (last_vis_line >= total_lines) {
+    last_vis_line = total_lines > 0 ? total_lines - 1 : 0;
   }
 
-  size_t vis_start = document_line_start(doc, first_vis_line);
-  size_t vis_end = document_line_end(doc, last_vis_line);
+  // Calculate document range for layers
+  size_t vis_start, vis_end;
+  if (wrap_mode) {
+    vis_start = e->visual_line_starts[first_vis_line];
+    vis_end = (last_vis_line + 1 < e->visual_line_count)
+                  ? e->visual_line_starts[last_vis_line + 1]
+                  : document_length(doc);
+  } else {
+    vis_start = document_line_start(doc, first_vis_line);
+    vis_end = document_line_end(doc, last_vis_line);
+  }
 
   // Render all layers for the visible range
   const DecorationList *decorations =
@@ -542,7 +618,7 @@ void pane_render(Pane *p, Renderer *r, bool focused) {
   SDL_Color linenum_current = {.r = 180, .g = 180, .b = 180, .a = 255};
   size_t current_line = document_pos_to_line(doc, editor_get_cursor_pos(e));
 
-  for (size_t i = 0; i < line_count; i++) {
+  for (size_t i = 0; i < total_lines; i++) {
     // Skip lines that are off-screen (optimization)
     int line_bottom = y + line_height;
     if (line_bottom < p->bounds.y + header_height) {
@@ -553,19 +629,49 @@ void pane_render(Pane *p, Renderer *r, bool focused) {
       break;
     }
 
-    // Draw line number
-    char linenum_buf[16];
-    snprintf(linenum_buf, sizeof(linenum_buf), "%zu", i + 1);
-    int linenum_x =
-        gutter_x + gutter_width - (int)strlen(linenum_buf) * char_width - 4;
-    SDL_Color ln_color = (i == current_line) ? linenum_current : linenum_color;
-    if (y >= p->bounds.y + header_height) {
-      renderer_draw_text(r, linenum_buf, linenum_x, y, ln_color);
+    // Determine line positions
+    size_t line_start, line_end, doc_line_num;
+    bool show_line_number;
+
+    if (wrap_mode) {
+      // Wrapped mode: use visual line cache
+      line_start = e->visual_line_starts[i];
+      line_end = (i + 1 < e->visual_line_count) ? e->visual_line_starts[i + 1]
+                                                : document_length(doc);
+
+      // Determine document line number
+      doc_line_num = document_pos_to_line(doc, line_start);
+
+      // Show line number only on first visual line of each doc line
+      if (i == 0) {
+        show_line_number = true;
+      } else {
+        size_t prev_doc_line =
+            document_pos_to_line(doc, e->visual_line_starts[i - 1]);
+        show_line_number = (doc_line_num != prev_doc_line);
+      }
+    } else {
+      // Non-wrapped mode: use document lines
+      line_start = document_line_start(doc, i);
+      line_end = document_line_end(doc, i);
+      doc_line_num = i;
+      show_line_number = true;
     }
 
-    size_t line_start = document_line_start(doc, i);
-    size_t line_end = document_line_end(doc, i);
     size_t line_len = line_end - line_start;
+
+    // Draw line number
+    if (show_line_number) {
+      char linenum_buf[16];
+      snprintf(linenum_buf, sizeof(linenum_buf), "%zu", doc_line_num + 1);
+      int linenum_x =
+          gutter_x + gutter_width - (int)strlen(linenum_buf) * char_width - 4;
+      SDL_Color ln_color =
+          (doc_line_num == current_line) ? linenum_current : linenum_color;
+      if (y >= p->bounds.y + header_height) {
+        renderer_draw_text(r, linenum_buf, linenum_x, y, ln_color);
+      }
+    }
 
     if (line_len > sizeof(line_buf) - 1) {
       line_len = sizeof(line_buf) - 1;

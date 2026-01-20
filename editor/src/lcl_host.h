@@ -52,6 +52,13 @@ typedef struct {
   bool use_tabs;   // true = insert tabs, false = insert spaces
 } IndentSettings;
 
+// Wrap settings: maps file extension to text wrapping preferences
+typedef struct {
+  char *extension; // File extension (e.g., ".txt", ".md")
+  bool enabled;    // true = wrap enabled
+  int wrap_width;  // Character width to wrap at, 0 = use pane width
+} WrapSettings;
+
 // Registered keybinding: maps a key combination to an Lcl script
 typedef struct {
   int keycode;   // SDL_Keycode (e.g., SDLK_W)
@@ -127,6 +134,11 @@ typedef struct LclHost {
   IndentSettings *indent_settings;
   size_t indent_count;
   size_t indent_cap;
+
+  // Wrap settings per file type
+  WrapSettings *wrap_settings;
+  size_t wrap_count;
+  size_t wrap_cap;
 
   // Keybindings
   RegisteredKeybind *keybindings;
@@ -294,6 +306,16 @@ void lcl_host_register_indent(LclHost *host, const char *extension,
 
 // Get indent settings for a file extension (returns NULL if not found)
 const IndentSettings *lcl_host_get_indent(LclHost *host, const char *extension);
+
+// Register wrap settings for a file extension
+void lcl_host_register_wrap(LclHost *host, const char *extension, bool enabled,
+                            int wrap_width);
+
+// Get wrap settings for a file extension (returns NULL if not found)
+const WrapSettings *lcl_host_get_wrap(LclHost *host, const char *extension);
+
+// Apply wrap settings to an editor based on its buffer's file extension
+void lcl_host_apply_wrap(LclHost *host, Editor *editor);
 
 // Get the config directory path
 const char *lcl_host_get_config_dir(LclHost *host);

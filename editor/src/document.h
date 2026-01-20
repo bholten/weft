@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 typedef enum {
   PIECE_ORIGINAL, // Initial content (immutable)
@@ -37,6 +38,9 @@ typedef struct document {
   size_t *line_starts; // line_starts[i] = byte offset where line i begins
   size_t line_count;
   size_t line_cap;
+
+  // Revision counter - incremented on each edit for cache invalidation
+  uint64_t revision;
 } Document;
 
 // Lifecycle

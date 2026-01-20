@@ -248,6 +248,9 @@ SDL_AppResult SDL_AppInit(void **app_state, int argc, char **argv) {
   // Apply indent settings based on file type
   lcl_host_apply_indent(ctx->app.lcl, pane_get_editor(initial_pane));
 
+  // Apply wrap settings based on file type
+  lcl_host_apply_wrap(ctx->app.lcl, pane_get_editor(initial_pane));
+
   // Create layout root with the pane
   ctx->app.layout_root = layout_leaf_new(initial_pane);
   if (!ctx->app.layout_root) {

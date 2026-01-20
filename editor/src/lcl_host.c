@@ -1045,6 +1045,9 @@ static int c_buffer_open(lcl_interp *interp, int argc, lcl_value **argv,
   // Apply indent settings based on file type
   lcl_host_apply_indent(host, pane_get_editor(new_pane));
 
+  // Apply wrap settings based on file type
+  lcl_host_apply_wrap(host, pane_get_editor(new_pane));
+
   // Split current pane horizontally to show new pane
   // Find the current focused pane's layout node
   LayoutNode *root = *host->layout_root_ptr;
@@ -1900,6 +1903,9 @@ static int c_buffer_open_at(lcl_interp *interp, int argc, lcl_value **argv,
   Editor *editor = pane_get_editor(new_pane);
   lcl_host_apply_indent(host, editor);
 
+  // Apply wrap settings based on file type
+  lcl_host_apply_wrap(host, editor);
+
   // Split current pane horizontally to show new pane
   LayoutNode *root = *host->layout_root_ptr;
   LayoutNode *new_split = layout_split_horizontal(root, new_pane);
@@ -2618,6 +2624,45 @@ static int c_config_indent(lcl_interp *interp, int argc, lcl_value **argv,
   }
 
   lcl_host_register_indent(host, ext, (int)tab_size, use_tabs != 0);
+
+  *out = lcl_list_new();
+  return LCL_RC_OK;
+}
+
+// weft::config::wrap ext enabled wrap-width -> register wrap settings
+static int c_config_wrap(lcl_interp *interp, int argc, lcl_value **argv,
+                         lcl_value **out) {
+  LclHost *host = lcl_interp_get_user_data(interp);
+  if (!host) {
+    lcl_set_error(interp, "no host context");
+    return LCL_RC_ERR;
+  }
+
+  if (argc < 3) {
+    lcl_set_error(interp,
+                  "config::wrap requires extension, enabled, and wrap-width");
+    return LCL_RC_ERR;
+  }
+
+  const char *ext = lcl_value_to_string(argv[0]);
+  if (!ext) {
+    lcl_set_error(interp, "config::wrap: extension must be a string");
+    return LCL_RC_ERR;
+  }
+
+  int64_t enabled = 0;
+  if (lcl_value_to_int(argv[1], &enabled) != LCL_OK) {
+    lcl_set_error(interp, "config::wrap: enabled must be an integer (0 or 1)");
+    return LCL_RC_ERR;
+  }
+
+  int64_t wrap_width = 0;
+  if (lcl_value_to_int(argv[2], &wrap_width) != LCL_OK) {
+    lcl_set_error(interp, "config::wrap: wrap-width must be an integer");
+    return LCL_RC_ERR;
+  }
+
+  lcl_host_register_wrap(host, ext, enabled != 0, (int)wrap_width);
 
   *out = lcl_list_new();
   return LCL_RC_OK;
@@ -3456,6 +3501,8 @@ static void register_weft_bindings(lcl_interp *interp) {
              lcl_c_proc_new("weft::config::dir", c_config_dir));
   lcl_ns_def(config_ns, "indent",
              lcl_c_proc_new("weft::config::indent", c_config_indent));
+  lcl_ns_def(config_ns, "wrap",
+             lcl_c_proc_new("weft::config::wrap", c_config_wrap));
   lcl_ns_def(config_ns, "keybind",
              lcl_c_proc_new("weft::config::keybind", c_config_keybind));
   lcl_ns_def(config_ns, "viewlayer",
@@ -3556,9 +3603,24 @@ LclHost *lcl_host_new(void) {
   host->indent_cap = INITIAL_LAYER_CAP;
   host->indent_count = 0;
 
+  // Initialize wrap settings array
+  host->wrap_settings = calloc(INITIAL_LAYER_CAP, sizeof(WrapSettings));
+  if (!host->wrap_settings) {
+    free(host->indent_settings);
+    free(host->filetypes);
+    free(host->handlers);
+    free(host->registered_layers);
+    lcl_interp_free(host->interp);
+    free(host);
+    return NULL;
+  }
+  host->wrap_cap = INITIAL_LAYER_CAP;
+  host->wrap_count = 0;
+
   // Initialize keybindings array
   host->keybindings = calloc(INITIAL_HANDLER_CAP, sizeof(RegisteredKeybind));
   if (!host->keybindings) {
+    free(host->wrap_settings);
     free(host->indent_settings);
     free(host->filetypes);
     free(host->handlers);
@@ -3574,6 +3636,7 @@ LclHost *lcl_host_new(void) {
   host->viewlayer_configs = calloc(INITIAL_LAYER_CAP, sizeof(ViewLayerConfig));
   if (!host->viewlayer_configs) {
     free(host->keybindings);
+    free(host->wrap_settings);
     free(host->indent_settings);
     free(host->filetypes);
     free(host->handlers);
@@ -3643,6 +3706,12 @@ void lcl_host_free(LclHost *host) {
     free(host->indent_settings[i].extension);
   }
   free(host->indent_settings);
+
+  // Free wrap settings
+  for (size_t i = 0; i < host->wrap_count; i++) {
+    free(host->wrap_settings[i].extension);
+  }
+  free(host->wrap_settings);
 
   // Free keybindings
   for (size_t i = 0; i < host->keybind_count; i++) {
@@ -4444,6 +4513,84 @@ const IndentSettings *lcl_host_get_indent(LclHost *host,
   }
 
   return NULL;
+}
+
+// === Wrap Settings Functions ===
+
+void lcl_host_register_wrap(LclHost *host, const char *extension, bool enabled,
+                            int wrap_width) {
+  if (!host || !extension) {
+    return;
+  }
+
+  // Check if we already have settings for this extension (update if so)
+  for (size_t i = 0; i < host->wrap_count; i++) {
+    if (strcmp(host->wrap_settings[i].extension, extension) == 0) {
+      host->wrap_settings[i].enabled = enabled;
+      host->wrap_settings[i].wrap_width = wrap_width;
+      return;
+    }
+  }
+
+  // Check if we need to grow the array
+  if (host->wrap_count >= host->wrap_cap) {
+    size_t new_cap = host->wrap_cap * 2;
+    WrapSettings *new_arr =
+        realloc(host->wrap_settings, new_cap * sizeof(WrapSettings));
+    if (!new_arr) {
+      return;
+    }
+    host->wrap_settings = new_arr;
+    host->wrap_cap = new_cap;
+  }
+
+  // Add the new settings
+  WrapSettings *settings = &host->wrap_settings[host->wrap_count];
+  settings->extension = strdup(extension);
+  if (!settings->extension) {
+    return;
+  }
+  settings->enabled = enabled;
+  settings->wrap_width = wrap_width;
+
+  host->wrap_count++;
+}
+
+const WrapSettings *lcl_host_get_wrap(LclHost *host, const char *extension) {
+  if (!host || !extension) {
+    return NULL;
+  }
+
+  for (size_t i = 0; i < host->wrap_count; i++) {
+    if (strcmp(host->wrap_settings[i].extension, extension) == 0) {
+      return &host->wrap_settings[i];
+    }
+  }
+
+  return NULL;
+}
+
+void lcl_host_apply_wrap(LclHost *host, Editor *editor) {
+  if (!host || !editor) {
+    return;
+  }
+
+  Buffer *buffer = editor_get_buffer(editor);
+  if (!buffer || !buffer->file_path) {
+    return;
+  }
+
+  // Find the file extension
+  const char *ext = strrchr(buffer->file_path, '.');
+  if (!ext) {
+    return;
+  }
+
+  // Look up wrap settings for this extension
+  const WrapSettings *settings = lcl_host_get_wrap(host, ext);
+  if (settings) {
+    editor_set_wrap(editor, settings->enabled, settings->wrap_width);
+  }
 }
 
 // === Keybinding Functions ===

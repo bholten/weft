@@ -52,6 +52,18 @@ typedef struct Editor {
   // Indent settings
   int tab_size;  // Tab width / spaces per indent (default 4)
   bool use_tabs; // Insert tabs vs spaces (default: tabs)
+
+  // Text wrapping
+  bool wrap_enabled; // Whether text wrapping is enabled
+  int wrap_width;    // Character width to wrap at, 0 = use pane width
+
+  // Visual line cache (for wrapped text)
+  size_t *visual_line_starts;  // Byte offset where each visual line starts
+  size_t visual_line_count;    // Number of visual lines
+  size_t visual_line_cap;      // Capacity of visual_line_starts array
+  uint64_t wrap_cache_doc_rev; // Document revision when cache was built
+  int wrap_cache_width;        // Wrap width when cache was built
+  int wrap_cache_pane_chars;   // Pane width in characters when cache was built
 } Editor;
 
 // Lifecycle
@@ -61,6 +73,16 @@ void editor_set_layout(Editor *e, int char_width, int line_height, int offset_x,
                        int offset_y);
 void editor_set_viewport_height(Editor *e, int height);
 void editor_set_indent(Editor *e, int tab_size, bool use_tabs);
+void editor_set_wrap(Editor *e, bool enabled, int wrap_width);
+bool editor_get_wrap_enabled(const Editor *e);
+int editor_get_wrap_width(const Editor *e);
+
+// Visual line cache (for wrapped text)
+void editor_invalidate_wrap_cache(Editor *e);
+void editor_ensure_wrap_cache(Editor *e, int pane_chars);
+size_t editor_get_visual_line_count(Editor *e);
+size_t editor_pos_to_visual_line(Editor *e, size_t pos);
+size_t editor_visual_line_to_pos(Editor *e, size_t visual_line);
 
 // Input handling
 bool editor_handle_event(Editor *e, const InputEvent *event);
