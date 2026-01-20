@@ -6,6 +6,8 @@
 
 #include <SDL3/SDL.h>
 
+#include "utf8.h"
+
 #define BLINK_INTERVAL_MS 530
 
 // Helper: Reset cursor blink state (makes cursor visible)
@@ -774,7 +776,17 @@ void editor_move_cursor_left(Editor *e) {
     return;
   }
 
-  e->cursor_pos--;
+  // Move by UTF-8 codepoint, not byte
+  // Move back one byte first
+  size_t pos = e->cursor_pos - 1;
+
+  // Skip over any continuation bytes (10xxxxxx)
+  while (pos > 0 &&
+         utf8_is_continuation(document_get_byte(e->buffer->document, pos))) {
+    pos--;
+  }
+
+  e->cursor_pos = pos;
   update_target_column(e);
   editor_scroll_to_cursor(e);
 }
@@ -785,11 +797,23 @@ void editor_move_cursor_right(Editor *e) {
   }
 
   size_t doc_len = document_length(e->buffer->document);
-  if (e->cursor_pos < doc_len) {
-    e->cursor_pos++;
-    update_target_column(e);
-    editor_scroll_to_cursor(e);
+  if (e->cursor_pos >= doc_len) {
+    return;
   }
+
+  // Move by UTF-8 codepoint, not byte
+  unsigned char byte = document_get_byte(e->buffer->document, e->cursor_pos);
+  int cp_len = utf8_codepoint_len(byte);
+  size_t next = e->cursor_pos + cp_len;
+
+  // Don't overshoot the end
+  if (next > doc_len) {
+    next = doc_len;
+  }
+
+  e->cursor_pos = next;
+  update_target_column(e);
+  editor_scroll_to_cursor(e);
 }
 
 void editor_move_cursor_up(Editor *e) {
@@ -1148,14 +1172,26 @@ void editor_delete_backward(Editor *e) {
     return;
   }
 
-  // Get the character to be deleted for undo
-  char deleted_char;
-  document_get_text(e->buffer->document, e->cursor_pos - 1, &deleted_char, 1);
+  // Find start of UTF-8 codepoint to delete
+  size_t delete_start = e->cursor_pos - 1;
 
-  if (document_delete(e->buffer->document, e->cursor_pos - 1, 1)) {
-    annot_store_on_delete(e->buffer->annots, e->cursor_pos - 1, 1);
-    record_edit(e, EDIT_DELETE, e->cursor_pos - 1, &deleted_char, 1);
-    e->cursor_pos--;
+  // Skip over any continuation bytes (10xxxxxx)
+  while (delete_start > 0 && utf8_is_continuation(document_get_byte(
+                                 e->buffer->document, delete_start))) {
+    delete_start--;
+  }
+
+  size_t delete_len = e->cursor_pos - delete_start;
+
+  // Get the bytes to be deleted for undo
+  char deleted_bytes[4];
+  document_get_text(e->buffer->document, delete_start, deleted_bytes,
+                    delete_len);
+
+  if (document_delete(e->buffer->document, delete_start, delete_len)) {
+    annot_store_on_delete(e->buffer->annots, delete_start, delete_len);
+    record_edit(e, EDIT_DELETE, delete_start, deleted_bytes, delete_len);
+    e->cursor_pos = delete_start;
     update_target_column(e);
     editor_scroll_to_cursor(e);
   }
@@ -1177,13 +1213,22 @@ void editor_delete_forward(Editor *e) {
     return;
   }
 
-  // Get the character to be deleted for undo
-  char deleted_char;
-  document_get_text(e->buffer->document, e->cursor_pos, &deleted_char, 1);
+  // Get length of UTF-8 codepoint at cursor
+  unsigned char byte = document_get_byte(e->buffer->document, e->cursor_pos);
+  int cp_len = utf8_codepoint_len(byte);
 
-  if (document_delete(e->buffer->document, e->cursor_pos, 1)) {
-    annot_store_on_delete(e->buffer->annots, e->cursor_pos, 1);
-    record_edit(e, EDIT_DELETE, e->cursor_pos, &deleted_char, 1);
+  // Don't delete past end of document
+  if (e->cursor_pos + cp_len > doc_len) {
+    cp_len = doc_len - e->cursor_pos;
+  }
+
+  // Get the bytes to be deleted for undo
+  char deleted_bytes[4];
+  document_get_text(e->buffer->document, e->cursor_pos, deleted_bytes, cp_len);
+
+  if (document_delete(e->buffer->document, e->cursor_pos, cp_len)) {
+    annot_store_on_delete(e->buffer->annots, e->cursor_pos, cp_len);
+    record_edit(e, EDIT_DELETE, e->cursor_pos, deleted_bytes, cp_len);
     update_target_column(e);
   }
 }

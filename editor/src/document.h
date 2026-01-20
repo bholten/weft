@@ -56,6 +56,9 @@ size_t document_line_count(const Document *doc);
 size_t document_get_text(const Document *doc, size_t pos, char *buf,
                          size_t buf_len);
 
+// Get a single byte at position (returns 0 if out of bounds)
+unsigned char document_get_byte(const Document *doc, size_t pos);
+
 // Line operations (0-indexed lines)
 size_t document_line_start(const Document *doc, size_t line);
 size_t document_line_end(const Document *doc,

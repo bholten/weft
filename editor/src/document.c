@@ -260,6 +260,23 @@ size_t document_get_text(const Document *doc, size_t pos, char *buf,
   return bytes_written;
 }
 
+unsigned char document_get_byte(const Document *doc, size_t pos) {
+  if (!doc || pos >= doc->total_len) {
+    return 0;
+  }
+
+  size_t piece_idx;
+  size_t offset_in_piece;
+
+  if (!find_piece_at_pos(doc, pos, &piece_idx, &offset_in_piece)) {
+    return 0;
+  }
+
+  const Piece *piece = &doc->pieces[piece_idx];
+  const char *src = get_source_buffer(doc, piece->source);
+  return (unsigned char)src[piece->start + offset_in_piece];
+}
+
 size_t document_line_start(const Document *doc, size_t line) {
   if (!doc || line >= doc->line_count) {
     return 0;

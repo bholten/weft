@@ -31,6 +31,7 @@ set(WEFT_SOURCES
   src/patch.c
   src/transform.c
   src/color.c
+  src/utf8.c
 )
 
 set(CMAKE_C_STANDARD 11)
