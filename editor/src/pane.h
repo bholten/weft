@@ -48,6 +48,12 @@ typedef struct Pane {
   bool goto_visible;   // Whether goto dialog is shown
   char goto_input[16]; // Line number input buffer
   size_t goto_cursor;  // Cursor position in goto input
+
+  // Transform prompt state
+  bool prompt_visible;      // Whether prompt dialog is shown
+  char prompt_message[256]; // Message to display
+  char prompt_input[256];   // User input buffer
+  size_t prompt_cursor;     // Cursor position in prompt input
 } Pane;
 
 // Lifecycle
@@ -124,5 +130,16 @@ void pane_goto_execute(Pane *p);         // Jump to the line
 // Goto input handling (returns true if event was consumed)
 bool pane_goto_handle_key(Pane *p, SDL_Keycode key, SDL_Keymod mod);
 bool pane_goto_handle_text(Pane *p, const char *text);
+
+// Transform prompt functionality
+void pane_prompt_show(Pane *p, const char *message,
+                      const char *default_value); // Show prompt with message
+void pane_prompt_hide(Pane *p);                   // Hide prompt dialog
+bool pane_prompt_is_active(const Pane *p);        // Is prompt dialog visible?
+const char *pane_prompt_get_input(const Pane *p); // Get current input
+
+// Prompt input handling (returns true if event was consumed)
+bool pane_prompt_handle_key(Pane *p, SDL_Keycode key, SDL_Keymod mod);
+bool pane_prompt_handle_text(Pane *p, const char *text);
 
 #endif // WEFT_PANE_H

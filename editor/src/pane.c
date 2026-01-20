@@ -7,10 +7,10 @@
 
 #include "annot_layer.h"
 #include "annot_store.h"
+#include "color.h"
 #include "document.h"
 #include "plumb_layer.h"
 #include "renderer.h"
-#include "tree_sitter_layer.h"
 
 #define TEXT_PADDING 10
 #define MAX_STYLED_SPANS 64
@@ -32,80 +32,7 @@ typedef struct {
 } StyledSpan;
 
 // Parse hex color string like "#RRGGBB" or "#RGB"
-static bool parse_hex_color(const char *str, SDL_Color *out) {
-  if (!str || str[0] != '#') {
-    return false;
-  }
-
-  size_t len = strlen(str);
-  unsigned int r, g, b;
-
-  if (len == 7) {
-    // #RRGGBB
-    if (sscanf(str, "#%02x%02x%02x", &r, &g, &b) == 3) {
-      out->r = (uint8_t)r;
-      out->g = (uint8_t)g;
-      out->b = (uint8_t)b;
-      out->a = 255;
-      return true;
-    }
-  } else if (len == 4) {
-    // #RGB -> #RRGGBB
-    if (sscanf(str, "#%1x%1x%1x", &r, &g, &b) == 3) {
-      out->r = (uint8_t)(r * 17);
-      out->g = (uint8_t)(g * 17);
-      out->b = (uint8_t)(b * 17);
-      out->a = 255;
-      return true;
-    }
-  }
-
-  return false;
-}
-
-// Parse named color
-static bool parse_named_color(const char *str, SDL_Color *out) {
-  if (!str) {
-    return false;
-  }
-
-  // Basic named colors
-  struct {
-    const char *name;
-    uint8_t r, g, b;
-  } colors[] = {
-      {"red",     255, 0,   0  },
-      {"green",   0,   255, 0  },
-      {"blue",    0,   0,   255},
-      {"yellow",  255, 255, 0  },
-      {"cyan",    0,   255, 255},
-      {"magenta", 255, 0,   255},
-      {"white",   255, 255, 255},
-      {"black",   0,   0,   0  },
-      {"orange",  255, 165, 0  },
-      {"purple",  128, 0,   128},
-      {"pink",    255, 192, 203},
-      {"gray",    128, 128, 128},
-      {"grey",    128, 128, 128},
-  };
-
-  for (size_t i = 0; i < sizeof(colors) / sizeof(colors[0]); i++) {
-    if (strcasecmp(str, colors[i].name) == 0) {
-      out->r = colors[i].r;
-      out->g = colors[i].g;
-      out->b = colors[i].b;
-      out->a = 255;
-      return true;
-    }
-  }
-
-  return false;
-}
-
-// Parse any color value
-static bool parse_color(const char *str, SDL_Color *out) {
-  return parse_hex_color(str, out) || parse_named_color(str, out);
-}
+// Color parsing moved to color.h/color.c
 
 // Build TextStyle from annotation metadata
 static void style_from_annot(const AnnotStore *store, uint32_t annot_id,
@@ -113,12 +40,12 @@ static void style_from_annot(const AnnotStore *store, uint32_t annot_id,
   memset(style, 0, sizeof(TextStyle));
 
   const char *fg = annot_store_get_meta(store, annot_id, "style:fg");
-  if (fg && parse_color(fg, &style->fg)) {
+  if (fg && color_parse(fg, &style->fg)) {
     style->has_fg = true;
   }
 
   const char *bg = annot_store_get_meta(store, annot_id, "style:bg");
-  if (bg && parse_color(bg, &style->bg)) {
+  if (bg && color_parse(bg, &style->bg)) {
     style->has_bg = true;
   }
 
@@ -212,44 +139,14 @@ Pane *pane_new(Buffer *buffer, int char_width, int line_height) {
     return NULL;
   }
 
-  // Add layers in priority order:
-  // - style (0): syntax highlighting from annotations (only if no tree-sitter)
-  // - ts:* (2): tree-sitter syntax highlighting (if file type detected)
+  // Add utility layers (always present):
   // - plumb (5): clickable file:line patterns
   // - search (10): search result highlights (on top)
+  //
+  // File-type-specific layers (syntax highlighting, etc.) are added by
+  // lcl_host_apply_viewlayers() after pane creation, based on config.
   ViewLayer *plumb_layer = plumb_layer_new(5);
   ViewLayer *search_layer = annot_layer_new("search", 10);
-
-  // Check if we should use tree-sitter for syntax highlighting
-  bool use_tree_sitter = false;
-  const char *file_path = buffer_get_file_path(buffer);
-  if (file_path) {
-    size_t len = strlen(file_path);
-    // Check for .lcl extension or *lcl* buffer name (REPL)
-    bool is_lcl = (len > 4 && strcmp(file_path + len - 4, ".lcl") == 0) ||
-                  strcmp(file_path, "*lcl*") == 0;
-    if (is_lcl) {
-      ViewLayer *ts_layer = tree_sitter_layer_new_lcl(2);
-      if (ts_layer) {
-        layer_stack_add(p->layer_stack, ts_layer);
-        use_tree_sitter = true;
-
-        // Clear any existing style annotations to avoid conflicts
-        if (buffer->annots) {
-          annot_store_clear_layer(buffer->annots, "style");
-        }
-      }
-    }
-  }
-
-  // Only add style annotation layer if not using tree-sitter
-  // (tree-sitter computes highlighting, annotations would conflict)
-  if (!use_tree_sitter) {
-    ViewLayer *style_layer = annot_layer_new("style", 0);
-    if (style_layer) {
-      layer_stack_add(p->layer_stack, style_layer);
-    }
-  }
 
   if (plumb_layer) {
     layer_stack_add(p->layer_stack, plumb_layer);
@@ -849,9 +746,51 @@ void pane_render(Pane *p, Renderer *r, bool focused) {
     }
   }
 
-  // Draw cursor (only if search/goto is not active, otherwise cursor is in
-  // dialog input)
-  if (!p->search_visible && !p->goto_visible && editor_cursor_is_visible(e)) {
+  // Draw transform prompt dialog if visible
+  if (p->prompt_visible) {
+    // Dialog dimensions - wider than goto to accommodate message
+    int dialog_w = 350;
+    int dialog_h = 80;
+    int dialog_x = p->bounds.x + (p->bounds.w - dialog_w) / 2;
+    int dialog_y = p->bounds.y + header_height + 40;
+
+    // Dialog colors
+    SDL_Color dialog_bg = {.r = 45, .g = 45, .b = 50, .a = 255};
+    SDL_Color dialog_border = {.r = 100, .g = 150, .b = 100, .a = 255}; // Green
+    SDL_Color label_text = {.r = 180, .g = 180, .b = 180, .a = 255};
+    SDL_Color input_bg = {.r = 35, .g = 35, .b = 40, .a = 255};
+    SDL_Color input_text = {.r = 255, .g = 255, .b = 255, .a = 255};
+
+    // Draw border (slightly larger)
+    renderer_draw_rect(r, dialog_x - 2, dialog_y - 2, dialog_w + 4,
+                       dialog_h + 4, dialog_border);
+    // Draw background
+    renderer_draw_rect(r, dialog_x, dialog_y, dialog_w, dialog_h, dialog_bg);
+
+    // Draw prompt message
+    renderer_draw_text(r, p->prompt_message, dialog_x + 10, dialog_y + 8,
+                       label_text);
+
+    // Draw input box
+    int input_x = dialog_x + 10;
+    int input_y = dialog_y + 38;
+    int input_w = dialog_w - 20;
+    int input_h = 28;
+    renderer_draw_rect(r, input_x, input_y, input_w, input_h, input_bg);
+    renderer_draw_text(r, p->prompt_input, input_x + 4, input_y + 5,
+                       input_text);
+
+    // Draw cursor in input
+    if (focused) {
+      int cursor_x = input_x + 4 + (int)p->prompt_cursor * char_width;
+      renderer_draw_rect(r, cursor_x, input_y + 5, 2, input_h - 10, input_text);
+    }
+  }
+
+  // Draw cursor (only if search/goto/prompt is not active, otherwise cursor is
+  // in dialog input)
+  if (!p->search_visible && !p->goto_visible && !p->prompt_visible &&
+      editor_cursor_is_visible(e)) {
     int cursor_x, cursor_y;
     editor_pos_to_screen(e, editor_get_cursor_pos(e), &cursor_x, &cursor_y);
 
@@ -1510,6 +1449,123 @@ bool pane_goto_handle_text(Pane *p, const char *text) {
           p->goto_input + p->goto_cursor, len - p->goto_cursor + 1);
   memcpy(p->goto_input + p->goto_cursor, text, text_len);
   p->goto_cursor += text_len;
+
+  return true;
+}
+
+// === Transform Prompt ===
+
+void pane_prompt_show(Pane *p, const char *message, const char *default_value) {
+  if (!p) {
+    return;
+  }
+
+  // Hide other dialogs
+  pane_search_hide(p);
+  pane_goto_hide(p);
+
+  p->prompt_visible = true;
+  snprintf(p->prompt_message, sizeof(p->prompt_message), "%s",
+           message ? message : "Input:");
+
+  // Set default value if provided
+  if (default_value) {
+    snprintf(p->prompt_input, sizeof(p->prompt_input), "%s", default_value);
+    p->prompt_cursor = strlen(p->prompt_input);
+  } else {
+    p->prompt_input[0] = '\0';
+    p->prompt_cursor = 0;
+  }
+}
+
+void pane_prompt_hide(Pane *p) {
+  if (!p) {
+    return;
+  }
+  p->prompt_visible = false;
+}
+
+bool pane_prompt_is_active(const Pane *p) {
+  return p && p->prompt_visible;
+}
+
+const char *pane_prompt_get_input(const Pane *p) {
+  if (!p || !p->prompt_visible) {
+    return NULL;
+  }
+  return p->prompt_input;
+}
+
+bool pane_prompt_handle_key(Pane *p, SDL_Keycode key, SDL_Keymod mod) {
+  if (!p || !p->prompt_visible) {
+    return false;
+  }
+
+  (void)mod;
+  size_t len = strlen(p->prompt_input);
+
+  switch (key) {
+  case SDLK_ESCAPE: pane_prompt_hide(p); return true;
+
+  case SDLK_RETURN:
+  case SDLK_KP_ENTER:
+    // Return true but don't hide - let caller handle submission
+    return true;
+
+  case SDLK_BACKSPACE:
+    if (p->prompt_cursor > 0) {
+      memmove(p->prompt_input + p->prompt_cursor - 1,
+              p->prompt_input + p->prompt_cursor, len - p->prompt_cursor + 1);
+      p->prompt_cursor--;
+    }
+    return true;
+
+  case SDLK_DELETE:
+    if (p->prompt_cursor < len) {
+      memmove(p->prompt_input + p->prompt_cursor,
+              p->prompt_input + p->prompt_cursor + 1, len - p->prompt_cursor);
+    }
+    return true;
+
+  case SDLK_LEFT:
+    if (p->prompt_cursor > 0) {
+      p->prompt_cursor--;
+    }
+    return true;
+
+  case SDLK_RIGHT:
+    if (p->prompt_cursor < len) {
+      p->prompt_cursor++;
+    }
+    return true;
+
+  case SDLK_HOME: p->prompt_cursor = 0; return true;
+
+  case SDLK_END: p->prompt_cursor = len; return true;
+
+  default: return false;
+  }
+}
+
+bool pane_prompt_handle_text(Pane *p, const char *text) {
+  if (!p || !p->prompt_visible || !text) {
+    return false;
+  }
+
+  size_t len = strlen(p->prompt_input);
+  size_t text_len = strlen(text);
+  size_t max_len = sizeof(p->prompt_input) - 1;
+
+  // Don't insert if it would overflow
+  if (len + text_len >= max_len) {
+    return true;
+  }
+
+  // Insert text at cursor
+  memmove(p->prompt_input + p->prompt_cursor + text_len,
+          p->prompt_input + p->prompt_cursor, len - p->prompt_cursor + 1);
+  memcpy(p->prompt_input + p->prompt_cursor, text, text_len);
+  p->prompt_cursor += text_len;
 
   return true;
 }

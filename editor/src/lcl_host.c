@@ -13,17 +13,20 @@
 
 #include <lcl.h>
 
+#include "annot_layer.h"
 #include "annot_store.h"
 #include "buffer.h"
 #include "document.h"
 #include "editor.h"
 #include "interaction.h"
+#include "layer.h"
 #include "layer_stack.h"
 #include "layout.h"
 #include "pane.h"
 #include "patch.h"
 #include "transform.h"
 #include "tree_sitter_hl.h"
+#include "tree_sitter_layer.h"
 
 #include <SDL3/SDL.h>
 
@@ -1036,6 +1039,9 @@ static int c_buffer_open(lcl_interp *interp, int argc, lcl_value **argv,
     return LCL_RC_ERR;
   }
 
+  // Apply viewlayer configuration based on file type
+  lcl_host_apply_viewlayers(host, new_pane);
+
   // Apply indent settings based on file type
   lcl_host_apply_indent(host, pane_get_editor(new_pane));
 
@@ -1112,6 +1118,9 @@ static int c_buffer_open_output(lcl_interp *interp, int argc, lcl_value **argv,
     lcl_set_error(interp, "buffer::open-output: failed to create pane");
     return LCL_RC_ERR;
   }
+
+  // Apply viewlayer configuration
+  lcl_host_apply_viewlayers(host, new_pane);
 
   // Split to show new pane
   LayoutNode *root = *host->layout_root_ptr;
@@ -1204,6 +1213,9 @@ static int c_repl_open(lcl_interp *interp, int argc, lcl_value **argv,
     lcl_set_error(interp, "repl::open: failed to create pane");
     return LCL_RC_ERR;
   }
+
+  // Apply viewlayer configuration (REPL uses *lcl* which triggers .lcl config)
+  lcl_host_apply_viewlayers(host, new_pane);
 
   // Split to show new pane
   LayoutNode *root = *host->layout_root_ptr;
@@ -1814,6 +1826,9 @@ static int c_inspect_at(lcl_interp *interp, int argc, lcl_value **argv,
     return LCL_RC_ERR;
   }
 
+  // Apply viewlayer configuration
+  lcl_host_apply_viewlayers(host, new_pane);
+
   // Split to show new pane
   LayoutNode *root = *host->layout_root_ptr;
   LayoutNode *new_split = layout_split_horizontal(root, new_pane);
@@ -1877,6 +1892,9 @@ static int c_buffer_open_at(lcl_interp *interp, int argc, lcl_value **argv,
     lcl_set_error(interp, "buffer::open-at: failed to create pane");
     return LCL_RC_ERR;
   }
+
+  // Apply viewlayer configuration based on file type
+  lcl_host_apply_viewlayers(host, new_pane);
 
   // Apply indent settings based on file type
   Editor *editor = pane_get_editor(new_pane);
@@ -2298,6 +2316,9 @@ static int c_fs_ls(lcl_interp *interp, int argc, lcl_value **argv,
     return LCL_RC_ERR;
   }
 
+  // Apply viewlayer configuration
+  lcl_host_apply_viewlayers(host, new_pane);
+
   // Split to show new pane
   LayoutNode *root = *host->layout_root_ptr;
   LayoutNode *new_split = layout_split_horizontal(root, new_pane);
@@ -2602,6 +2623,65 @@ static int c_config_indent(lcl_interp *interp, int argc, lcl_value **argv,
   return LCL_RC_OK;
 }
 
+// weft::config::viewlayer ext type param ?priority? -> register viewlayer
+// config type: "tree-sitter", "lcl-script", or "annot" param: language name
+// (for tree-sitter), script path (for lcl-script), or
+//        layer name (for annot)
+static int c_config_viewlayer(lcl_interp *interp, int argc, lcl_value **argv,
+                              lcl_value **out) {
+  LclHost *host = lcl_interp_get_user_data(interp);
+  if (!host) {
+    lcl_set_error(interp, "no host context");
+    return LCL_RC_ERR;
+  }
+
+  if (argc < 3) {
+    lcl_set_error(interp,
+                  "config::viewlayer requires extension, type, and param");
+    return LCL_RC_ERR;
+  }
+
+  const char *ext = lcl_value_to_string(argv[0]);
+  const char *type_str = lcl_value_to_string(argv[1]);
+  const char *param = lcl_value_to_string(argv[2]);
+
+  if (!ext || !type_str || !param) {
+    lcl_set_error(
+        interp,
+        "config::viewlayer: extension, type, and param must be strings");
+    return LCL_RC_ERR;
+  }
+
+  // Parse type
+  ViewLayerType type;
+  if (strcmp(type_str, "tree-sitter") == 0) {
+    type = VIEWLAYER_TREE_SITTER;
+  } else if (strcmp(type_str, "lcl-script") == 0) {
+    type = VIEWLAYER_LCL_SCRIPT;
+  } else if (strcmp(type_str, "annot") == 0) {
+    type = VIEWLAYER_ANNOT;
+  } else {
+    lcl_set_error(
+        interp, "config::viewlayer: type must be 'tree-sitter', 'lcl-script', "
+                "or 'annot'");
+    return LCL_RC_ERR;
+  }
+
+  // Optional priority (default 0)
+  int priority = 0;
+  if (argc >= 4) {
+    int64_t prio = 0;
+    if (lcl_value_to_int(argv[3], &prio) == LCL_OK) {
+      priority = (int)prio;
+    }
+  }
+
+  lcl_host_register_viewlayer(host, ext, type, param, priority);
+
+  *out = lcl_list_new();
+  return LCL_RC_OK;
+}
+
 // Helper to parse a key name to SDL keycode
 static int parse_keycode(const char *name) {
   // Common single-character keys
@@ -2881,6 +2961,9 @@ static void show_patch_buffer(LclHost *host, Patch *patch, Buffer *target) {
     return;
   }
 
+  // Apply viewlayer configuration
+  lcl_host_apply_viewlayers(host, new_pane);
+
   // Split current layout horizontally to show new pane
   LayoutNode *root = *host->layout_root_ptr;
   LayoutNode *new_split = layout_split_horizontal(root, new_pane);
@@ -2896,6 +2979,117 @@ static void show_patch_buffer(LclHost *host, Patch *patch, Buffer *target) {
   if (host->focused_pane_ptr) {
     *host->focused_pane_ptr = new_pane;
   }
+}
+
+// weft::transform::register name description script -> register an Lcl
+// transform
+static int c_transform_register(lcl_interp *interp, int argc, lcl_value **argv,
+                                lcl_value **out) {
+  if (argc < 3) {
+    lcl_set_error(interp,
+                  "transform::register requires name, description, and script");
+    return LCL_RC_ERR;
+  }
+
+  LclHost *host = lcl_interp_get_user_data(interp);
+  if (!host) {
+    lcl_set_error(interp, "no host context");
+    return LCL_RC_ERR;
+  }
+
+  const char *name = lcl_value_to_string(argv[0]);
+  const char *description = lcl_value_to_string(argv[1]);
+  const char *script = lcl_value_to_string(argv[2]);
+
+  if (!name || !description || !script) {
+    lcl_set_error(interp, "arguments must be strings");
+    return LCL_RC_ERR;
+  }
+
+  if (!transform_register_lcl(name, description, host, script)) {
+    lcl_set_error(interp, "failed to register transform (name may exist)");
+    return LCL_RC_ERR;
+  }
+
+  *out = lcl_string_new(name);
+  return LCL_RC_OK;
+}
+
+// weft::transform::replace text -> create tagged replace result
+static int c_transform_replace(lcl_interp *interp, int argc, lcl_value **argv,
+                               lcl_value **out) {
+  (void)interp;
+
+  if (argc < 1) {
+    lcl_set_error(interp, "transform::replace requires text argument");
+    return LCL_RC_ERR;
+  }
+
+  // Create {replace <text>} list
+  lcl_value *result = lcl_list_new();
+  lcl_list_push(&result, lcl_string_new("replace"));
+  lcl_list_push(&result, lcl_ref_inc(argv[0]));
+
+  *out = result;
+  return LCL_RC_OK;
+}
+
+// weft::transform::cancel -> create tagged cancel result
+static int c_transform_cancel(lcl_interp *interp, int argc, lcl_value **argv,
+                              lcl_value **out) {
+  (void)interp;
+  (void)argc;
+  (void)argv;
+
+  // Create {cancel} list
+  lcl_value *result = lcl_list_new();
+  lcl_list_push(&result, lcl_string_new("cancel"));
+
+  *out = result;
+  return LCL_RC_OK;
+}
+
+// weft::transform::patch edits -> create tagged patch result
+// edits should be a list of {start end text} triples
+static int c_transform_patch(lcl_interp *interp, int argc, lcl_value **argv,
+                             lcl_value **out) {
+  (void)interp;
+
+  if (argc < 1) {
+    lcl_set_error(interp, "transform::patch requires edits list argument");
+    return LCL_RC_ERR;
+  }
+
+  // Create {patch <edits>} list
+  lcl_value *result = lcl_list_new();
+  lcl_list_push(&result, lcl_string_new("patch"));
+  lcl_list_push(&result, lcl_ref_inc(argv[0]));
+
+  *out = result;
+  return LCL_RC_OK;
+}
+
+// weft::transform::prompt message ?default? -> create tagged prompt result
+static int c_transform_prompt(lcl_interp *interp, int argc, lcl_value **argv,
+                              lcl_value **out) {
+  (void)interp;
+
+  if (argc < 1) {
+    lcl_set_error(interp, "transform::prompt requires message argument");
+    return LCL_RC_ERR;
+  }
+
+  // Create {prompt <message> ?<default>?} list
+  lcl_value *result = lcl_list_new();
+  lcl_list_push(&result, lcl_string_new("prompt"));
+  lcl_list_push(&result, lcl_ref_inc(argv[0]));
+
+  if (argc >= 2) {
+    lcl_list_push(&result, lcl_ref_inc(argv[1]));
+  }
+
+  *out = result;
+  return LCL_RC_OK;
 }
 
 // weft::transform::run name ?args...? -> run transform on selection
@@ -2918,14 +3112,29 @@ static int c_transform_run(lcl_interp *interp, int argc, lcl_value **argv,
     return LCL_RC_ERR;
   }
 
-  // Get selection range
+  // Determine target buffer and editor
+  // If we're in the REPL with an attached buffer, use the attached buffer
+  Buffer *target_buffer = host->current_buffer;
+  Editor *target_editor = host->current_editor;
+
+  if (host->repl_attached_buffer) {
+    // We have an attached buffer - use it instead
+    Pane *attached_pane =
+        find_pane_for_buffer(host, host->repl_attached_buffer);
+    if (attached_pane && attached_pane->view) {
+      target_buffer = host->repl_attached_buffer;
+      target_editor = attached_pane->view;
+    }
+  }
+
+  // Get selection range from target editor
   size_t start, end;
-  if (editor_has_selection(host->current_editor)) {
-    editor_get_selection(host->current_editor, &start, &end);
+  if (editor_has_selection(target_editor)) {
+    editor_get_selection(target_editor, &start, &end);
   } else {
     // No selection - use entire document
     start = 0;
-    end = document_length(host->current_buffer->document);
+    end = document_length(target_buffer->document);
   }
 
   // Collect additional args (if any)
@@ -2940,11 +3149,16 @@ static int c_transform_run(lcl_interp *interp, int argc, lcl_value **argv,
     }
   }
 
-  // Run the transform
-  Patch *patch = transform_run(name, host->current_buffer, start, end, args);
+  // Run the transform on target buffer
+  Patch *patch = transform_run(name, target_buffer, start, end, args);
   free(args);
 
   if (!patch) {
+    // Check if transform requested a prompt
+    if (lcl_host_has_transform_prompt(host)) {
+      *out = lcl_string_new("prompt requested");
+      return LCL_RC_OK;
+    }
     lcl_set_error(interp, "transform failed or not found");
     return LCL_RC_ERR;
   }
@@ -2954,10 +3168,10 @@ static int c_transform_run(lcl_interp *interp, int argc, lcl_value **argv,
     patch_free(host->pending_patch);
   }
   host->pending_patch = patch;
-  host->patch_target_buffer = host->current_buffer;
+  host->patch_target_buffer = target_buffer;
 
   // Show the diff buffer
-  show_patch_buffer(host, patch, host->current_buffer);
+  show_patch_buffer(host, patch, target_buffer);
 
   *out = lcl_string_new("patch created");
   return LCL_RC_OK;
@@ -3041,6 +3255,54 @@ static int c_transform_list(lcl_interp *interp, int argc, lcl_value **argv,
   }
 
   *out = result;
+  return LCL_RC_OK;
+}
+
+// weft::transform::menu -> insert transform menu at cursor as executable text
+static int c_transform_menu(lcl_interp *interp, int argc, lcl_value **argv,
+                            lcl_value **out) {
+  (void)argc;
+  (void)argv;
+
+  LclHost *host = lcl_interp_get_user_data(interp);
+  if (!host || !host->current_buffer || !host->current_editor) {
+    lcl_set_error(interp, "no buffer/editor context");
+    return LCL_RC_ERR;
+  }
+
+  // Get list of transforms
+  const char *names[64];
+  size_t count = transform_list(names, 64);
+
+  if (count == 0) {
+    *out = lcl_string_new("No transforms available");
+    return LCL_RC_OK;
+  }
+
+  // Build menu text
+  // Format: weft::transform::run "name"   ;; description
+  char menu[4096];
+  size_t pos = 0;
+
+  pos += snprintf(menu + pos, sizeof(menu) - pos,
+                  ";; Transforms (select line and Ctrl+Enter to run)\n");
+
+  for (size_t i = 0; i < count && pos < sizeof(menu) - 256; i++) {
+    const char *desc = transform_get_description(names[i]);
+    pos += snprintf(menu + pos, sizeof(menu) - pos,
+                    "weft::transform::run \"%s\"", names[i]);
+    if (desc && desc[0]) {
+      pos += snprintf(menu + pos, sizeof(menu) - pos, "   ;; %s", desc);
+    }
+    pos += snprintf(menu + pos, sizeof(menu) - pos, "\n");
+  }
+
+  // Insert at cursor
+  size_t cursor = editor_get_cursor_pos(host->current_editor);
+  document_insert(host->current_buffer->document, cursor, menu, strlen(menu));
+  editor_set_cursor_pos(host->current_editor, cursor + strlen(menu));
+
+  *out = lcl_int_new((long)count);
   return LCL_RC_OK;
 }
 
@@ -3196,6 +3458,8 @@ static void register_weft_bindings(lcl_interp *interp) {
              lcl_c_proc_new("weft::config::indent", c_config_indent));
   lcl_ns_def(config_ns, "keybind",
              lcl_c_proc_new("weft::config::keybind", c_config_keybind));
+  lcl_ns_def(config_ns, "viewlayer",
+             lcl_c_proc_new("weft::config::viewlayer", c_config_viewlayer));
 
   // Create weft::ts namespace for tree-sitter operations
   lcl_value *ts_ns = lcl_ns_new("ts");
@@ -3216,6 +3480,20 @@ static void register_weft_bindings(lcl_interp *interp) {
              lcl_c_proc_new("weft::transform::reject", c_transform_reject));
   lcl_ns_def(transform_ns, "list",
              lcl_c_proc_new("weft::transform::list", c_transform_list));
+  lcl_ns_def(transform_ns, "menu",
+             lcl_c_proc_new("weft::transform::menu", c_transform_menu));
+  lcl_ns_def(transform_ns, "register",
+             lcl_c_proc_new("weft::transform::register", c_transform_register));
+
+  // Tagged return helpers for Lcl transforms
+  lcl_ns_def(transform_ns, "replace",
+             lcl_c_proc_new("weft::transform::replace", c_transform_replace));
+  lcl_ns_def(transform_ns, "cancel",
+             lcl_c_proc_new("weft::transform::cancel", c_transform_cancel));
+  lcl_ns_def(transform_ns, "patch",
+             lcl_c_proc_new("weft::transform::patch", c_transform_patch));
+  lcl_ns_def(transform_ns, "prompt",
+             lcl_c_proc_new("weft::transform::prompt", c_transform_prompt));
 }
 
 // === Public API ===
@@ -3292,6 +3570,21 @@ LclHost *lcl_host_new(void) {
   host->keybind_cap = INITIAL_HANDLER_CAP;
   host->keybind_count = 0;
 
+  // Initialize viewlayer configs array
+  host->viewlayer_configs = calloc(INITIAL_LAYER_CAP, sizeof(ViewLayerConfig));
+  if (!host->viewlayer_configs) {
+    free(host->keybindings);
+    free(host->indent_settings);
+    free(host->filetypes);
+    free(host->handlers);
+    free(host->registered_layers);
+    lcl_interp_free(host->interp);
+    free(host);
+    return NULL;
+  }
+  host->viewlayer_cap = INITIAL_LAYER_CAP;
+  host->viewlayer_count = 0;
+
   // Set up config directory path (~/.config/weft)
   const char *home = getenv("HOME");
   if (home) {
@@ -3356,6 +3649,13 @@ void lcl_host_free(LclHost *host) {
     free(host->keybindings[i].script);
   }
   free(host->keybindings);
+
+  // Free viewlayer configs
+  for (size_t i = 0; i < host->viewlayer_count; i++) {
+    free(host->viewlayer_configs[i].extension);
+    free(host->viewlayer_configs[i].param);
+  }
+  free(host->viewlayer_configs);
 
   free(host->config_dir);
 
@@ -3474,6 +3774,12 @@ char *lcl_host_eval_to_string(LclHost *host, const char *code,
 void lcl_host_set_buffer(LclHost *host, Buffer *buffer) {
   if (host) {
     host->current_buffer = buffer;
+  }
+}
+
+void lcl_host_set_editor(LclHost *host, Editor *editor) {
+  if (host) {
+    host->current_editor = editor;
   }
 }
 
@@ -4206,6 +4512,156 @@ bool lcl_host_dispatch_keybind(LclHost *host, int keycode, int modifiers) {
   return false;
 }
 
+// === ViewLayer Configuration Functions ===
+
+void lcl_host_register_viewlayer(LclHost *host, const char *extension,
+                                 ViewLayerType type, const char *param,
+                                 int priority) {
+  if (!host || !extension) {
+    return;
+  }
+
+  // Check if we need to grow the array
+  if (host->viewlayer_count >= host->viewlayer_cap) {
+    size_t new_cap = host->viewlayer_cap * 2;
+    ViewLayerConfig *new_arr =
+        realloc(host->viewlayer_configs, new_cap * sizeof(ViewLayerConfig));
+    if (!new_arr) {
+      return;
+    }
+    host->viewlayer_configs = new_arr;
+    host->viewlayer_cap = new_cap;
+  }
+
+  // Add the new config (we allow multiple layers per extension)
+  ViewLayerConfig *config = &host->viewlayer_configs[host->viewlayer_count];
+  config->extension = strdup(extension);
+  if (!config->extension) {
+    return;
+  }
+  config->type = type;
+  config->param = param ? strdup(param) : NULL;
+  config->priority = priority;
+
+  host->viewlayer_count++;
+}
+
+const ViewLayerConfig *lcl_host_get_viewlayers(LclHost *host,
+                                               const char *extension,
+                                               size_t *out_count) {
+  if (!host || !extension || !out_count) {
+    if (out_count) {
+      *out_count = 0;
+    }
+    return NULL;
+  }
+
+  // Count matching configs
+  size_t count = 0;
+  for (size_t i = 0; i < host->viewlayer_count; i++) {
+    if (strcmp(host->viewlayer_configs[i].extension, extension) == 0) {
+      count++;
+    }
+  }
+
+  *out_count = count;
+  if (count == 0) {
+    return NULL;
+  }
+
+  // Find the first matching config
+  for (size_t i = 0; i < host->viewlayer_count; i++) {
+    if (strcmp(host->viewlayer_configs[i].extension, extension) == 0) {
+      return &host->viewlayer_configs[i];
+    }
+  }
+
+  return NULL;
+}
+
+bool lcl_host_apply_viewlayers(LclHost *host, Pane *pane) {
+  if (!host || !pane || !pane->view || !pane->layer_stack) {
+    return false;
+  }
+
+  Buffer *buffer = editor_get_buffer(pane->view);
+  if (!buffer) {
+    return false;
+  }
+
+  const char *file_path = buffer_get_file_path(buffer);
+  const char *ext = NULL;
+
+  if (file_path) {
+    ext = strrchr(file_path, '.');
+    // Special case: check for buffer names like "*lcl*"
+    if (!ext && strcmp(file_path, "*lcl*") == 0) {
+      ext = ".lcl";
+    }
+  }
+
+  // Get viewlayer configs for this extension
+  size_t config_count = 0;
+  if (ext) {
+    lcl_host_get_viewlayers(host, ext, &config_count);
+  }
+
+  // If no custom config, add default style annotation layer
+  if (config_count == 0) {
+    ViewLayer *style_layer = annot_layer_new("style", 0);
+    if (style_layer) {
+      layer_stack_add(pane->layer_stack, style_layer);
+    }
+    return false; // No custom config applied
+  }
+
+  // Apply each matching config
+  bool applied_any = false;
+  for (size_t i = 0; i < host->viewlayer_count; i++) {
+    const ViewLayerConfig *config = &host->viewlayer_configs[i];
+    if (!ext || strcmp(config->extension, ext) != 0) {
+      continue;
+    }
+
+    ViewLayer *layer = NULL;
+
+    switch (config->type) {
+    case VIEWLAYER_TREE_SITTER:
+      // Currently only "lcl" is supported
+      if (strcmp(config->param, "lcl") == 0) {
+        layer = tree_sitter_layer_new_lcl(config->priority);
+      } else {
+        fprintf(stderr, "viewlayer: unsupported tree-sitter language: %s\n",
+                config->param);
+      }
+      break;
+
+    case VIEWLAYER_LCL_SCRIPT:
+      // TODO: Implement Lcl script-based viewlayer
+      // This would run an Lcl script that produces decorations
+      fprintf(stderr, "viewlayer: lcl-script type not yet implemented\n");
+      break;
+
+    case VIEWLAYER_ANNOT:
+      // Create annotation layer that reads from annotation store
+      layer = annot_layer_new(config->param, config->priority);
+      break;
+    }
+
+    if (layer) {
+      layer_stack_add(pane->layer_stack, layer);
+      applied_any = true;
+
+      // If using tree-sitter, clear any existing style annotations
+      if (config->type == VIEWLAYER_TREE_SITTER && buffer->annots) {
+        annot_store_clear_layer(buffer->annots, "style");
+      }
+    }
+  }
+
+  return applied_any;
+}
+
 // === Accessors for interaction dispatch ===
 
 BufferManager *lcl_host_get_buffer_manager(LclHost *host) {
@@ -4218,4 +4674,115 @@ Buffer *lcl_host_get_repl_attached_buffer(LclHost *host) {
 
 LayoutNode *lcl_host_get_layout_root(LclHost *host) {
   return (host && host->layout_root_ptr) ? *host->layout_root_ptr : NULL;
+}
+
+// === Transform Prompt ===
+
+bool lcl_host_has_transform_prompt(LclHost *host) {
+  return host && host->transform_prompt.active;
+}
+
+bool lcl_host_get_transform_prompt(LclHost *host, const char **message,
+                                   const char **default_value) {
+  if (!host || !host->transform_prompt.active) {
+    return false;
+  }
+
+  if (message) {
+    *message = host->transform_prompt.prompt_message;
+  }
+  if (default_value) {
+    *default_value = host->transform_prompt.default_value;
+  }
+  return true;
+}
+
+void lcl_host_set_transform_prompt(LclHost *host, const char *transform_name,
+                                   const char *message, const char *default_val,
+                                   Buffer *buffer, size_t start, size_t end) {
+  if (!host) {
+    return;
+  }
+
+  // Clear any existing prompt
+  lcl_host_cancel_transform_prompt(host);
+
+  // Set new prompt
+  host->transform_prompt.transform_name =
+      transform_name ? strdup(transform_name) : NULL;
+  host->transform_prompt.prompt_message = message ? strdup(message) : NULL;
+  host->transform_prompt.default_value =
+      default_val ? strdup(default_val) : NULL;
+  host->transform_prompt.buffer = buffer;
+  host->transform_prompt.start = start;
+  host->transform_prompt.end = end;
+  host->transform_prompt.active = true;
+}
+
+Patch *lcl_host_submit_transform_prompt(LclHost *host, const char *input) {
+  if (!host || !host->transform_prompt.active) {
+    return NULL;
+  }
+
+  // Get the info we need
+  const char *name = host->transform_prompt.transform_name;
+  Buffer *buffer = host->transform_prompt.buffer;
+  size_t start = host->transform_prompt.start;
+  size_t end = host->transform_prompt.end;
+
+  if (!name || !buffer) {
+    lcl_host_cancel_transform_prompt(host);
+    return NULL;
+  }
+
+  // Build args array with input
+  const char *args[2] = {input, NULL};
+
+  // Clear the prompt before re-running (in case transform prompts again)
+  host->transform_prompt.active = false;
+
+  // Re-run the transform with input
+  Patch *patch = transform_run(name, buffer, start, end, args);
+
+  // Clean up prompt state
+  free(host->transform_prompt.transform_name);
+  free(host->transform_prompt.prompt_message);
+  free(host->transform_prompt.default_value);
+  host->transform_prompt.transform_name = NULL;
+  host->transform_prompt.prompt_message = NULL;
+  host->transform_prompt.default_value = NULL;
+  host->transform_prompt.buffer = NULL;
+
+  // If we got a patch, show the diff preview and store it
+  if (patch) {
+    // Store pending patch
+    if (host->pending_patch) {
+      patch_free(host->pending_patch);
+    }
+    host->pending_patch = patch;
+    host->patch_target_buffer = buffer;
+
+    // Show the diff buffer
+    show_patch_buffer(host, patch, buffer);
+  }
+
+  return patch;
+}
+
+void lcl_host_cancel_transform_prompt(LclHost *host) {
+  if (!host) {
+    return;
+  }
+
+  free(host->transform_prompt.transform_name);
+  free(host->transform_prompt.prompt_message);
+  free(host->transform_prompt.default_value);
+
+  host->transform_prompt.transform_name = NULL;
+  host->transform_prompt.prompt_message = NULL;
+  host->transform_prompt.default_value = NULL;
+  host->transform_prompt.buffer = NULL;
+  host->transform_prompt.start = 0;
+  host->transform_prompt.end = 0;
+  host->transform_prompt.active = false;
 }

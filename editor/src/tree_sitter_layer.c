@@ -10,6 +10,7 @@
 #include <tree_sitter/tree-sitter-lcl.h>
 
 #include "buffer.h"
+#include "color.h"
 #include "document.h"
 
 // === Color Scheme ===
@@ -102,22 +103,6 @@ static const char *get_color_for_capture(const char *capture) {
   }
 
   return NULL; // No color for this capture
-}
-
-// Parse hex color string to SDL_Color
-static SDL_Color parse_hex_color(const char *hex) {
-  SDL_Color c = {255, 255, 255, 255}; // Default white
-  if (!hex || hex[0] != '#' || strlen(hex) != 7) {
-    return c;
-  }
-
-  unsigned int r, g, b;
-  if (sscanf(hex + 1, "%02x%02x%02x", &r, &g, &b) == 3) {
-    c.r = (Uint8)r;
-    c.g = (Uint8)g;
-    c.b = (Uint8)b;
-  }
-  return c;
 }
 
 // === TreeSitterLayer Data ===
@@ -287,8 +272,9 @@ static void tree_sitter_layer_render(ViewLayer *layer, Buffer *buffer,
     Decoration *d =
         decoration_list_add(out, captures[i].start, captures[i].end);
     if (d) {
-      d->fg = parse_hex_color(captures[i].color);
-      d->has_fg = true;
+      if (color_parse_hex(captures[i].color, &d->fg)) {
+        d->has_fg = true;
+      }
       d->layer_name = layer->name;
     }
   }

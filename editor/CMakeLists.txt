@@ -30,6 +30,7 @@ set(WEFT_SOURCES
   src/tree_sitter_layer.c
   src/patch.c
   src/transform.c
+  src/color.c
 )
 
 set(CMAKE_C_STANDARD 11)

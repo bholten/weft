@@ -60,6 +60,21 @@ typedef struct {
   bool enabled;
 } RegisteredKeybind;
 
+// ViewLayer type for configuration
+typedef enum {
+  VIEWLAYER_TREE_SITTER, // Uses tree-sitter for syntax highlighting
+  VIEWLAYER_LCL_SCRIPT,  // Runs an Lcl script that produces decorations
+  VIEWLAYER_ANNOT,       // Reads from annotation store layer
+} ViewLayerType;
+
+// ViewLayer configuration: maps file extension to layer setup
+typedef struct {
+  char *extension;    // File extension (e.g., ".lcl", ".txt")
+  ViewLayerType type; // Type of layer
+  char *param;  // Type-specific: language name, script path, or layer name
+  int priority; // Layer priority (default 0)
+} ViewLayerConfig;
+
 // Keybinding modifier flags
 #define KEYBIND_CTRL 0x01
 #define KEYBIND_SHIFT 0x02
@@ -118,6 +133,11 @@ typedef struct LclHost {
   size_t keybind_count;
   size_t keybind_cap;
 
+  // ViewLayer configurations per file type
+  ViewLayerConfig *viewlayer_configs;
+  size_t viewlayer_count;
+  size_t viewlayer_cap;
+
   // Config directory path
   char *config_dir;
 
@@ -127,6 +147,17 @@ typedef struct LclHost {
 
   // REPL attachment - when set, doc commands in REPL operate on this buffer
   Buffer *repl_attached_buffer;
+
+  // Pending transform prompt - when a transform requests user input
+  struct {
+    char *transform_name; // Name of transform to re-run
+    char *prompt_message; // Message to show user
+    char *default_value;  // Optional default value
+    Buffer *buffer;       // Target buffer
+    size_t start;         // Range start
+    size_t end;           // Range end
+    bool active;          // Whether a prompt is pending
+  } transform_prompt;
 } LclHost;
 
 // === Lifecycle ===
@@ -160,6 +191,9 @@ char *lcl_host_eval_to_string(LclHost *host, const char *code,
 
 // Set the current buffer for bindings (used during layer execution)
 void lcl_host_set_buffer(LclHost *host, Buffer *buffer);
+
+// Set the current editor for bindings (used during keybind dispatch)
+void lcl_host_set_editor(LclHost *host, Editor *editor);
 
 // Get the current buffer
 Buffer *lcl_host_get_buffer(LclHost *host);
@@ -264,6 +298,25 @@ const IndentSettings *lcl_host_get_indent(LclHost *host, const char *extension);
 // Get the config directory path
 const char *lcl_host_get_config_dir(LclHost *host);
 
+// Register a viewlayer configuration for a file extension
+// type: "tree-sitter", "lcl-script", or "annot"
+// param: language name (for tree-sitter), script path (for lcl-script), or
+//        layer name (for annot)
+void lcl_host_register_viewlayer(LclHost *host, const char *extension,
+                                 ViewLayerType type, const char *param,
+                                 int priority);
+
+// Get viewlayer configs for a file extension
+// Returns array of configs (count in out_count), or NULL if none
+const ViewLayerConfig *lcl_host_get_viewlayers(LclHost *host,
+                                               const char *extension,
+                                               size_t *out_count);
+
+// Apply viewlayer configuration to a pane based on its buffer's file extension
+// Call this after pane_new to set up file-type-specific layers
+// Returns true if any custom viewlayers were applied
+bool lcl_host_apply_viewlayers(LclHost *host, Pane *pane);
+
 // === Keybinding Registration ===
 
 // Register a keybinding (modifiers: KEYBIND_CTRL, KEYBIND_SHIFT, KEYBIND_ALT)
@@ -284,5 +337,26 @@ Buffer *lcl_host_get_repl_attached_buffer(LclHost *host);
 
 // Get the layout root (for finding panes)
 LayoutNode *lcl_host_get_layout_root(LclHost *host);
+
+// === Transform Prompt ===
+
+// Check if there's a pending transform prompt
+bool lcl_host_has_transform_prompt(LclHost *host);
+
+// Get pending prompt info (returns false if no prompt pending)
+bool lcl_host_get_transform_prompt(LclHost *host, const char **message,
+                                   const char **default_value);
+
+// Set a pending transform prompt (called internally by transform system)
+void lcl_host_set_transform_prompt(LclHost *host, const char *transform_name,
+                                   const char *message, const char *default_val,
+                                   Buffer *buffer, size_t start, size_t end);
+
+// Submit user input to the pending prompt (re-runs transform with input)
+// Returns the resulting patch, or NULL if transform fails/cancels
+Patch *lcl_host_submit_transform_prompt(LclHost *host, const char *input);
+
+// Cancel the pending transform prompt
+void lcl_host_cancel_transform_prompt(LclHost *host);
 
 #endif // WEFT_LCL_HOST_H

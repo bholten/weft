@@ -24,94 +24,6 @@
 #include "tree_sitter_hl.h"
 #include "weft.h"
 
-static void test_document(void) {
-  printf("=== Document Tests ===\n");
-
-  // Test 1: Create from string
-  const char *text = "hello\nworld";
-  Document *doc = document_from_string(text, strlen(text));
-  printf("Test 1 - Create from string:\n");
-  printf("  Length: %zu (expected 11)\n", document_length(doc));
-  printf("  Lines: %zu (expected 2)\n", document_line_count(doc));
-
-  // Test 2: Get text
-  char buf[64];
-  size_t got = document_get_text(doc, 0, buf, sizeof(buf));
-  buf[got] = '\0';
-  printf("Test 2 - Get text:\n");
-  printf("  Content: \"%s\" (expected \"hello\\nworld\")\n", buf);
-
-  // Test 3: Line operations
-  printf("Test 3 - Line operations:\n");
-  printf("  Line 0 start: %zu (expected 0)\n", document_line_start(doc, 0));
-  printf("  Line 0 end: %zu (expected 5)\n", document_line_end(doc, 0));
-  printf("  Line 0 length: %zu (expected 6)\n", document_line_length(doc, 0));
-  printf("  Line 1 start: %zu (expected 6)\n", document_line_start(doc, 1));
-  printf("  Line 1 end: %zu (expected 11)\n", document_line_end(doc, 1));
-  printf("  Line 1 length: %zu (expected 5)\n", document_line_length(doc, 1));
-
-  // Test 4: Position to line
-  printf("Test 4 - Position to line:\n");
-  printf("  Pos 0 -> line %zu (expected 0)\n", document_pos_to_line(doc, 0));
-  printf("  Pos 5 -> line %zu (expected 0)\n", document_pos_to_line(doc, 5));
-  printf("  Pos 6 -> line %zu (expected 1)\n", document_pos_to_line(doc, 6));
-  printf("  Pos 10 -> line %zu (expected 1)\n", document_pos_to_line(doc, 10));
-
-  // Test 5: Insert
-  printf("Test 5 - Insert:\n");
-  document_insert(doc, 5, "X", 1);
-  got = document_get_text(doc, 0, buf, sizeof(buf));
-  buf[got] = '\0';
-  printf("  After insert 'X' at 5: \"%s\" (expected \"helloX\\nworld\")\n",
-         buf);
-  printf("  Length: %zu (expected 12)\n", document_length(doc));
-  printf("  Lines: %zu (expected 2)\n", document_line_count(doc));
-  printf("  Line 0 end: %zu (expected 6)\n", document_line_end(doc, 0));
-
-  // Test 6: Insert newline
-  document_insert(doc, 3, "\n", 1);
-  got = document_get_text(doc, 0, buf, sizeof(buf));
-  buf[got] = '\0';
-  printf("Test 6 - Insert newline:\n");
-  printf("  After insert '\\n' at 3: \"%s\"\n", buf);
-  printf("  Lines: %zu (expected 3)\n", document_line_count(doc));
-
-  // Test 7: Delete
-  printf("Test 7 - Delete:\n");
-  document_delete(doc, 0, 4); // Delete "hel\n"
-  got = document_get_text(doc, 0, buf, sizeof(buf));
-  buf[got] = '\0';
-  printf("  After delete 4 chars at 0: \"%s\" (expected \"loX\\nworld\")\n",
-         buf);
-  printf("  Length: %zu (expected 9)\n", document_length(doc));
-  printf("  Lines: %zu (expected 2)\n", document_line_count(doc));
-
-  document_free(doc);
-
-  // Test 8: Empty document
-  printf("Test 8 - Empty document:\n");
-  doc = document_new();
-  printf("  Length: %zu (expected 0)\n", document_length(doc));
-  printf("  Lines: %zu (expected 1)\n", document_line_count(doc));
-  document_insert(doc, 0, "test", 4);
-  got = document_get_text(doc, 0, buf, sizeof(buf));
-  buf[got] = '\0';
-  printf("  After insert: \"%s\" (expected \"test\")\n", buf);
-  document_free(doc);
-
-  // Test 9: Insert at start and end
-  printf("Test 9 - Insert at boundaries:\n");
-  doc = document_from_string("mid", 3);
-  document_insert(doc, 0, "start-", 6);
-  document_insert(doc, document_length(doc), "-end", 4);
-  got = document_get_text(doc, 0, buf, sizeof(buf));
-  buf[got] = '\0';
-  printf("  Content: \"%s\" (expected \"start-mid-end\")\n", buf);
-  document_free(doc);
-
-  printf("=== Tests Complete ===\n\n");
-}
-
 // Application context using our new modules
 typedef struct {
   WeftApp app;
@@ -119,8 +31,6 @@ typedef struct {
 } AppContext;
 
 SDL_AppResult SDL_AppInit(void **app_state, int argc, char **argv) {
-  test_document();
-
   // Create application context
   AppContext *ctx = calloc(1, sizeof(AppContext));
   if (!ctx) {
@@ -332,6 +242,9 @@ SDL_AppResult SDL_AppInit(void **app_state, int argc, char **argv) {
     return SDL_APP_FAILURE;
   }
 
+  // Apply viewlayer configuration based on file type
+  lcl_host_apply_viewlayers(ctx->app.lcl, initial_pane);
+
   // Apply indent settings based on file type
   lcl_host_apply_indent(ctx->app.lcl, pane_get_editor(initial_pane));
 
@@ -380,6 +293,9 @@ static Pane *create_new_pane(AppContext *ctx) {
     buffer_manager_close(ctx->app.buffers, new_buffer);
     return NULL;
   }
+
+  // Apply viewlayer configuration (will add default style layer for new buffer)
+  lcl_host_apply_viewlayers(ctx->app.lcl, new_pane);
 
   return new_pane;
 }
@@ -553,11 +469,12 @@ SDL_AppResult SDL_AppEvent(void *app_state, SDL_Event *event) {
       keybind_mods |= KEYBIND_ALT;
     }
 
-    // Set current buffer context for keybinding scripts
+    // Set current buffer/editor context for keybinding scripts
     if (ctx->app.focused_pane) {
       Editor *editor = pane_get_editor(ctx->app.focused_pane);
       Buffer *buffer = editor_get_buffer(editor);
       lcl_host_set_buffer(ctx->app.lcl, buffer);
+      lcl_host_set_editor(ctx->app.lcl, editor);
     }
 
     if (lcl_host_dispatch_keybind(ctx->app.lcl, key, keybind_mods)) {
@@ -1036,6 +953,17 @@ SDL_AppResult SDL_AppEvent(void *app_state, SDL_Event *event) {
   default: break;
   }
 
+  // Check if there's a pending transform prompt that needs to be shown
+  if (ctx->app.focused_pane && ctx->app.lcl &&
+      lcl_host_has_transform_prompt(ctx->app.lcl) &&
+      !pane_prompt_is_active(ctx->app.focused_pane)) {
+    const char *message = NULL;
+    const char *default_value = NULL;
+    if (lcl_host_get_transform_prompt(ctx->app.lcl, &message, &default_value)) {
+      pane_prompt_show(ctx->app.focused_pane, message, default_value);
+    }
+  }
+
   // If search bar is active, route events there first
   if (input_event.type != INPUT_NONE && ctx->app.focused_pane &&
       pane_search_is_active(ctx->app.focused_pane)) {
@@ -1064,6 +992,43 @@ SDL_AppResult SDL_AppEvent(void *app_state, SDL_Event *event) {
       }
     } else if (input_event.type == INPUT_TEXT) {
       if (pane_goto_handle_text(ctx->app.focused_pane, input_event.text.text)) {
+        return SDL_APP_CONTINUE;
+      }
+    }
+  }
+
+  // If transform prompt is active, route events there first
+  if (input_event.type != INPUT_NONE && ctx->app.focused_pane &&
+      pane_prompt_is_active(ctx->app.focused_pane)) {
+
+    if (input_event.type == INPUT_KEY_DOWN) {
+      SDL_Keycode key = input_event.key.key;
+
+      // Handle Enter key specially - submit the prompt
+      if (key == SDLK_RETURN || key == SDLK_KP_ENTER) {
+        const char *input = pane_prompt_get_input(ctx->app.focused_pane);
+        if (input && ctx->app.lcl) {
+          // Submit prompt - this shows diff preview if a patch is returned
+          lcl_host_submit_transform_prompt(ctx->app.lcl, input);
+        }
+        pane_prompt_hide(ctx->app.focused_pane);
+        return SDL_APP_CONTINUE;
+      }
+
+      // Handle Escape - cancel the prompt
+      if (key == SDLK_ESCAPE) {
+        lcl_host_cancel_transform_prompt(ctx->app.lcl);
+        pane_prompt_hide(ctx->app.focused_pane);
+        return SDL_APP_CONTINUE;
+      }
+
+      if (pane_prompt_handle_key(ctx->app.focused_pane, key,
+                                 input_event.key.mod)) {
+        return SDL_APP_CONTINUE;
+      }
+    } else if (input_event.type == INPUT_TEXT) {
+      if (pane_prompt_handle_text(ctx->app.focused_pane,
+                                  input_event.text.text)) {
         return SDL_APP_CONTINUE;
       }
     }
