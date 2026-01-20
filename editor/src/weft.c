@@ -24,6 +24,9 @@
 #include "tree_sitter_hl.h"
 #include "weft.h"
 
+// Embedded default font (generated at build time)
+#include "embedded_font.h"
+
 // Application context using our new modules
 typedef struct {
   WeftApp app;
@@ -53,16 +56,41 @@ SDL_AppResult SDL_AppInit(void **app_state, int argc, char **argv) {
     return SDL_APP_FAILURE;
   }
 
-  // Load font
-  if (!renderer_load_font(
-          ctx->app.renderer,
-          "/home/brennan/dev/weft/editor/fonts/Roboto_Mono/RobotoMono-VariableFont_wght.ttf",
-          14)) {
+  // Load embedded default font initially
+  // (Will be replaced by configured font after config is loaded)
+#if EMBEDDED_FONT_AVAILABLE
+  if (!renderer_load_font_from_memory(ctx->app.renderer, embedded_font_data,
+                                      embedded_font_data_len, 14)) {
+    SDL_LogError(SDL_LOG_CATEGORY_CUSTOM, "Failed to load embedded font");
     renderer_free(ctx->app.renderer);
     platform_free(ctx->app.platform);
     free(ctx);
     return SDL_APP_FAILURE;
   }
+#else
+  // No embedded font - try system fallback
+  SDL_LogWarn(SDL_LOG_CATEGORY_CUSTOM,
+              "No embedded font available, trying system fonts");
+  bool font_loaded = false;
+  const char *fallback_fonts[] = {
+      "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+      "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+      "/usr/share/fonts/liberation-mono/LiberationMono-Regular.ttf",
+      "/System/Library/Fonts/Menlo.ttc", NULL};
+  for (const char **fp = fallback_fonts; *fp; fp++) {
+    if (renderer_load_font(ctx->app.renderer, *fp, 14)) {
+      font_loaded = true;
+      break;
+    }
+  }
+  if (!font_loaded) {
+    SDL_LogError(SDL_LOG_CATEGORY_CUSTOM, "Failed to load any font");
+    renderer_free(ctx->app.renderer);
+    platform_free(ctx->app.platform);
+    free(ctx);
+    return SDL_APP_FAILURE;
+  }
+#endif
 
   // Create buffer manager
   ctx->app.buffers = buffer_manager_new();
@@ -92,46 +120,6 @@ SDL_AppResult SDL_AppInit(void **app_state, int argc, char **argv) {
     return SDL_APP_FAILURE;
   }
 
-  // Add test content and annotations if buffer is empty (new buffer)
-  if (document_length(initial_buffer->document) == 0) {
-    const char *test_text =
-        "Hello, Weft!\nThis is styled text with annotations.\nRed, green, and blue words here.\nUnderlined text too!";
-    document_insert(initial_buffer->document, 0, test_text, strlen(test_text));
-
-    // Add test annotations to demonstrate styling
-    // "Weft" in cyan (bytes 7-11 of line 1)
-    const char *keys1[] = {"style:fg"};
-    const char *vals1[] = {"cyan"};
-    annot_store_add(initial_buffer->annots, 7, 11, "style", keys1, vals1, 1);
-
-    // "styled" in yellow with underline (line 2)
-    const char *keys2[] = {"style:fg", "style:underline"};
-    const char *vals2[] = {"yellow", "true"};
-    annot_store_add(initial_buffer->annots, 21, 27, "style", keys2, vals2, 2);
-
-    // "Red" in red (line 3)
-    const char *keys3[] = {"style:fg"};
-    const char *vals3[] = {"red"};
-    annot_store_add(initial_buffer->annots, 60, 63, "style", keys3, vals3, 1);
-
-    // "green" in green (line 3)
-    const char *keys4[] = {"style:fg"};
-    const char *vals4[] = {"green"};
-    annot_store_add(initial_buffer->annots, 65, 70, "style", keys4, vals4, 1);
-
-    // "blue" in blue (line 3)
-    const char *keys5[] = {"style:fg"};
-    const char *vals5[] = {"#0088FF"};
-    annot_store_add(initial_buffer->annots, 76, 80, "style", keys5, vals5, 1);
-
-    // "Underlined" with underline and orange bg (line 4)
-    const char *keys6[] = {"style:underline", "style:bg"};
-    const char *vals6[] = {"true", "#442200"};
-    annot_store_add(initial_buffer->annots, 94, 104, "style", keys6, vals6, 2);
-
-    printf("Added test annotations for styling demo\n");
-  }
-
   // Create Lcl scripting host
   ctx->app.lcl = lcl_host_new();
   if (!ctx->app.lcl) {
@@ -158,6 +146,28 @@ SDL_AppResult SDL_AppInit(void **app_state, int argc, char **argv) {
   // Load user configuration (~/.config/weft/init.lcl)
   if (!lcl_host_load_config(ctx->app.lcl)) {
     SDL_LogWarn(SDL_LOG_CATEGORY_CUSTOM, "Failed to load config file");
+  }
+
+  // Apply configured font if specified in config
+  if (lcl_host_has_font_config(ctx->app.lcl)) {
+    const FontConfig *font_cfg = lcl_host_get_font(ctx->app.lcl);
+    if (font_cfg && font_cfg->path) {
+      if (renderer_load_font(ctx->app.renderer, font_cfg->path,
+                             font_cfg->size)) {
+        SDL_Log("Loaded configured font: %s (size %d)", font_cfg->path,
+                font_cfg->size);
+        // Update metrics after font change
+        char_width = renderer_get_char_width(ctx->app.renderer);
+        line_height = renderer_get_line_height(ctx->app.renderer);
+        lcl_host_set_app_context(ctx->app.lcl, ctx->app.buffers,
+                                 &ctx->app.layout_root, &ctx->app.focused_pane,
+                                 ctx, char_width, line_height, win_w, win_h);
+      } else {
+        SDL_LogWarn(SDL_LOG_CATEGORY_CUSTOM,
+                    "Failed to load configured font: %s, using default",
+                    font_cfg->path);
+      }
+    }
   }
 
   // Apply file type associations to initial buffer (syntax highlighting, etc.)

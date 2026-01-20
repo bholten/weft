@@ -59,6 +59,12 @@ typedef struct {
   int wrap_width;  // Character width to wrap at, 0 = use pane width
 } WrapSettings;
 
+// Font configuration
+typedef struct {
+  char *path; // Path to font file (NULL = use embedded default)
+  int size;   // Font size in points
+} FontConfig;
+
 // Registered keybinding: maps a key combination to an Lcl script
 typedef struct {
   int keycode;   // SDL_Keycode (e.g., SDLK_W)
@@ -149,6 +155,10 @@ typedef struct LclHost {
   ViewLayerConfig *viewlayer_configs;
   size_t viewlayer_count;
   size_t viewlayer_cap;
+
+  // Font configuration
+  FontConfig font_config;
+  bool font_config_set; // true if user specified a font via config
 
   // Config directory path
   char *config_dir;
@@ -316,6 +326,15 @@ const WrapSettings *lcl_host_get_wrap(LclHost *host, const char *extension);
 
 // Apply wrap settings to an editor based on its buffer's file extension
 void lcl_host_apply_wrap(LclHost *host, Editor *editor);
+
+// Set global font configuration
+void lcl_host_set_font(LclHost *host, const char *path, int size);
+
+// Get font configuration (returns NULL path if using embedded default)
+const FontConfig *lcl_host_get_font(LclHost *host);
+
+// Check if a font was configured by user
+bool lcl_host_has_font_config(LclHost *host);
 
 // Get the config directory path
 const char *lcl_host_get_config_dir(LclHost *host);

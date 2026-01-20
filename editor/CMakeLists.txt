@@ -88,10 +88,29 @@ target_include_directories(tree-sitter-lcl PUBLIC
 )
 target_link_libraries(tree-sitter-lcl PUBLIC tree-sitter-lib)
 
+# Generate embedded font header using a CMake script
+set(EMBEDDED_FONT_PATH "${CMAKE_CURRENT_SOURCE_DIR}/fonts/Roboto_Mono/static/RobotoMono-Regular.ttf")
+set(EMBEDDED_FONT_HEADER "${CMAKE_CURRENT_BINARY_DIR}/embedded_font.h")
+set(EMBED_FONT_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_font.cmake")
+
+add_custom_command(
+  OUTPUT ${EMBEDDED_FONT_HEADER}
+  COMMAND ${CMAKE_COMMAND}
+    -DINPUT_FILE=${EMBEDDED_FONT_PATH}
+    -DOUTPUT_FILE=${EMBEDDED_FONT_HEADER}
+    -P ${EMBED_FONT_SCRIPT}
+  DEPENDS ${EMBEDDED_FONT_PATH} ${EMBED_FONT_SCRIPT}
+  COMMENT "Generating embedded font header"
+)
+
+add_custom_target(embedded_font DEPENDS ${EMBEDDED_FONT_HEADER})
+
 add_executable(weft ${WEFT_SOURCES})
+add_dependencies(weft embedded_font)
 target_link_libraries(weft PRIVATE SDL3::SDL3 SDL3_ttf::SDL3_ttf lcl_static tree-sitter-lib tree-sitter-lcl m)
 target_include_directories(weft PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../submodules/lcl/include
   ${tree-sitter_SOURCE_DIR}/lib/include
   ${CMAKE_CURRENT_SOURCE_DIR}/../submodules/tree-sitter-lcl/bindings/c
+  ${CMAKE_CURRENT_BINARY_DIR}  # For embedded_font.h
 )

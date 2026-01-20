@@ -87,6 +87,62 @@ bool renderer_load_font(Renderer *r, const char *path, int size) {
   return true;
 }
 
+bool renderer_load_font_from_memory(Renderer *r, const unsigned char *data,
+                                    size_t data_len, int size) {
+  if (!r || !data || data_len == 0) {
+    return false;
+  }
+
+  // Scale font size by DPI for crisp rendering on high-DPI displays
+  float dpi_scale = platform_get_dpi_scale(r->platform);
+  int scaled_size = (int)(size * dpi_scale);
+
+  // Create an SDL_IOStream from the memory buffer
+  SDL_IOStream *io = SDL_IOFromConstMem(data, data_len);
+  if (!io) {
+    SDL_LogError(SDL_LOG_CATEGORY_CUSTOM, "SDL_IOFromConstMem failed: %s",
+                 SDL_GetError());
+    return false;
+  }
+
+  // Load font from IO stream (closeio=true means SDL will close the stream)
+  TTF_Font *ttf_font = TTF_OpenFontIO(io, true, scaled_size);
+  if (!ttf_font) {
+    SDL_LogError(SDL_LOG_CATEGORY_CUSTOM, "TTF_OpenFontIO failed: %s",
+                 SDL_GetError());
+    return false;
+  }
+
+  // Free existing font if any
+  if (r->font) {
+    if (r->font->font) {
+      TTF_CloseFont(r->font->font);
+    }
+    free(r->font);
+  }
+
+  r->font = calloc(1, sizeof(Font));
+  if (!r->font) {
+    TTF_CloseFont(ttf_font);
+    return false;
+  }
+
+  r->font->font = ttf_font;
+  r->font->font_size = size;
+  r->font->line_height = TTF_GetFontLineSkip(ttf_font);
+
+  // Measure char width for monospace (use 'M' as reference)
+  int advance = 0;
+  if (TTF_GetGlyphMetrics(ttf_font, 'M', NULL, NULL, NULL, NULL, &advance)) {
+    r->font->char_width = advance;
+  } else {
+    // Fallback: estimate based on font size
+    r->font->char_width = size;
+  }
+
+  return true;
+}
+
 void renderer_clear(Renderer *r, uint8_t red, uint8_t green, uint8_t blue) {
   if (!r || !r->platform) {
     return;

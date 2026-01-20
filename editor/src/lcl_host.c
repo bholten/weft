@@ -2668,6 +2668,43 @@ static int c_config_wrap(lcl_interp *interp, int argc, lcl_value **argv,
   return LCL_RC_OK;
 }
 
+// weft::config::font path size -> set global font configuration
+static int c_config_font(lcl_interp *interp, int argc, lcl_value **argv,
+                         lcl_value **out) {
+  LclHost *host = lcl_interp_get_user_data(interp);
+  if (!host) {
+    lcl_set_error(interp, "no host context");
+    return LCL_RC_ERR;
+  }
+
+  if (argc < 2) {
+    lcl_set_error(interp, "config::font requires path and size");
+    return LCL_RC_ERR;
+  }
+
+  const char *path = lcl_value_to_string(argv[0]);
+  if (!path) {
+    lcl_set_error(interp, "config::font: path must be a string");
+    return LCL_RC_ERR;
+  }
+
+  int64_t size = 0;
+  if (lcl_value_to_int(argv[1], &size) != LCL_OK) {
+    lcl_set_error(interp, "config::font: size must be an integer");
+    return LCL_RC_ERR;
+  }
+
+  if (size < 6 || size > 72) {
+    lcl_set_error(interp, "config::font: size must be between 6 and 72");
+    return LCL_RC_ERR;
+  }
+
+  lcl_host_set_font(host, path, (int)size);
+
+  *out = lcl_list_new();
+  return LCL_RC_OK;
+}
+
 // weft::config::viewlayer ext type param ?priority? -> register viewlayer
 // config type: "tree-sitter", "lcl-script", or "annot" param: language name
 // (for tree-sitter), script path (for lcl-script), or
@@ -3503,6 +3540,8 @@ static void register_weft_bindings(lcl_interp *interp) {
              lcl_c_proc_new("weft::config::indent", c_config_indent));
   lcl_ns_def(config_ns, "wrap",
              lcl_c_proc_new("weft::config::wrap", c_config_wrap));
+  lcl_ns_def(config_ns, "font",
+             lcl_c_proc_new("weft::config::font", c_config_font));
   lcl_ns_def(config_ns, "keybind",
              lcl_c_proc_new("weft::config::keybind", c_config_keybind));
   lcl_ns_def(config_ns, "viewlayer",
@@ -3617,6 +3656,11 @@ LclHost *lcl_host_new(void) {
   host->wrap_cap = INITIAL_LAYER_CAP;
   host->wrap_count = 0;
 
+  // Initialize font config to default values
+  host->font_config.path = NULL;
+  host->font_config.size = 14; // Default size
+  host->font_config_set = false;
+
   // Initialize keybindings array
   host->keybindings = calloc(INITIAL_HANDLER_CAP, sizeof(RegisteredKeybind));
   if (!host->keybindings) {
@@ -3712,6 +3756,9 @@ void lcl_host_free(LclHost *host) {
     free(host->wrap_settings[i].extension);
   }
   free(host->wrap_settings);
+
+  // Free font config
+  free(host->font_config.path);
 
   // Free keybindings
   for (size_t i = 0; i < host->keybind_count; i++) {
@@ -4591,6 +4638,41 @@ void lcl_host_apply_wrap(LclHost *host, Editor *editor) {
   if (settings) {
     editor_set_wrap(editor, settings->enabled, settings->wrap_width);
   }
+}
+
+// === Font Configuration Functions ===
+
+void lcl_host_set_font(LclHost *host, const char *path, int size) {
+  if (!host) {
+    return;
+  }
+
+  // Free existing path if any
+  if (host->font_config.path) {
+    free(host->font_config.path);
+    host->font_config.path = NULL;
+  }
+
+  // Set new configuration
+  if (path) {
+    host->font_config.path = strdup(path);
+  }
+  host->font_config.size = size > 0 ? size : 14; // Default to 14 if invalid
+  host->font_config_set = true;
+}
+
+const FontConfig *lcl_host_get_font(LclHost *host) {
+  if (!host) {
+    return NULL;
+  }
+  return &host->font_config;
+}
+
+bool lcl_host_has_font_config(LclHost *host) {
+  if (!host) {
+    return false;
+  }
+  return host->font_config_set;
 }
 
 // === Keybinding Functions ===

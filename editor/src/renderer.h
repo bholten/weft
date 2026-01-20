@@ -27,6 +27,8 @@ void renderer_free(Renderer *r);
 
 // Font management
 bool renderer_load_font(Renderer *r, const char *path, int size);
+bool renderer_load_font_from_memory(Renderer *r, const unsigned char *data,
+                                    size_t data_len, int size);
 
 // Drawing operations
 void renderer_clear(Renderer *r, uint8_t red, uint8_t green, uint8_t blue);
