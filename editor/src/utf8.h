@@ -50,4 +50,12 @@ static inline int utf8_is_lead(unsigned char byte) {
   return (byte & 0xC0) != 0x80;
 }
 
+// Check if a codepoint is a "word character" (alphanumeric or underscore)
+// For ASCII, this is [a-zA-Z0-9_]
+// For Unicode, includes letters and numbers from other scripts
+int utf8_is_word_char(uint32_t codepoint);
+
+// Check if a codepoint is whitespace
+int utf8_is_whitespace(uint32_t codepoint);
+
 #endif // WEFT_UTF8_H

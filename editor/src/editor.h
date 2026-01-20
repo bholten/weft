@@ -102,8 +102,10 @@ void editor_move_cursor_page_down(Editor *e);
 
 // Editing
 void editor_insert_text(Editor *e, const char *text, size_t len);
-void editor_delete_backward(Editor *e); // Backspace
-void editor_delete_forward(Editor *e);  // Delete key
+void editor_delete_backward(Editor *e);      // Backspace
+void editor_delete_forward(Editor *e);       // Delete key
+void editor_delete_word_backward(Editor *e); // Ctrl+Backspace
+void editor_delete_word_forward(Editor *e);  // Ctrl+Delete
 
 // Position conversion
 void editor_pos_to_screen(const Editor *e, size_t pos, int *x, int *y);

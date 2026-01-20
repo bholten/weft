@@ -29,7 +29,7 @@ static void update_target_column(Editor *e) {
 }
 
 // Helper: Convert document byte offset within line to visual column (accounting
-// for tabs)
+// for tabs and multi-byte UTF-8)
 static size_t doc_col_to_visual(const char *line_buf, size_t line_len,
                                 size_t doc_col, int tab_size) {
   if (tab_size <= 0) {
@@ -38,19 +38,22 @@ static size_t doc_col_to_visual(const char *line_buf, size_t line_len,
 
   size_t visual_col = 0;
   for (size_t i = 0; i < line_len && i < doc_col; i++) {
-    if (line_buf[i] == '\t') {
+    unsigned char c = (unsigned char)line_buf[i];
+    if (c == '\t') {
       // Advance to next tab stop
       int spaces = tab_size - (int)(visual_col % (size_t)tab_size);
       visual_col += (size_t)spaces;
-    } else {
+    } else if (!utf8_is_continuation(c)) {
+      // Only count lead bytes (not continuation bytes) as visual columns
       visual_col++;
     }
+    // Continuation bytes (10xxxxxx) don't add to visual column
   }
   return visual_col;
 }
 
 // Helper: Convert visual column to document byte offset within line (accounting
-// for tabs)
+// for tabs and multi-byte UTF-8)
 static size_t visual_col_to_doc(const char *line_buf, size_t line_len,
                                 size_t visual_col, int tab_size) {
   if (tab_size <= 0) {
@@ -64,12 +67,15 @@ static size_t visual_col_to_doc(const char *line_buf, size_t line_len,
     if (current_visual >= visual_col) {
       break;
     }
-    if (line_buf[doc_col] == '\t') {
+    unsigned char c = (unsigned char)line_buf[doc_col];
+    if (c == '\t') {
       int spaces = tab_size - (int)(current_visual % (size_t)tab_size);
       current_visual += (size_t)spaces;
-    } else {
+    } else if (!utf8_is_continuation(c)) {
+      // Only count lead bytes as visual columns
       current_visual++;
     }
+    // Continuation bytes don't add to visual column
   }
   return doc_col;
 }
@@ -596,12 +602,20 @@ bool editor_handle_event(Editor *e, const InputEvent *event) {
       return true;
 
     case SDLK_BACKSPACE:
-      editor_delete_backward(e);
+      if (ctrl_held) {
+        editor_delete_word_backward(e);
+      } else {
+        editor_delete_backward(e);
+      }
       reset_blink(e, now);
       return true;
 
     case SDLK_DELETE:
-      editor_delete_forward(e);
+      if (ctrl_held) {
+        editor_delete_word_forward(e);
+      } else {
+        editor_delete_forward(e);
+      }
       reset_blink(e, now);
       return true;
 
@@ -951,10 +965,63 @@ void editor_move_cursor_to_line_end(Editor *e) {
   editor_scroll_to_cursor(e);
 }
 
-// Helper: Check if character is a word character (alphanumeric or underscore)
-static bool is_word_char(char c) {
-  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-         (c >= '0' && c <= '9') || c == '_';
+// Helper: Decode codepoint at position using document_get_byte
+static uint32_t decode_codepoint_at(Document *doc, size_t pos, size_t doc_len,
+                                    int *out_len) {
+  if (pos >= doc_len) {
+    if (out_len) {
+      *out_len = 0;
+    }
+    return 0;
+  }
+
+  unsigned char byte = document_get_byte(doc, pos);
+  int cp_len = utf8_codepoint_len(byte);
+  uint32_t codepoint;
+
+  if (pos + cp_len > doc_len) {
+    cp_len = 1;
+  }
+
+  switch (cp_len) {
+  case 1: codepoint = byte; break;
+  case 2:
+    codepoint = (byte & 0x1F) << 6;
+    codepoint |= (document_get_byte(doc, pos + 1) & 0x3F);
+    break;
+  case 3:
+    codepoint = (byte & 0x0F) << 12;
+    codepoint |= (document_get_byte(doc, pos + 1) & 0x3F) << 6;
+    codepoint |= (document_get_byte(doc, pos + 2) & 0x3F);
+    break;
+  case 4:
+    codepoint = (byte & 0x07) << 18;
+    codepoint |= (document_get_byte(doc, pos + 1) & 0x3F) << 12;
+    codepoint |= (document_get_byte(doc, pos + 2) & 0x3F) << 6;
+    codepoint |= (document_get_byte(doc, pos + 3) & 0x3F);
+    break;
+  default:
+    codepoint = byte;
+    cp_len = 1;
+    break;
+  }
+
+  if (out_len) {
+    *out_len = cp_len;
+  }
+  return codepoint;
+}
+
+// Helper: Move backward by one codepoint, return new position
+static size_t prev_codepoint_pos(Document *doc, size_t pos) {
+  if (pos == 0) {
+    return 0;
+  }
+  size_t prev = pos - 1;
+  while (prev > 0 && utf8_is_continuation(document_get_byte(doc, prev))) {
+    prev--;
+  }
+  return prev;
 }
 
 void editor_move_cursor_word_left(Editor *e) {
@@ -962,25 +1029,35 @@ void editor_move_cursor_word_left(Editor *e) {
     return;
   }
 
+  Document *doc = e->buffer->document;
+  size_t doc_len = document_length(doc);
   size_t pos = e->cursor_pos;
-  char c;
+
+  // Ensure we're at a valid codepoint start (back up past continuation bytes)
+  while (pos > 0 && utf8_is_continuation(document_get_byte(doc, pos))) {
+    pos--;
+  }
+
+  // Move back one codepoint first
+  pos = prev_codepoint_pos(doc, pos);
 
   // Skip whitespace/punctuation going backwards
   while (pos > 0) {
-    document_get_text(e->buffer->document, pos - 1, &c, 1);
-    if (is_word_char(c)) {
+    uint32_t cp = decode_codepoint_at(doc, pos, doc_len, NULL);
+    if (utf8_is_word_char(cp)) {
       break;
     }
-    pos--;
+    pos = prev_codepoint_pos(doc, pos);
   }
 
   // Skip word characters going backwards
   while (pos > 0) {
-    document_get_text(e->buffer->document, pos - 1, &c, 1);
-    if (!is_word_char(c)) {
+    size_t prev = prev_codepoint_pos(doc, pos);
+    uint32_t cp = decode_codepoint_at(doc, prev, doc_len, NULL);
+    if (!utf8_is_word_char(cp)) {
       break;
     }
-    pos--;
+    pos = prev;
   }
 
   e->cursor_pos = pos;
@@ -993,30 +1070,42 @@ void editor_move_cursor_word_right(Editor *e) {
     return;
   }
 
-  size_t doc_len = document_length(e->buffer->document);
+  Document *doc = e->buffer->document;
+  size_t doc_len = document_length(doc);
   if (e->cursor_pos >= doc_len) {
     return;
   }
 
   size_t pos = e->cursor_pos;
-  char c;
+  int cp_len;
+
+  // Ensure we're at a valid codepoint start (skip any continuation bytes)
+  while (pos < doc_len && utf8_is_continuation(document_get_byte(doc, pos))) {
+    pos++;
+  }
 
   // Skip current word characters
   while (pos < doc_len) {
-    document_get_text(e->buffer->document, pos, &c, 1);
-    if (!is_word_char(c)) {
+    uint32_t cp = decode_codepoint_at(doc, pos, doc_len, &cp_len);
+    if (cp_len == 0) {
+      cp_len = 1; // Safety: always advance
+    }
+    if (!utf8_is_word_char(cp)) {
       break;
     }
-    pos++;
+    pos += cp_len;
   }
 
   // Skip whitespace/punctuation
   while (pos < doc_len) {
-    document_get_text(e->buffer->document, pos, &c, 1);
-    if (is_word_char(c)) {
+    uint32_t cp = decode_codepoint_at(doc, pos, doc_len, &cp_len);
+    if (cp_len == 0) {
+      cp_len = 1; // Safety: always advance
+    }
+    if (utf8_is_word_char(cp)) {
       break;
     }
-    pos++;
+    pos += cp_len;
   }
 
   e->cursor_pos = pos;
@@ -1231,6 +1320,129 @@ void editor_delete_forward(Editor *e) {
     record_edit(e, EDIT_DELETE, e->cursor_pos, deleted_bytes, cp_len);
     update_target_column(e);
   }
+}
+
+void editor_delete_word_backward(Editor *e) {
+  if (!e) {
+    return;
+  }
+
+  // Delete selection if active
+  if (editor_has_selection(e)) {
+    editor_delete_selection(e);
+    return;
+  }
+
+  if (e->cursor_pos == 0) {
+    return;
+  }
+
+  Document *doc = e->buffer->document;
+  size_t doc_len = document_length(doc);
+  size_t end_pos = e->cursor_pos;
+  size_t pos = end_pos;
+
+  // Move back one codepoint first
+  pos = prev_codepoint_pos(doc, pos);
+
+  // Skip whitespace/punctuation going backwards
+  while (pos > 0) {
+    uint32_t cp = decode_codepoint_at(doc, pos, doc_len, NULL);
+    if (utf8_is_word_char(cp)) {
+      break;
+    }
+    pos = prev_codepoint_pos(doc, pos);
+  }
+
+  // Skip word characters going backwards
+  while (pos > 0) {
+    size_t prev = prev_codepoint_pos(doc, pos);
+    uint32_t cp = decode_codepoint_at(doc, prev, doc_len, NULL);
+    if (!utf8_is_word_char(cp)) {
+      break;
+    }
+    pos = prev;
+  }
+
+  size_t delete_len = end_pos - pos;
+  if (delete_len == 0) {
+    return;
+  }
+
+  // Get the bytes to be deleted for undo
+  char *deleted_bytes = malloc(delete_len);
+  if (!deleted_bytes) {
+    return;
+  }
+  document_get_text(doc, pos, deleted_bytes, delete_len);
+
+  if (document_delete(doc, pos, delete_len)) {
+    annot_store_on_delete(e->buffer->annots, pos, delete_len);
+    record_edit(e, EDIT_DELETE, pos, deleted_bytes, delete_len);
+    e->cursor_pos = pos;
+    update_target_column(e);
+    editor_scroll_to_cursor(e);
+  }
+  free(deleted_bytes);
+}
+
+void editor_delete_word_forward(Editor *e) {
+  if (!e) {
+    return;
+  }
+
+  // Delete selection if active
+  if (editor_has_selection(e)) {
+    editor_delete_selection(e);
+    return;
+  }
+
+  Document *doc = e->buffer->document;
+  size_t doc_len = document_length(doc);
+  if (e->cursor_pos >= doc_len) {
+    return;
+  }
+
+  size_t start_pos = e->cursor_pos;
+  size_t pos = start_pos;
+  int cp_len;
+
+  // Skip current word characters
+  while (pos < doc_len) {
+    uint32_t cp = decode_codepoint_at(doc, pos, doc_len, &cp_len);
+    if (!utf8_is_word_char(cp)) {
+      break;
+    }
+    pos += cp_len;
+  }
+
+  // Skip whitespace/punctuation
+  while (pos < doc_len) {
+    uint32_t cp = decode_codepoint_at(doc, pos, doc_len, &cp_len);
+    if (utf8_is_word_char(cp)) {
+      break;
+    }
+    pos += cp_len;
+  }
+
+  size_t delete_len = pos - start_pos;
+  if (delete_len == 0) {
+    return;
+  }
+
+  // Get the bytes to be deleted for undo
+  char *deleted_bytes = malloc(delete_len);
+  if (!deleted_bytes) {
+    return;
+  }
+  document_get_text(doc, start_pos, deleted_bytes, delete_len);
+
+  if (document_delete(doc, start_pos, delete_len)) {
+    annot_store_on_delete(e->buffer->annots, start_pos, delete_len);
+    record_edit(e, EDIT_DELETE, start_pos, deleted_bytes, delete_len);
+    update_target_column(e);
+  }
+  free(deleted_bytes);
 }
 
 void editor_pos_to_screen(const Editor *e, size_t pos, int *x, int *y) {
