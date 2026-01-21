@@ -5,6 +5,7 @@
 
 // Forward declarations
 typedef struct TSLanguage TSLanguage;
+typedef struct TSLangRegistry TSLangRegistry;
 
 // TreeSitterLayer: computes syntax highlighting decorations using tree-sitter
 //
@@ -31,6 +32,18 @@ ViewLayer *tree_sitter_layer_new(const char *language_name,
 // Get the language name for a TreeSitterLayer
 // Returns NULL if not a tree-sitter layer
 const char *tree_sitter_layer_get_language(const ViewLayer *layer);
+
+// === Registry-based Layer Creation ===
+
+// Create a TreeSitterLayer for a language registered in the registry
+// Loads the language and query from the registry (dynamic or embedded)
+// Parameters:
+//   reg       - The language registry
+//   lang_name - Name of the registered language (e.g., "c", "javascript")
+//   priority  - Layer priority (higher = rendered later/on top)
+// Returns NULL if language not found or loading fails
+ViewLayer *tree_sitter_layer_from_registry(TSLangRegistry *reg,
+                                           const char *lang_name, int priority);
 
 // === Built-in Language Layers ===
 

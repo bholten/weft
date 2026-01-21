@@ -5,7 +5,10 @@
 #include <string.h>
 
 #include <tree_sitter/api.h>
+
+#ifdef WEFT_EMBED_TS_LCL
 #include <tree_sitter/tree-sitter-lcl.h>
+#endif
 
 #include "annot_store.h"
 #include "buffer.h"
@@ -328,6 +331,7 @@ void ts_hl_apply_to_buffer(TSHighlighter *hl, Buffer *buffer,
 
 // === Built-in Languages ===
 
+#ifdef WEFT_EMBED_TS_LCL
 static TSHighlighter *g_lcl_highlighter = NULL;
 
 TSHighlighter *ts_hl_get_lcl(const char *highlights_path) {
@@ -373,3 +377,14 @@ void ts_hl_cleanup(void) {
     g_lcl_highlighter = NULL;
   }
 }
+#else
+// Stubs when Lcl parser is not embedded
+TSHighlighter *ts_hl_get_lcl(const char *highlights_path) {
+  (void)highlights_path;
+  return NULL;
+}
+
+void ts_hl_cleanup(void) {
+  // Nothing to clean up
+}
+#endif

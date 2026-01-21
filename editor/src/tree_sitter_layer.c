@@ -1,4 +1,5 @@
 #include "tree_sitter_layer.h"
+#include "ts_lang_registry.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,9 +8,15 @@
 #include <limits.h>
 
 #include <tree_sitter/api.h>
+
+#ifdef WEFT_EMBED_TS_LCL
 #include <tree_sitter/tree-sitter-lcl.h>
+#endif
 
 #include "buffer.h"
+
+// Forward declaration
+static char *read_file(const char *path);
 #include "color.h"
 #include "document.h"
 
@@ -432,6 +439,72 @@ const char *tree_sitter_layer_get_language(const ViewLayer *layer) {
   return data->language_name;
 }
 
+// === Registry-based Layer Creation ===
+
+ViewLayer *tree_sitter_layer_from_registry(TSLangRegistry *reg,
+                                           const char *lang_name, int priority) {
+  if (!reg || !lang_name) {
+    return NULL;
+  }
+
+  // Get language config from registry
+  TSLangConfig *config = ts_lang_registry_get(reg, lang_name);
+  if (!config) {
+    fprintf(stderr, "tree_sitter_layer: language '%s' not found in registry\n",
+            lang_name);
+    return NULL;
+  }
+
+  // Try to load the language if not already loaded
+  if (!config->language && !config->load_failed) {
+    // For dynamic languages, we need to load them
+    // The registry's get_highlighter does this, but we need just the language
+    // So we'll trigger loading by attempting to get highlighter (which caches)
+    TSHighlighter *hl = ts_lang_registry_get_highlighter(reg, config);
+    if (!hl) {
+      fprintf(stderr,
+              "tree_sitter_layer: failed to load language '%s' from registry\n",
+              lang_name);
+      return NULL;
+    }
+    // Now config->language should be set
+  }
+
+  if (!config->language) {
+    fprintf(stderr, "tree_sitter_layer: language '%s' has no TSLanguage\n",
+            lang_name);
+    return NULL;
+  }
+
+  // Load query source
+  char *query_source = NULL;
+
+  if (config->source == TS_LANG_SOURCE_EMBEDDED && config->query_path) {
+    // For embedded, query_path might be actual query content
+    if (config->query_path[0] == '(' || config->query_path[0] == ';' ||
+        config->query_path[0] == '[') {
+      query_source = strdup(config->query_path);
+    } else {
+      query_source = read_file(config->query_path);
+    }
+  } else if (config->query_path) {
+    query_source = read_file(config->query_path);
+  }
+
+  if (!query_source) {
+    fprintf(stderr, "tree_sitter_layer: failed to load query for '%s'\n",
+            lang_name);
+    return NULL;
+  }
+
+  // Create the layer using the standard function
+  ViewLayer *layer =
+      tree_sitter_layer_new(lang_name, config->language, query_source, priority);
+  free(query_source);
+
+  return layer;
+}
+
 // === Built-in Language Layers ===
 
 // Helper to read entire file into string
@@ -458,12 +531,15 @@ static char *read_file(const char *path) {
   return content;
 }
 
+#ifdef WEFT_EMBED_TS_LCL
 ViewLayer *tree_sitter_layer_new_lcl(int priority) {
-  // Search for highlights.scm in common locations
+  // Search for highlights.scm - prefer absolute path from CMake define
   const char *paths[] = {
+#ifdef WEFT_SUBMODULES_DIR
+      WEFT_SUBMODULES_DIR "/tree-sitter-lcl/queries/highlights.scm",
+#endif
       "../submodules/tree-sitter-lcl/queries/highlights.scm",
       "../../submodules/tree-sitter-lcl/queries/highlights.scm",
-      "/home/brennan/dev/weft/submodules/tree-sitter-lcl/queries/highlights.scm",
       NULL};
 
   char *query_source = NULL;
@@ -485,3 +561,10 @@ ViewLayer *tree_sitter_layer_new_lcl(int priority) {
 
   return layer;
 }
+#else
+ViewLayer *tree_sitter_layer_new_lcl(int priority) {
+  (void)priority;
+  // Lcl parser not embedded - return NULL
+  return NULL;
+}
+#endif

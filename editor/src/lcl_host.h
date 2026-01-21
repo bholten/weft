@@ -13,6 +13,7 @@ typedef struct BufferManager BufferManager;
 typedef struct LayoutNode LayoutNode;
 typedef struct Pane Pane;
 typedef struct Patch Patch;
+typedef struct TSLangRegistry TSLangRegistry;
 
 // Interaction type enum (mirrors InteractType from interaction.h)
 typedef enum {
@@ -169,6 +170,9 @@ typedef struct LclHost {
 
   // REPL attachment - when set, doc commands in REPL operate on this buffer
   Buffer *repl_attached_buffer;
+
+  // Tree-sitter language registry
+  TSLangRegistry *ts_registry;
 
   // Pending transform prompt - when a transform requests user input
   struct {
@@ -357,6 +361,9 @@ const ViewLayerConfig *lcl_host_get_viewlayers(LclHost *host,
 // Call this after pane_new to set up file-type-specific layers
 // Returns true if any custom viewlayers were applied
 bool lcl_host_apply_viewlayers(LclHost *host, Pane *pane);
+
+// Get the tree-sitter language registry
+TSLangRegistry *lcl_host_get_ts_registry(LclHost *host);
 
 // === Keybinding Registration ===
 

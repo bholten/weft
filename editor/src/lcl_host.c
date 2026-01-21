@@ -27,6 +27,24 @@
 #include "transform.h"
 #include "tree_sitter_hl.h"
 #include "tree_sitter_layer.h"
+#include "ts_lang_registry.h"
+
+// Conditional includes for embedded tree-sitter parsers
+#ifdef WEFT_EMBED_TS_LCL
+#include <tree_sitter/tree-sitter-lcl.h>
+#endif
+#ifdef WEFT_EMBED_TS_C
+#include <tree_sitter/tree-sitter-c.h>
+#endif
+#ifdef WEFT_EMBED_TS_JSON
+#include <tree-sitter-json.h>
+#endif
+#ifdef WEFT_EMBED_TS_BASH
+#include <tree_sitter/tree-sitter-bash.h>
+#endif
+#ifdef WEFT_EMBED_TS_JAVASCRIPT
+#include <tree_sitter/tree-sitter-javascript.h>
+#endif
 
 #include <SDL3/SDL.h>
 
@@ -2764,6 +2782,81 @@ static int c_config_viewlayer(lcl_interp *interp, int argc, lcl_value **argv,
   return LCL_RC_OK;
 }
 
+// weft::config::language name library_path ?query_path? -> register tree-sitter
+// language Registers a tree-sitter language that can be loaded dynamically.
+// name: language identifier (e.g., "c", "javascript")
+// library_path: path to shared library (.so/.dylib/.dll)
+// query_path: optional path to highlights.scm (defaults to
+// <library_dir>/queries/highlights.scm)
+static int c_config_language(lcl_interp *interp, int argc, lcl_value **argv,
+                             lcl_value **out) {
+  LclHost *host = lcl_interp_get_user_data(interp);
+  if (!host) {
+    lcl_set_error(interp, "no host context");
+    return LCL_RC_ERR;
+  }
+
+  if (argc < 2) {
+    lcl_set_error(interp,
+                  "config::language requires name and library_path");
+    return LCL_RC_ERR;
+  }
+
+  const char *name = lcl_value_to_string(argv[0]);
+  const char *library_path = lcl_value_to_string(argv[1]);
+  const char *query_path = (argc >= 3) ? lcl_value_to_string(argv[2]) : NULL;
+
+  if (!name || !library_path) {
+    lcl_set_error(interp,
+                  "config::language: name and library_path must be strings");
+    return LCL_RC_ERR;
+  }
+
+  if (!ts_lang_registry_add_dynamic(host->ts_registry, name, library_path,
+                                    query_path)) {
+    lcl_set_error(interp, "config::language: failed to register language");
+    return LCL_RC_ERR;
+  }
+
+  *out = lcl_list_new();
+  return LCL_RC_OK;
+}
+
+// weft::config::language-ext extension language_name -> map extension to
+// language Maps a file extension to a registered tree-sitter language.
+static int c_config_language_ext(lcl_interp *interp, int argc, lcl_value **argv,
+                                 lcl_value **out) {
+  LclHost *host = lcl_interp_get_user_data(interp);
+  if (!host) {
+    lcl_set_error(interp, "no host context");
+    return LCL_RC_ERR;
+  }
+
+  if (argc < 2) {
+    lcl_set_error(interp,
+                  "config::language-ext requires extension and language_name");
+    return LCL_RC_ERR;
+  }
+
+  const char *extension = lcl_value_to_string(argv[0]);
+  const char *language_name = lcl_value_to_string(argv[1]);
+
+  if (!extension || !language_name) {
+    lcl_set_error(
+        interp,
+        "config::language-ext: extension and language_name must be strings");
+    return LCL_RC_ERR;
+  }
+
+  if (!ts_lang_registry_map_ext(host->ts_registry, extension, language_name)) {
+    lcl_set_error(interp, "config::language-ext: failed to map extension");
+    return LCL_RC_ERR;
+  }
+
+  *out = lcl_list_new();
+  return LCL_RC_OK;
+}
+
 // Helper to parse a key name to SDL keycode
 static int parse_keycode(const char *name) {
   // Common single-character keys
@@ -3546,6 +3639,10 @@ static void register_weft_bindings(lcl_interp *interp) {
              lcl_c_proc_new("weft::config::keybind", c_config_keybind));
   lcl_ns_def(config_ns, "viewlayer",
              lcl_c_proc_new("weft::config::viewlayer", c_config_viewlayer));
+  lcl_ns_def(config_ns, "language",
+             lcl_c_proc_new("weft::config::language", c_config_language));
+  lcl_ns_def(config_ns, "language-ext",
+             lcl_c_proc_new("weft::config::language-ext", c_config_language_ext));
 
   // Create weft::ts namespace for tree-sitter operations
   lcl_value *ts_ns = lcl_ns_new("ts");
@@ -3702,6 +3799,59 @@ LclHost *lcl_host_new(void) {
     }
   }
 
+  // Initialize tree-sitter language registry
+  host->ts_registry = ts_lang_registry_new();
+  if (!host->ts_registry) {
+    free(host->config_dir);
+    free(host->viewlayer_configs);
+    free(host->keybindings);
+    free(host->wrap_settings);
+    free(host->indent_settings);
+    free(host->filetypes);
+    free(host->handlers);
+    free(host->registered_layers);
+    lcl_interp_free(host->interp);
+    free(host);
+    return NULL;
+  }
+
+  // Register embedded tree-sitter parsers
+  // These are conditionally compiled based on WEFT_EMBED_TS_* defines
+  // WEFT_SUBMODULES_DIR is defined by CMake as an absolute path
+#ifdef WEFT_EMBED_TS_LCL
+  ts_lang_registry_add_embedded(host->ts_registry, "lcl", tree_sitter_lcl, NULL,
+                                WEFT_SUBMODULES_DIR "/tree-sitter-lcl/queries/highlights.scm");
+  ts_lang_registry_map_ext(host->ts_registry, ".lcl", "lcl");
+#endif
+
+#ifdef WEFT_EMBED_TS_C
+  ts_lang_registry_add_embedded(host->ts_registry, "c", tree_sitter_c, NULL,
+                                WEFT_SUBMODULES_DIR "/c/queries/highlights.scm");
+  ts_lang_registry_map_ext(host->ts_registry, ".c", "c");
+  ts_lang_registry_map_ext(host->ts_registry, ".h", "c");
+#endif
+
+#ifdef WEFT_EMBED_TS_JSON
+  ts_lang_registry_add_embedded(host->ts_registry, "json", tree_sitter_json, NULL,
+                                WEFT_SUBMODULES_DIR "/tree-sitter-json/queries/highlights.scm");
+  ts_lang_registry_map_ext(host->ts_registry, ".json", "json");
+#endif
+
+#ifdef WEFT_EMBED_TS_BASH
+  ts_lang_registry_add_embedded(host->ts_registry, "bash", tree_sitter_bash, NULL,
+                                WEFT_SUBMODULES_DIR "/tree-sitter-bash/queries/highlights.scm");
+  ts_lang_registry_map_ext(host->ts_registry, ".sh", "bash");
+  ts_lang_registry_map_ext(host->ts_registry, ".bash", "bash");
+#endif
+
+#ifdef WEFT_EMBED_TS_JAVASCRIPT
+  ts_lang_registry_add_embedded(host->ts_registry, "javascript", tree_sitter_javascript, NULL,
+                                WEFT_SUBMODULES_DIR "/tree-sitter-javascript/queries/highlights.scm");
+  ts_lang_registry_map_ext(host->ts_registry, ".js", "javascript");
+  ts_lang_registry_map_ext(host->ts_registry, ".mjs", "javascript");
+  ts_lang_registry_map_ext(host->ts_registry, ".jsx", "javascript");
+#endif
+
   // Register core Lcl commands
   lcl_register_core(host->interp);
 
@@ -3774,6 +3924,11 @@ void lcl_host_free(LclHost *host) {
   free(host->viewlayer_configs);
 
   free(host->config_dir);
+
+  // Free tree-sitter language registry
+  if (host->ts_registry) {
+    ts_lang_registry_free(host->ts_registry);
+  }
 
   // Cleanup tree-sitter highlighters
   ts_hl_cleanup();
@@ -4675,6 +4830,13 @@ bool lcl_host_has_font_config(LclHost *host) {
   return host->font_config_set;
 }
 
+TSLangRegistry *lcl_host_get_ts_registry(LclHost *host) {
+  if (!host) {
+    return NULL;
+  }
+  return host->ts_registry;
+}
+
 // === Keybinding Functions ===
 
 void lcl_host_register_keybind(LclHost *host, int keycode, int modifiers,
@@ -4856,11 +5018,18 @@ bool lcl_host_apply_viewlayers(LclHost *host, Pane *pane) {
 
     switch (config->type) {
     case VIEWLAYER_TREE_SITTER:
-      // Currently only "lcl" is supported
-      if (strcmp(config->param, "lcl") == 0) {
+      // Try registry first for all languages
+      if (host->ts_registry) {
+        layer = tree_sitter_layer_from_registry(host->ts_registry, config->param,
+                                                config->priority);
+      }
+      // Fall back to hardcoded lcl support if registry doesn't have it
+      // (for backwards compatibility when WEFT_EMBED_TS_LCL is disabled)
+      if (!layer && strcmp(config->param, "lcl") == 0) {
         layer = tree_sitter_layer_new_lcl(config->priority);
-      } else {
-        fprintf(stderr, "viewlayer: unsupported tree-sitter language: %s\n",
+      }
+      if (!layer) {
+        fprintf(stderr, "viewlayer: tree-sitter language '%s' not available\n",
                 config->param);
       }
       break;
