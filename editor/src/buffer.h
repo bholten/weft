@@ -38,6 +38,9 @@ void buffer_manager_close(BufferManager *bm, Buffer *buf);
 // Find buffer by file path (returns NULL if not found)
 Buffer *buffer_manager_find_by_path(BufferManager *bm, const char *path);
 
+// Find buffer by ID (returns NULL if not found)
+Buffer *buffer_manager_find_by_id(BufferManager *bm, uint32_t id);
+
 // Buffer reference counting
 void buffer_ref(Buffer *buf);
 void buffer_unref(Buffer *buf);

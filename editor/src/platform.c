@@ -10,9 +10,11 @@ Platform *platform_new(const char *title, int width, int height) {
     return NULL;
   }
 
+  // Create window hidden initially to avoid flicker during positioning
   SDL_Window *window =
       SDL_CreateWindow(title, width, height,
-                       SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+                       SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY |
+                           SDL_WINDOW_HIDDEN);
 
   if (!window) {
     SDL_LogError(SDL_LOG_CATEGORY_CUSTOM, "SDL_CreateWindow failed: %s",
@@ -21,7 +23,9 @@ Platform *platform_new(const char *title, int width, int height) {
     return NULL;
   }
 
+  // Position window centered before showing
   SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+  SDL_ShowWindow(window);
 
   SDL_Renderer *renderer = SDL_CreateRenderer(window, NULL);
 

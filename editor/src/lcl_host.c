@@ -1019,6 +1019,93 @@ static int c_shell_pipe_selection(lcl_interp *interp, int argc,
 
 // === Internal: Buffer Bindings ===
 
+// weft::buffer::id -> get the current buffer's ID
+static int c_buffer_id(lcl_interp *interp, int argc, lcl_value **argv,
+                       lcl_value **out) {
+  (void)argc;
+  (void)argv;
+
+  LclHost *host = lcl_interp_get_user_data(interp);
+  if (!host) {
+    lcl_set_error(interp, "no host context");
+    return LCL_RC_ERR;
+  }
+
+  Buffer *buf = get_effective_doc_buffer(host);
+  if (!buf) {
+    lcl_set_error(interp, "no current buffer");
+    return LCL_RC_ERR;
+  }
+
+  *out = lcl_int_new((int64_t)buf->id);
+  return LCL_RC_OK;
+}
+
+// weft::buffer::by-id id -> get buffer info by ID, returns {id path modified}
+static int c_buffer_by_id(lcl_interp *interp, int argc, lcl_value **argv,
+                          lcl_value **out) {
+  if (argc < 1) {
+    lcl_set_error(interp, "buffer::by-id requires id");
+    return LCL_RC_ERR;
+  }
+
+  LclHost *host = lcl_interp_get_user_data(interp);
+  if (!host || !host->buffer_manager) {
+    lcl_set_error(interp, "no buffer manager context");
+    return LCL_RC_ERR;
+  }
+
+  long id;
+  if (lcl_value_to_int(argv[0], &id) != LCL_OK || id <= 0) {
+    lcl_set_error(interp, "buffer::by-id: id must be a positive integer");
+    return LCL_RC_ERR;
+  }
+
+  Buffer *buf = buffer_manager_find_by_id(host->buffer_manager, (uint32_t)id);
+  if (!buf) {
+    *out = lcl_list_new(); // Empty list if not found
+    return LCL_RC_OK;
+  }
+
+  // Return {id path modified}
+  lcl_value *result = lcl_list_new();
+  lcl_list_push(&result, lcl_int_new((long)buf->id));
+  lcl_list_push(&result,
+                lcl_string_new(buf->file_path ? buf->file_path : ""));
+  lcl_list_push(&result, lcl_int_new(buf->modified ? 1 : 0));
+  *out = result;
+  return LCL_RC_OK;
+}
+
+// weft::buffer::list -> list all open buffers as {{id path modified} ...}
+static int c_buffer_list(lcl_interp *interp, int argc, lcl_value **argv,
+                         lcl_value **out) {
+  (void)argc;
+  (void)argv;
+
+  LclHost *host = lcl_interp_get_user_data(interp);
+  if (!host || !host->buffer_manager) {
+    lcl_set_error(interp, "no buffer manager context");
+    return LCL_RC_ERR;
+  }
+
+  lcl_value *result = lcl_list_new();
+  BufferManager *bm = host->buffer_manager;
+
+  for (size_t i = 0; i < bm->count; i++) {
+    Buffer *buf = bm->buffers[i];
+    lcl_value *entry = lcl_list_new();
+    lcl_list_push(&entry, lcl_int_new((long)buf->id));
+    lcl_list_push(&entry,
+                  lcl_string_new(buf->file_path ? buf->file_path : ""));
+    lcl_list_push(&entry, lcl_int_new(buf->modified ? 1 : 0));
+    lcl_list_push(&result, entry);
+  }
+
+  *out = result;
+  return LCL_RC_OK;
+}
+
 // weft::buffer::open path -> open file in new pane
 static int c_buffer_open(lcl_interp *interp, int argc, lcl_value **argv,
                          lcl_value **out) {
@@ -1281,43 +1368,61 @@ static Buffer *get_effective_doc_buffer(LclHost *host) {
 // weft::repl::attach -> attach REPL to the previously focused buffer
 static int c_repl_attach(lcl_interp *interp, int argc, lcl_value **argv,
                          lcl_value **out) {
-  (void)argc;
-  (void)argv;
-
   LclHost *host = lcl_interp_get_user_data(interp);
   if (!host) {
     lcl_set_error(interp, "no host context");
     return LCL_RC_ERR;
   }
 
-  if (!host->current_buffer) {
-    lcl_set_error(interp, "no current buffer");
-    return LCL_RC_ERR;
-  }
+  Buffer *target = NULL;
 
-  // Don't attach to the REPL itself
-  if (is_repl_buffer(host->current_buffer)) {
-    // If we're in the REPL and there's no attachment yet, this is a no-op
-    // User needs to call this from a non-REPL buffer
-    if (!host->repl_attached_buffer) {
-      lcl_set_error(
-          interp,
-          "repl::attach must be called from the target buffer, not the REPL");
+  // If an argument is provided, treat it as a buffer ID
+  if (argc >= 1) {
+    long id;
+    if (lcl_value_to_int(argv[0], &id) != LCL_OK || id <= 0) {
+      lcl_set_error(interp, "repl::attach: id must be a positive integer");
       return LCL_RC_ERR;
     }
-    // Already attached - return info
-    *out = lcl_string_new(host->repl_attached_buffer->file_path
-                              ? host->repl_attached_buffer->file_path
-                              : "(untitled)");
-    return LCL_RC_OK;
+    target = buffer_manager_find_by_id(host->buffer_manager, (uint32_t)id);
+    if (!target) {
+      lcl_set_error(interp, "repl::attach: no buffer with that id");
+      return LCL_RC_ERR;
+    }
+    // Don't allow attaching to the REPL itself
+    if (is_repl_buffer(target)) {
+      lcl_set_error(interp, "repl::attach: cannot attach to the REPL itself");
+      return LCL_RC_ERR;
+    }
+  } else {
+    // No argument - use current buffer (original behavior)
+    if (!host->current_buffer) {
+      lcl_set_error(interp, "no current buffer");
+      return LCL_RC_ERR;
+    }
+
+    // Don't attach to the REPL itself
+    if (is_repl_buffer(host->current_buffer)) {
+      // If we're in the REPL and there's no attachment yet, this is a no-op
+      // User needs to call this from a non-REPL buffer or provide an ID
+      if (!host->repl_attached_buffer) {
+        lcl_set_error(interp,
+                      "repl::attach requires buffer id when called from REPL");
+        return LCL_RC_ERR;
+      }
+      // Already attached - return info
+      *out = lcl_string_new(host->repl_attached_buffer->file_path
+                                ? host->repl_attached_buffer->file_path
+                                : "(untitled)");
+      return LCL_RC_OK;
+    }
+
+    target = host->current_buffer;
   }
 
-  // Attach to current buffer
-  host->repl_attached_buffer = host->current_buffer;
+  // Attach to target buffer
+  host->repl_attached_buffer = target;
 
-  *out = lcl_string_new(host->current_buffer->file_path
-                            ? host->current_buffer->file_path
-                            : "(untitled)");
+  *out = lcl_string_new(target->file_path ? target->file_path : "(untitled)");
   return LCL_RC_OK;
 }
 
@@ -3579,6 +3684,12 @@ static void register_weft_bindings(lcl_interp *interp) {
   lcl_value *buffer_ns = lcl_ns_new("buffer");
   lcl_ns_def(weft_ns, "buffer", buffer_ns);
 
+  lcl_ns_def(buffer_ns, "id",
+             lcl_c_proc_new("weft::buffer::id", c_buffer_id));
+  lcl_ns_def(buffer_ns, "by-id",
+             lcl_c_proc_new("weft::buffer::by-id", c_buffer_by_id));
+  lcl_ns_def(buffer_ns, "list",
+             lcl_c_proc_new("weft::buffer::list", c_buffer_list));
   lcl_ns_def(buffer_ns, "open",
              lcl_c_proc_new("weft::buffer::open", c_buffer_open));
   lcl_ns_def(buffer_ns, "open-output",

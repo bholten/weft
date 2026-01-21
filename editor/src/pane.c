@@ -319,6 +319,12 @@ void pane_render(Pane *p, Renderer *r, bool focused) {
   int tag_x = p->bounds.x + 4;
   int tag_y = p->bounds.y + 2;
 
+  // Draw buffer ID
+  char id_buf[16];
+  snprintf(id_buf, sizeof(id_buf), "[B%u]", buf->id);
+  renderer_draw_text(r, id_buf, tag_x, tag_y, tag_text);
+  tag_x += (int)strlen(id_buf) * char_width + 4;
+
   // Draw filename (or "untitled")
   const char *filepath = buffer_get_file_path(buf);
   const char *display_name = filepath ? filepath : "[untitled]";

@@ -159,6 +159,21 @@ Buffer *buffer_manager_find_by_path(BufferManager *bm, const char *path) {
   return NULL;
 }
 
+Buffer *buffer_manager_find_by_id(BufferManager *bm, uint32_t id) {
+  if (!bm || id == 0) {
+    return NULL;
+  }
+
+  for (size_t i = 0; i < bm->count; i++) {
+    Buffer *buf = bm->buffers[i];
+    if (buf->id == id) {
+      return buf;
+    }
+  }
+
+  return NULL;
+}
+
 void buffer_ref(Buffer *buf) {
   if (buf) {
     buf->ref_count++;
@@ -254,9 +269,13 @@ bool buffer_save_as(Buffer *buf, const char *path) {
 
   fclose(f);
 
-  // Update file path
+  // Update file path (copy first to handle case where path == buf->file_path)
+  char *new_path = strdup(path);
+  if (!new_path) {
+    return false;
+  }
   free(buf->file_path);
-  buf->file_path = strdup(path);
+  buf->file_path = new_path;
   buf->modified = false;
 
   return true;
