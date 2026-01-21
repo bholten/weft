@@ -101,8 +101,9 @@ SDL_AppResult SDL_AppInit(void **app_state, int argc, char **argv) {
     return SDL_APP_FAILURE;
   }
 
-  // Create initial buffer (load file or create empty)
+  // Create initial buffer (load file or open REPL)
   Buffer *initial_buffer = NULL;
+  bool started_with_repl = false;
   if (argc > 1) {
     initial_buffer = buffer_manager_open_file(ctx->app.buffers, argv[1]);
     if (!initial_buffer) {
@@ -110,7 +111,23 @@ SDL_AppResult SDL_AppInit(void **app_state, int argc, char **argv) {
     }
   }
   if (!initial_buffer) {
+    // No file specified - create REPL buffer
     initial_buffer = buffer_manager_create(ctx->app.buffers);
+    if (initial_buffer) {
+      const char *welcome =
+          ";; Lcl REPL - Weft Scripting Console\n"
+          ";; Type Lcl expressions and press Ctrl+Enter to evaluate\n"
+          ";; Results appear below each expression\n"
+          ";;\n"
+          ";; Examples:\n"
+          ";;   [+ 1 2]              ;; => 3\n"
+          ";;   [weft::doc::length]  ;; => document length\n"
+          ";;   [weft::version]      ;; => version string\n"
+          ";;\n\n";
+      document_insert(initial_buffer->document, 0, welcome, strlen(welcome));
+      initial_buffer->file_path = strdup("*lcl*");
+      started_with_repl = true;
+    }
   }
   if (!initial_buffer) {
     buffer_manager_free(ctx->app.buffers);

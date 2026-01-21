@@ -1964,24 +1964,17 @@ static int c_buffer_open_at(lcl_interp *interp, int argc, lcl_value **argv,
 
 // === Internal: Pane Commands ===
 
-// weft::pane::close -> close the currently focused pane
-static int c_pane_close(lcl_interp *interp, int argc, lcl_value **argv,
-                        lcl_value **out) {
-  (void)argc;
-  (void)argv;
-
-  LclHost *host = lcl_interp_get_user_data(interp);
+// Helper to close the focused pane - returns true if closed, false if last pane
+static bool close_focused_pane(LclHost *host) {
   if (!host || !host->layout_root_ptr || !host->focused_pane_ptr) {
-    lcl_set_error(interp, "no app context");
-    return LCL_RC_ERR;
+    return false;
   }
 
   LayoutNode *root = *host->layout_root_ptr;
   Pane *focused = *host->focused_pane_ptr;
 
   if (!root || !focused) {
-    *out = lcl_int_new(0); // Nothing to close
-    return LCL_RC_OK;
+    return false;
   }
 
   // Find the next pane to focus before closing
@@ -1997,14 +1990,29 @@ static int c_pane_close(lcl_interp *interp, int argc, lcl_value **argv,
     *host->layout_root_ptr = new_root;
     *host->focused_pane_ptr = next ? next : layout_first_pane(new_root);
     recompute_layout_bounds(host);
-    *out = lcl_int_new(1); // Success
+    return true;
   } else {
-    // Last pane closed - return 0 to indicate app should quit
+    // Last pane closed
     *host->layout_root_ptr = NULL;
     *host->focused_pane_ptr = NULL;
-    *out = lcl_int_new(0);
+    return false;
+  }
+}
+
+// weft::pane::close -> close the currently focused pane
+static int c_pane_close(lcl_interp *interp, int argc, lcl_value **argv,
+                        lcl_value **out) {
+  (void)argc;
+  (void)argv;
+
+  LclHost *host = lcl_interp_get_user_data(interp);
+  if (!host || !host->layout_root_ptr || !host->focused_pane_ptr) {
+    lcl_set_error(interp, "no app context");
+    return LCL_RC_ERR;
   }
 
+  bool closed = close_focused_pane(host);
+  *out = lcl_int_new(closed ? 1 : 0);
   return LCL_RC_OK;
 }
 
@@ -3383,6 +3391,9 @@ static int c_transform_apply(lcl_interp *interp, int argc, lcl_value **argv,
     return LCL_RC_ERR;
   }
 
+  // Close the diff buffer (currently focused pane)
+  close_focused_pane(host);
+
   *out = lcl_string_new("patch applied");
   return LCL_RC_OK;
 }
@@ -3408,6 +3419,9 @@ static int c_transform_reject(lcl_interp *interp, int argc, lcl_value **argv,
   patch_free(host->pending_patch);
   host->pending_patch = NULL;
   host->patch_target_buffer = NULL;
+
+  // Close the diff buffer (currently focused pane)
+  close_focused_pane(host);
 
   *out = lcl_string_new("patch rejected");
   return LCL_RC_OK;
