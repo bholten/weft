@@ -51,6 +51,9 @@ Pane *layout_pane_at_point(LayoutNode *node, int x, int y);
 // Find the node containing a pane
 LayoutNode *layout_find_pane(LayoutNode *root, Pane *pane);
 
+// Find a pane that contains a specific buffer
+Pane *layout_find_pane_with_buffer(LayoutNode *root, Buffer *buffer);
+
 // Traversal
 void layout_for_each_pane(LayoutNode *node, LayoutPaneCallback cb, void *data);
 

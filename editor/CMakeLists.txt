@@ -72,6 +72,7 @@ set(LCL_BUILD_SHARED OFF CACHE BOOL "" FORCE)
 set(LCL_BUILD_STATIC ON CACHE BOOL "" FORCE)
 set(LCL_BUILD_CLI OFF CACHE BOOL "" FORCE)
 set(LCL_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(LCL_BUILD_REGEX ON CACHE BOOL "" FORCE)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../submodules/lcl ${CMAKE_CURRENT_BINARY_DIR}/lcl)
 
 # Add tree-sitter runtime library
@@ -197,12 +198,30 @@ add_custom_command(
 
 add_custom_target(embedded_font DEPENDS ${EMBEDDED_FONT_HEADER})
 
+# Generate embedded stdlib header
+set(EMBEDDED_STDLIB_PATH "${CMAKE_CURRENT_SOURCE_DIR}/lib/weft.lcl")
+set(EMBEDDED_STDLIB_HEADER "${CMAKE_CURRENT_BINARY_DIR}/embedded_stdlib.h")
+set(EMBED_STDLIB_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_stdlib.cmake")
+
+add_custom_command(
+  OUTPUT ${EMBEDDED_STDLIB_HEADER}
+  COMMAND ${CMAKE_COMMAND}
+    -DINPUT_FILE=${EMBEDDED_STDLIB_PATH}
+    -DOUTPUT_FILE=${EMBEDDED_STDLIB_HEADER}
+    -P ${EMBED_STDLIB_SCRIPT}
+  DEPENDS ${EMBEDDED_STDLIB_PATH} ${EMBED_STDLIB_SCRIPT}
+  COMMENT "Generating embedded stdlib header"
+)
+
+add_custom_target(embedded_stdlib DEPENDS ${EMBEDDED_STDLIB_HEADER})
+
 add_executable(weft ${WEFT_SOURCES})
-add_dependencies(weft embedded_font)
+add_dependencies(weft embedded_font embedded_stdlib)
 target_link_libraries(weft PRIVATE
   SDL3::SDL3
   SDL3_ttf::SDL3_ttf
   lcl_static
+  lcl_regex
   tree-sitter-lib
   ${WEFT_TS_PARSER_LIBS}
   m
@@ -210,6 +229,7 @@ target_link_libraries(weft PRIVATE
 )
 target_include_directories(weft PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../submodules/lcl/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/../submodules/lcl/packages/lcl-regex/include
   ${tree-sitter_SOURCE_DIR}/lib/include
   ${WEFT_TS_PARSER_INCLUDES}
   ${CMAKE_CURRENT_BINARY_DIR}  # For embedded_font.h

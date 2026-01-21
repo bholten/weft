@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include <lcl.h>
+#include <lcl-regex.h>
 
 #include "annot_layer.h"
 #include "annot_store.h"
@@ -28,6 +29,9 @@
 #include "tree_sitter_hl.h"
 #include "tree_sitter_layer.h"
 #include "ts_lang_registry.h"
+
+// Embedded stdlib (generated at build time)
+#include "embedded_stdlib.h"
 
 // Conditional includes for embedded tree-sitter parsers
 #ifdef WEFT_EMBED_TS_LCL
@@ -1103,6 +1107,222 @@ static int c_buffer_list(lcl_interp *interp, int argc, lcl_value **argv,
   }
 
   *out = result;
+  return LCL_RC_OK;
+}
+
+// Helper struct for tracking action positions in buffer menu
+typedef struct {
+  size_t start;
+  size_t end;
+  char handler[256];
+} BufferMenuAction;
+
+// weft::buffer::menu -> insert buffer list with clickable actions at cursor
+static int c_buffer_menu(lcl_interp *interp, int argc, lcl_value **argv,
+                         lcl_value **out) {
+  (void)argc;
+  (void)argv;
+
+  LclHost *host = lcl_interp_get_user_data(interp);
+  if (!host || !host->buffer_manager || !host->current_buffer ||
+      !host->current_editor) {
+    lcl_set_error(interp, "no buffer/editor context");
+    return LCL_RC_ERR;
+  }
+
+  BufferManager *bm = host->buffer_manager;
+  if (bm->count == 0) {
+    *out = lcl_string_new("No buffers open");
+    return LCL_RC_OK;
+  }
+
+  // Build menu text and track action positions
+  // Max actions: 3 per buffer (Close, Attach, Save) * 64 buffers
+  BufferMenuAction actions[192];
+  size_t action_count = 0;
+
+  char menu[8192];
+  size_t pos = 0;
+
+  pos += snprintf(menu + pos, sizeof(menu) - pos,
+                  ";; Buffers (middle-click to execute)\n");
+
+  for (size_t i = 0; i < bm->count && pos < sizeof(menu) - 512; i++) {
+    Buffer *buf = bm->buffers[i];
+
+    // Get display name
+    const char *filepath = buf->file_path;
+    const char *display_name = filepath ? filepath : "[untitled]";
+    if (filepath) {
+      const char *last_slash = strrchr(filepath, '/');
+      if (last_slash) {
+        display_name = last_slash + 1;
+      }
+    }
+
+    // Buffer ID and name
+    size_t line_start = pos;
+    pos += snprintf(menu + pos, sizeof(menu) - pos, "[B%u] %s%s  ",
+                    buf->id, display_name, buf->modified ? " *" : "");
+
+    // [Close] action
+    if (action_count < 192) {
+      size_t action_start = pos;
+      pos += snprintf(menu + pos, sizeof(menu) - pos, "[Close]");
+      actions[action_count].start = action_start;
+      actions[action_count].end = pos;
+      snprintf(actions[action_count].handler, sizeof(actions[0].handler),
+               "weft::buffer::close %u\nweft::interact::handled", buf->id);
+      action_count++;
+    }
+
+    pos += snprintf(menu + pos, sizeof(menu) - pos, " ");
+
+    // [Attach] action (for REPL attachment)
+    if (action_count < 192) {
+      size_t action_start = pos;
+      pos += snprintf(menu + pos, sizeof(menu) - pos, "[Attach]");
+      actions[action_count].start = action_start;
+      actions[action_count].end = pos;
+      snprintf(actions[action_count].handler, sizeof(actions[0].handler),
+               "weft::repl::attach %u\nweft::interact::handled", buf->id);
+      action_count++;
+    }
+
+    // [Save] action (only if modified)
+    if (buf->modified) {
+      pos += snprintf(menu + pos, sizeof(menu) - pos, " ");
+      if (action_count < 192) {
+        size_t action_start = pos;
+        pos += snprintf(menu + pos, sizeof(menu) - pos, "[Save]");
+        actions[action_count].start = action_start;
+        actions[action_count].end = pos;
+        snprintf(actions[action_count].handler, sizeof(actions[0].handler),
+                 "weft::buffer::save %u\nweft::interact::handled", buf->id);
+        action_count++;
+      }
+    }
+
+    pos += snprintf(menu + pos, sizeof(menu) - pos, "\n");
+    (void)line_start; // Unused for now
+  }
+
+  // Insert text at cursor
+  size_t cursor = editor_get_cursor_pos(host->current_editor);
+  document_insert(host->current_buffer->document, cursor, menu, strlen(menu));
+
+  // Add annotations for each action
+  for (size_t i = 0; i < action_count; i++) {
+    const char *keys[] = {"action:on_middle_click", "style:fg"};
+    const char *vals[] = {actions[i].handler, "#88AAFF"};
+    annot_store_add(host->current_buffer->annots, cursor + actions[i].start,
+                    cursor + actions[i].end, "action", keys, vals, 2);
+  }
+
+  // Move cursor to end of inserted text
+  editor_set_cursor_pos(host->current_editor, cursor + strlen(menu));
+
+  *out = lcl_int_new((long)bm->count);
+  return LCL_RC_OK;
+}
+
+// weft::buffer::close id -> close buffer by ID (closes pane containing it)
+static int c_buffer_close(lcl_interp *interp, int argc, lcl_value **argv,
+                          lcl_value **out) {
+  if (argc < 1) {
+    lcl_set_error(interp, "buffer::close requires id");
+    return LCL_RC_ERR;
+  }
+
+  LclHost *host = lcl_interp_get_user_data(interp);
+  if (!host || !host->buffer_manager || !host->layout_root_ptr) {
+    lcl_set_error(interp, "no buffer manager context");
+    return LCL_RC_ERR;
+  }
+
+  long id;
+  if (lcl_value_to_int(argv[0], &id) != LCL_OK || id <= 0) {
+    lcl_set_error(interp, "buffer::close: id must be a positive integer");
+    return LCL_RC_ERR;
+  }
+
+  Buffer *buf = buffer_manager_find_by_id(host->buffer_manager, (uint32_t)id);
+  if (!buf) {
+    lcl_set_error(interp, "buffer::close: no buffer with that id");
+    return LCL_RC_ERR;
+  }
+
+  // Find pane containing this buffer and close it
+  LayoutNode *root = *host->layout_root_ptr;
+  Pane *pane = layout_find_pane_with_buffer(root, buf);
+  if (!pane) {
+    // Buffer exists but isn't displayed - just close the buffer
+    buffer_manager_close(host->buffer_manager, buf);
+    *out = lcl_int_new(1);
+    return LCL_RC_OK;
+  }
+
+  // Find next pane to focus
+  Pane *next = layout_next_pane(root, pane);
+  if (next == pane) {
+    next = NULL;
+  }
+
+  // Close the pane
+  LayoutNode *new_root = layout_close_pane(root, pane);
+
+  if (new_root) {
+    *host->layout_root_ptr = new_root;
+    *host->focused_pane_ptr = next ? next : layout_first_pane(new_root);
+    recompute_layout_bounds(host);
+    *out = lcl_int_new(1);
+  } else {
+    // Last pane - don't close
+    *out = lcl_int_new(0);
+  }
+
+  return LCL_RC_OK;
+}
+
+// weft::buffer::save ?id? -> save buffer (by ID, or current if no arg)
+static int c_buffer_save(lcl_interp *interp, int argc, lcl_value **argv,
+                         lcl_value **out) {
+  LclHost *host = lcl_interp_get_user_data(interp);
+  if (!host || !host->buffer_manager) {
+    lcl_set_error(interp, "no buffer manager context");
+    return LCL_RC_ERR;
+  }
+
+  Buffer *buf = NULL;
+
+  if (argc >= 1) {
+    // Save by ID
+    long id;
+    if (lcl_value_to_int(argv[0], &id) != LCL_OK || id <= 0) {
+      lcl_set_error(interp, "buffer::save: id must be a positive integer");
+      return LCL_RC_ERR;
+    }
+    buf = buffer_manager_find_by_id(host->buffer_manager, (uint32_t)id);
+    if (!buf) {
+      lcl_set_error(interp, "buffer::save: no buffer with that id");
+      return LCL_RC_ERR;
+    }
+  } else {
+    // Save current buffer
+    buf = get_effective_doc_buffer(host);
+    if (!buf) {
+      lcl_set_error(interp, "no current buffer");
+      return LCL_RC_ERR;
+    }
+  }
+
+  if (!buf->file_path) {
+    lcl_set_error(interp, "buffer::save: buffer has no file path");
+    return LCL_RC_ERR;
+  }
+
+  bool success = buffer_save(buf);
+  *out = lcl_int_new(success ? 1 : 0);
   return LCL_RC_OK;
 }
 
@@ -3696,6 +3916,12 @@ static void register_weft_bindings(lcl_interp *interp) {
              lcl_c_proc_new("weft::buffer::open-output", c_buffer_open_output));
   lcl_ns_def(buffer_ns, "open-at",
              lcl_c_proc_new("weft::buffer::open-at", c_buffer_open_at));
+  lcl_ns_def(buffer_ns, "menu",
+             lcl_c_proc_new("weft::buffer::menu", c_buffer_menu));
+  lcl_ns_def(buffer_ns, "close",
+             lcl_c_proc_new("weft::buffer::close", c_buffer_close));
+  lcl_ns_def(buffer_ns, "save",
+             lcl_c_proc_new("weft::buffer::save", c_buffer_save));
 
   // Create weft::pane namespace for pane operations
   lcl_value *pane_ns = lcl_ns_new("pane");
@@ -3817,6 +4043,9 @@ LclHost *lcl_host_new(void) {
     free(host);
     return NULL;
   }
+
+  // Register optional Lcl packages
+  lcl_register_regex(host->interp);
 
   // Initialize registered layers array
   host->registered_layers = calloc(INITIAL_LAYER_CAP, sizeof(RegisteredLayer));
@@ -3985,6 +4214,22 @@ LclHost *lcl_host_new(void) {
 
   // Register Weft-specific bindings
   register_weft_bindings(host->interp);
+
+  // Load embedded stdlib (defines common aliases like upper, lower, etc.)
+#ifdef EMBEDDED_STDLIB_AVAILABLE
+  {
+    lcl_value *result = NULL;
+    int rc = lcl_eval_string(host->interp, embedded_stdlib, &result);
+    if (result) {
+      lcl_ref_dec(result);
+    }
+    if (rc != LCL_RC_OK && rc != LCL_RC_RETURN) {
+      const char *error_msg = lcl_interp_error_msg(host->interp);
+      fprintf(stderr, "Warning: Failed to load embedded stdlib: %s\n",
+              error_msg ? error_msg : "unknown error");
+    }
+  }
+#endif
 
   // Initialize transform registry and built-in transforms
   transform_registry_init();

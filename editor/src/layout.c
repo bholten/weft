@@ -2,6 +2,8 @@
 
 #include <stdlib.h>
 
+#include "pane.h"
+
 LayoutNode *layout_leaf_new(Pane *pane) {
   if (!pane) {
     return NULL;
@@ -251,6 +253,25 @@ LayoutNode *layout_find_pane(LayoutNode *root, Pane *pane) {
     return result;
   }
   return layout_find_pane(root->split.second, pane);
+}
+
+Pane *layout_find_pane_with_buffer(LayoutNode *root, Buffer *buffer) {
+  if (!root || !buffer) {
+    return NULL;
+  }
+
+  if (root->type == LAYOUT_LEAF) {
+    if (root->pane && pane_get_buffer(root->pane) == buffer) {
+      return root->pane;
+    }
+    return NULL;
+  }
+
+  Pane *result = layout_find_pane_with_buffer(root->split.first, buffer);
+  if (result) {
+    return result;
+  }
+  return layout_find_pane_with_buffer(root->split.second, buffer);
 }
 
 void layout_for_each_pane(LayoutNode *node, LayoutPaneCallback cb, void *data) {

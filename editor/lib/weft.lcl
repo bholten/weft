@@ -1,0 +1,151 @@
+;; weft.lcl - Weft Standard Library
+;; This file is embedded in the binary and loaded at startup.
+;; It provides convenient aliases and utilities for text manipulation.
+
+;; === String Aliases ===
+;; These make common string operations more accessible at the top level.
+
+proc upper {s} { String::upper $s }
+proc lower {s} { String::lower $s }
+proc trim {s} { String::trim $s }
+proc split {s sep} { String::split $s $sep }
+proc join {lst sep} { String::join $lst $sep }
+proc replace {s old new} { String::replace $s $old $new }
+proc find {s sub} { String::find $s $sub }
+
+;; === String Conveniences ===
+;; Higher-level operations built on the primitives.
+
+;; Split text into lines
+proc lines {s} { String::split $s "\n" }
+
+;; Split text into words (whitespace-separated)
+proc words {s} { String::split [String::trim $s] " " }
+
+;; Check if text contains a substring
+proc contains? {s sub} { != [String::find $s $sub] -1 }
+
+;; Check if text starts with a prefix
+proc starts-with? {s prefix} {
+  let plen [len $prefix]
+  if [> $plen [len $s]] { return 0 }
+  == [String::range $s 0 $plen] $prefix
+}
+
+;; Check if text ends with a suffix
+proc ends-with? {s suffix} {
+  let slen [len $suffix]
+  let tlen [len $s]
+  if [> $slen $tlen] { return 0 }
+  == [String::range $s [- $tlen $slen] $tlen] $suffix
+}
+
+;; Concatenate strings (variadic-ish via list)
+proc concat-all {lst} { String::join $lst "" }
+
+;; Repeat a string n times
+proc repeat {s n} {
+  var result ""
+  var i 0
+  while [< $i $n] {
+    set! result [str $result $s]
+    set! i [+ $i 1]
+  }
+  $result
+}
+
+;; Pad string on the left to reach target length
+proc pad-left {s width {char " "}} {
+  let slen [len $s]
+  if [>= $slen $width] { return $s }
+  str [repeat $char [- $width $slen]] $s
+}
+
+;; Pad string on the right to reach target length
+proc pad-right {s width {char " "}} {
+  let slen [len $s]
+  if [>= $slen $width] { return $s }
+  str $s [repeat $char [- $width $slen]]
+}
+
+;; === List Conveniences ===
+
+;; Get first element of list
+proc first {lst} { get $lst 0 }
+
+;; Get last element of list
+proc last {lst} { get $lst [- [len $lst] 1] }
+
+;; Get all but first element
+proc rest {lst} { List::slice $lst 1 [len $lst] }
+
+;; Get all but last element
+proc butlast {lst} { List::slice $lst 0 [- [len $lst] 1] }
+
+;; Take first n elements
+proc take {lst n} { List::slice $lst 0 $n }
+
+;; Drop first n elements
+proc drop {lst n} { List::slice $lst $n [len $lst] }
+
+;; === Numeric Conveniences ===
+
+;; Clamp a value to a range
+proc clamp {val min max} {
+  if [< $val $min] { return $min }
+  if [> $val $max] { return $max }
+  $val
+}
+
+;; Absolute value
+proc abs {n} {
+  if [< $n 0] { - 0 $n } { $n }
+}
+
+;; Minimum of two values
+proc min {a b} {
+  if [< $a $b] { $a } { $b }
+}
+
+;; Maximum of two values
+proc max {a b} {
+  if [> $a $b] { $a } { $b }
+}
+
+;; === Regex Conveniences ===
+;; Uses POSIX Extended Regular Expressions (ERE).
+;; Pattern matches anywhere in string (use ^...$ for full match).
+
+;; Check if string matches a regex pattern
+;; Returns 1 if matched, 0 if not
+proc match? {pattern s} { regex::match $pattern $s }
+
+;; Check if string matches any pattern in a list
+proc matches-any? {patterns s} {
+  foreach p $patterns {
+    if [regex::match $p $s] { return 1 }
+  }
+  0
+}
+
+;; Filter list to items matching a pattern
+proc filter-match {pattern lst} {
+  var result {}
+  foreach item $lst {
+    if [regex::match $pattern $item] {
+      set! result [List::push $result $item]
+    }
+  }
+  $result
+}
+
+;; Filter list to items NOT matching a pattern
+proc filter-reject {pattern lst} {
+  var result {}
+  foreach item $lst {
+    if [! [regex::match $pattern $item]] {
+      set! result [List::push $result $item]
+    }
+  }
+  $result
+}
