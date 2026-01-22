@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "annot_persist.h"
 #include "annot_store.h"
 #include "document.h"
 
@@ -16,6 +17,14 @@ typedef struct Buffer {
   char *file_path;    // Owned, NULL if untitled
   bool modified;      // Has unsaved changes
   int ref_count;      // Reference count for shared views
+
+  // Persistent document ID (for annotation storage)
+  char doc_id[DOC_ID_LEN]; // UUID string, empty if no persistence
+
+  // Orphaned annotations (failed to re-anchor after document changes)
+  PersistedAnnot *orphaned_annots;
+  size_t orphaned_count;
+  size_t orphaned_capacity;
 } Buffer;
 
 // BufferManager: manages all open buffers
@@ -57,5 +66,41 @@ void buffer_set_modified(Buffer *buf, bool modified);
 
 // Get document revision (from annotation store, used for cache invalidation)
 uint64_t buffer_get_doc_rev(const Buffer *buf);
+
+// === Annotation Persistence ===
+
+// Get the persistent document ID for a buffer (creates one if needed)
+// reg: Document registry to use for ID lookup/creation
+// Returns pointer to buffer's doc_id (do not free), or NULL on error
+const char *buffer_get_doc_id(Buffer *buf, DocRegistry *reg);
+
+// Save annotations to persistent storage
+// Returns true on success
+bool buffer_save_annotations(Buffer *buf, DocRegistry *reg,
+                             const char *data_dir,
+                             const char *const *persistent_layers,
+                             size_t persistent_layer_count);
+
+// Load annotations from persistent storage
+// Returns number of annotations loaded (0 if none or error)
+size_t buffer_load_annotations(Buffer *buf, DocRegistry *reg,
+                               const char *data_dir);
+
+// Get orphaned annotation count
+size_t buffer_orphan_count(const Buffer *buf);
+
+// Get orphaned annotation by index (returns NULL if out of range)
+const PersistedAnnot *buffer_get_orphan(const Buffer *buf, size_t index);
+
+// Resolve an orphaned annotation to a new position
+// Returns annotation ID on success, 0 on failure
+uint32_t buffer_resolve_orphan(Buffer *buf, size_t index, size_t start,
+                               size_t end);
+
+// Discard an orphaned annotation
+void buffer_discard_orphan(Buffer *buf, size_t index);
+
+// Clear all orphaned annotations
+void buffer_clear_orphans(Buffer *buf);
 
 #endif // WEFT_BUFFER_H

@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 // Forward declarations
 typedef struct lcl_interp lcl_interp;
@@ -14,6 +15,7 @@ typedef struct LayoutNode LayoutNode;
 typedef struct Pane Pane;
 typedef struct Patch Patch;
 typedef struct TSLangRegistry TSLangRegistry;
+typedef struct DocRegistry DocRegistry;
 
 // Interaction type enum (mirrors InteractType from interaction.h)
 typedef enum {
@@ -164,6 +166,17 @@ typedef struct LclHost {
   // Config directory path
   char *config_dir;
 
+  // Data directory path for persistence (~/.local/share/weft)
+  char *data_dir;
+
+  // Document registry for annotation persistence
+  DocRegistry *doc_registry;
+
+  // Persistent layers (NULL = default behavior)
+  char **persistent_layers;
+  size_t persistent_layer_count;
+  size_t persistent_layer_cap;
+
   // Pending patch for transform preview
   Patch *pending_patch;
   Buffer *patch_target_buffer;
@@ -184,6 +197,18 @@ typedef struct LclHost {
     size_t end;           // Range end
     bool active;          // Whether a prompt is pending
   } transform_prompt;
+
+  // Annotation editor state
+  struct {
+    Buffer *target_buffer;    // Buffer whose annotations we're editing
+    uint32_t *original_ids;   // Array of original annotation IDs
+    size_t original_count;    // Count of original IDs
+    uint64_t doc_rev;         // Document revision at edit start
+    size_t query_start;       // Query start position
+    size_t query_end;         // Query end position (if range)
+    bool is_range;            // true = edit-range, false = edit-at
+    bool active;              // Whether an edit session is active
+  } annot_edit;
 } LclHost;
 
 // === Lifecycle ===
@@ -406,5 +431,29 @@ Patch *lcl_host_submit_transform_prompt(LclHost *host, const char *input);
 
 // Cancel the pending transform prompt
 void lcl_host_cancel_transform_prompt(LclHost *host);
+
+// === Annotation Persistence ===
+
+// Get the data directory path
+const char *lcl_host_get_data_dir(LclHost *host);
+
+// Get the document registry
+DocRegistry *lcl_host_get_doc_registry(LclHost *host);
+
+// Mark a layer as persistent (saved to disk)
+void lcl_host_set_layer_persistent(LclHost *host, const char *layer);
+
+// Mark a layer as ephemeral (not saved)
+void lcl_host_set_layer_ephemeral(LclHost *host, const char *layer);
+
+// Check if a layer is persistent
+bool lcl_host_is_layer_persistent(LclHost *host, const char *layer);
+
+// Get the list of persistent layers (returns NULL if using defaults)
+const char *const *lcl_host_get_persistent_layers(LclHost *host,
+                                                   size_t *out_count);
+
+// Save document registry to disk
+bool lcl_host_save_registry(LclHost *host);
 
 #endif // WEFT_LCL_HOST_H

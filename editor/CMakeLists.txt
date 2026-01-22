@@ -15,6 +15,7 @@ set(WEFT_SOURCES
   src/renderer.c
   src/input.c
   src/annot_store.c
+  src/annot_persist.c
   src/buffer.c
   src/editor.c
   src/pane.c

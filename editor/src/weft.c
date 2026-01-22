@@ -10,6 +10,7 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
 
+#include "annot_persist.h"
 #include "annot_store.h"
 #include "buffer.h"
 #include "document.h"
@@ -194,70 +195,6 @@ SDL_AppResult SDL_AppInit(void **app_state, int argc, char **argv) {
   // ~/.config/weft/init.lcl This allows users to customize the behavior without
   // recompiling.
 
-  // Test Lcl evaluation
-  const char *error_msg = NULL;
-  printf("=== Lcl Integration Test ===\n");
-  if (lcl_host_eval(ctx->app.lcl, "puts [weft::version]", &error_msg)) {
-    printf("Lcl: weft::version evaluated successfully\n");
-  } else {
-    printf("Lcl error: %s\n", error_msg ? error_msg : "unknown");
-  }
-
-  // Test document bindings
-  if (lcl_host_eval(ctx->app.lcl,
-                    "puts (str \"Doc length: \" [weft::doc::length])",
-                    &error_msg)) {
-    printf("Lcl: doc::length evaluated successfully\n");
-  } else {
-    printf("Lcl error: %s\n", error_msg ? error_msg : "unknown");
-  }
-
-  if (lcl_host_eval(ctx->app.lcl,
-                    "puts (str \"Line count: \" [weft::doc::line-count])",
-                    &error_msg)) {
-    printf("Lcl: doc::line-count evaluated successfully\n");
-  } else {
-    printf("Lcl error: %s\n", error_msg ? error_msg : "unknown");
-  }
-
-  // Test annotation bindings
-  if (lcl_host_eval(
-          ctx->app.lcl,
-          "let id [weft::annot::add 0 5 \"test\" \"style:fg\" \"magenta\"]",
-          &error_msg)) {
-    printf("Lcl: annot::add evaluated successfully\n");
-  } else {
-    printf("Lcl error: %s\n", error_msg ? error_msg : "unknown");
-  }
-
-  if (lcl_host_eval(ctx->app.lcl,
-                    "puts (str \"Annots at 2: \" [weft::annot::at 2])",
-                    &error_msg)) {
-    printf("Lcl: annot::at evaluated successfully\n");
-  } else {
-    printf("Lcl error: %s\n", error_msg ? error_msg : "unknown");
-  }
-
-  if (lcl_host_eval(ctx->app.lcl,
-                    "puts (str \"Annot info: \" [weft::annot::get $id])",
-                    &error_msg)) {
-    printf("Lcl: annot::get evaluated successfully\n");
-  } else {
-    printf("Lcl error: %s\n", error_msg ? error_msg : "unknown");
-  }
-
-  // Test layer execution with a simple inline script
-  const char *demo_layer =
-      ";; Simple demo layer - highlight 'Hello' in green\n"
-      "weft::annot::add 0 5 \"demo\" \"style:fg\" \"#00FF00\"\n";
-
-  if (lcl_host_run_layer(ctx->app.lcl, "demo", demo_layer, &error_msg)) {
-    printf("Lcl: demo layer executed successfully\n");
-  } else {
-    printf("Lcl layer error: %s\n", error_msg ? error_msg : "unknown");
-  }
-  printf("=== Lcl Test Complete ===\n\n");
-
   // Create initial pane with the buffer (uses char_width, line_height from
   // earlier)
   Pane *initial_pane = pane_new(initial_buffer, char_width, line_height);
@@ -354,6 +291,14 @@ static void open_file_callback(void *userdata, const char *const *filelist,
     Buffer *buf = pane_get_buffer(data->target_pane);
     if (buf) {
       buffer_load(buf, filelist[0]);
+
+      // Load persisted annotations for this file
+      LclHost *lcl = data->ctx->app.lcl;
+      DocRegistry *reg = lcl_host_get_doc_registry(lcl);
+      const char *data_dir = lcl_host_get_data_dir(lcl);
+      if (reg && data_dir) {
+        buffer_load_annotations(buf, reg, data_dir);
+      }
     }
   }
 
@@ -369,7 +314,19 @@ static void save_file_callback(void *userdata, const char *const *filelist,
   if (filelist && filelist[0]) {
     Buffer *buf = pane_get_buffer(data->target_pane);
     if (buf) {
-      buffer_save_as(buf, filelist[0]);
+      if (buffer_save_as(buf, filelist[0])) {
+        // Save annotations after successfully saving the file
+        LclHost *lcl = data->ctx->app.lcl;
+        DocRegistry *reg = lcl_host_get_doc_registry(lcl);
+        const char *data_dir = lcl_host_get_data_dir(lcl);
+        if (reg && data_dir) {
+          size_t layer_count = 0;
+          const char *const *layers =
+              lcl_host_get_persistent_layers(lcl, &layer_count);
+          buffer_save_annotations(buf, reg, data_dir, layers, layer_count);
+          doc_registry_save(reg);
+        }
+      }
     }
   }
 
@@ -413,7 +370,19 @@ static void handle_tag_command(AppContext *ctx, Pane *pane, TagCommand cmd) {
     Buffer *buf = pane_get_buffer(pane);
     if (buf) {
       if (buf->file_path) {
-        buffer_save(buf);
+        if (buffer_save(buf)) {
+          // Save annotations after successfully saving the file
+          LclHost *lcl = ctx->app.lcl;
+          DocRegistry *reg = lcl_host_get_doc_registry(lcl);
+          const char *data_dir = lcl_host_get_data_dir(lcl);
+          if (reg && data_dir) {
+            size_t layer_count = 0;
+            const char *const *layers =
+                lcl_host_get_persistent_layers(lcl, &layer_count);
+            buffer_save_annotations(buf, reg, data_dir, layers, layer_count);
+            doc_registry_save(reg);
+          }
+        }
       } else {
         // No path - fall through to SaveAs
         FileDialogData *data = calloc(1, sizeof(FileDialogData));

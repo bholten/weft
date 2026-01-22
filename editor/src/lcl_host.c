@@ -15,6 +15,7 @@
 #include <lcl-regex.h>
 
 #include "annot_layer.h"
+#include "annot_persist.h"
 #include "annot_store.h"
 #include "buffer.h"
 #include "document.h"
@@ -60,6 +61,7 @@ static int plumb_scan_buffer(Buffer *buf);
 static void recompute_layout_bounds(LclHost *host);
 static bool is_repl_buffer(const Buffer *buf);
 static Buffer *get_effective_doc_buffer(LclHost *host);
+static bool close_focused_pane(LclHost *host);
 
 // === Internal: Weft Bindings ===
 
@@ -512,6 +514,1126 @@ static int c_annot_clear_layer(lcl_interp *interp, int argc, lcl_value **argv,
 
   annot_store_clear_layer(buffer->annots, layer);
   *out = lcl_list_new();
+  return LCL_RC_OK;
+}
+
+// === Internal: Annotation Editor ===
+
+// Helper struct for parsing annotation blocks
+typedef struct {
+  uint32_t id;      // Annotation ID (0 = new)
+  bool is_new;      // true if id was "new"
+  size_t start;     // Start position
+  size_t end;       // End position
+  char *layer;      // Layer name (owned)
+  char **keys;      // Metadata keys (owned)
+  char **values;    // Metadata values (owned)
+  size_t meta_count;// Number of key/value pairs
+  bool valid;       // Parsing succeeded
+} AnnotEditBlock;
+
+// Free an AnnotEditBlock
+static void annot_edit_block_free(AnnotEditBlock *block) {
+  if (!block) {
+    return;
+  }
+  free(block->layer);
+  for (size_t i = 0; i < block->meta_count; i++) {
+    free(block->keys[i]);
+    free(block->values[i]);
+  }
+  free(block->keys);
+  free(block->values);
+  block->layer = NULL;
+  block->keys = NULL;
+  block->values = NULL;
+  block->meta_count = 0;
+}
+
+// Helper to escape a string for output (handles quotes)
+static char *escape_string(const char *s) {
+  if (!s) {
+    return strdup("");
+  }
+  size_t len = strlen(s);
+  size_t escaped_len = len;
+  for (size_t i = 0; i < len; i++) {
+    if (s[i] == '"' || s[i] == '\\') {
+      escaped_len++;
+    }
+  }
+  char *result = malloc(escaped_len + 1);
+  if (!result) {
+    return NULL;
+  }
+  size_t j = 0;
+  for (size_t i = 0; i < len; i++) {
+    if (s[i] == '"' || s[i] == '\\') {
+      result[j++] = '\\';
+    }
+    result[j++] = s[i];
+  }
+  result[j] = '\0';
+  return result;
+}
+
+// Helper to unescape a quoted string (modifies in place, returns new length)
+static size_t unescape_string(char *s, size_t len) {
+  size_t j = 0;
+  for (size_t i = 0; i < len; i++) {
+    if (s[i] == '\\' && i + 1 < len) {
+      i++;
+    }
+    s[j++] = s[i];
+  }
+  s[j] = '\0';
+  return j;
+}
+
+// Helper to clear annotation editor state
+static void annot_edit_clear(LclHost *host) {
+  if (!host) {
+    return;
+  }
+  host->annot_edit.target_buffer = NULL;
+  free(host->annot_edit.original_ids);
+  host->annot_edit.original_ids = NULL;
+  host->annot_edit.original_count = 0;
+  host->annot_edit.doc_rev = 0;
+  host->annot_edit.query_start = 0;
+  host->annot_edit.query_end = 0;
+  host->annot_edit.is_range = false;
+  host->annot_edit.active = false;
+}
+
+// Generate annotation editor content for a list of annotation IDs
+static char *generate_annot_editor_content(Buffer *buffer, uint32_t *ids,
+                                           size_t count, size_t query_start,
+                                           size_t query_end, bool is_range) {
+  AnnotStore *store = buffer->annots;
+
+  // Calculate buffer size - start with generous estimate
+  size_t cap = 4096 + count * 1024;
+  char *output = malloc(cap);
+  if (!output) {
+    return NULL;
+  }
+  size_t len = 0;
+
+  // Header
+  const char *path = buffer->file_path ? buffer->file_path : "(untitled)";
+  len += snprintf(output + len, cap - len,
+                  ";; Annotation Editor - B%u (%s)\n", buffer->id, path);
+
+  if (is_range) {
+    len += snprintf(output + len, cap - len,
+                    ";; Scope: range [%zu, %zu)\n", query_start, query_end);
+  } else {
+    len += snprintf(output + len, cap - len,
+                    ";; Scope: position %zu\n", query_start);
+  }
+
+  uint64_t rev = annot_store_get_doc_rev(store);
+  len += snprintf(output + len, cap - len,
+                  ";; Revision: %lu\n", (unsigned long)rev);
+  len += snprintf(output + len, cap - len,
+                  "[weft::annot::apply-edit]  [weft::annot::cancel-edit]\n\n");
+
+  // Output each annotation as a block
+  for (size_t i = 0; i < count; i++) {
+    uint32_t id = ids[i];
+    const AnnotRecord *rec = annot_store_get(store, id);
+    if (!rec) {
+      continue;
+    }
+
+    // Get span positions
+    size_t start_pos = 0, end_pos = 0;
+    annot_store_get_span(store, id, &start_pos, &end_pos);
+
+    // Ensure we have space
+    size_t needed = len + 512 + (rec->meta_count * 256);
+    if (needed > cap) {
+      cap = needed * 2;
+      char *new_output = realloc(output, cap);
+      if (!new_output) {
+        free(output);
+        return NULL;
+      }
+      output = new_output;
+    }
+
+    // Escape layer name
+    char *escaped_layer = escape_string(rec->layer);
+    if (!escaped_layer) {
+      free(output);
+      return NULL;
+    }
+
+    len += snprintf(output + len, cap - len,
+                    "{id %u start %zu end %zu layer \"%s\"",
+                    id, start_pos, end_pos, escaped_layer);
+    free(escaped_layer);
+
+    // Metadata (skip prov:* keys, they're auto-added)
+    for (size_t j = 0; j < rec->meta_count; j++) {
+      if (strncmp(rec->keys[j], "prov:", 5) == 0) {
+        continue;
+      }
+
+      // Ensure space
+      if (len + 256 > cap) {
+        cap *= 2;
+        char *new_output = realloc(output, cap);
+        if (!new_output) {
+          free(output);
+          return NULL;
+        }
+        output = new_output;
+      }
+
+      char *escaped_val = escape_string(rec->values[j]);
+      if (!escaped_val) {
+        free(output);
+        return NULL;
+      }
+
+      len += snprintf(output + len, cap - len,
+                      "\n  %s \"%s\"", rec->keys[j], escaped_val);
+      free(escaped_val);
+    }
+
+    len += snprintf(output + len, cap - len, "}\n\n");
+  }
+
+  // Footer with help text
+  len += snprintf(output + len, cap - len,
+                  ";; To add: {id new start X end Y layer \"name\" key \"val\"}\n"
+                  ";; To delete: remove the block entirely\n"
+                  ";; Note: start/end positions are read-only in this version\n");
+
+  return output;
+}
+
+// Parse a single annotation block from text
+// Returns true on success
+static bool parse_annot_block(const char *text, size_t text_len,
+                              AnnotEditBlock *out) {
+  memset(out, 0, sizeof(*out));
+  out->valid = false;
+
+  // Skip leading whitespace and find '{'
+  size_t pos = 0;
+  while (pos < text_len && (text[pos] == ' ' || text[pos] == '\t' ||
+                            text[pos] == '\n' || text[pos] == '\r')) {
+    pos++;
+  }
+
+  if (pos >= text_len || text[pos] != '{') {
+    return false;
+  }
+  pos++; // Skip '{'
+
+  // Temporary storage for key-value pairs
+  char *keys[64];
+  char *values[64];
+  size_t kv_count = 0;
+
+  bool has_id = false, has_start = false, has_end = false, has_layer = false;
+
+  // Parse tokens until '}'
+  while (pos < text_len && text[pos] != '}') {
+    // Skip whitespace
+    while (pos < text_len && (text[pos] == ' ' || text[pos] == '\t' ||
+                              text[pos] == '\n' || text[pos] == '\r')) {
+      pos++;
+    }
+
+    if (pos >= text_len || text[pos] == '}') {
+      break;
+    }
+
+    // Read key (non-quoted token)
+    size_t key_start = pos;
+    while (pos < text_len && text[pos] != ' ' && text[pos] != '\t' &&
+           text[pos] != '\n' && text[pos] != '}' && text[pos] != '"') {
+      pos++;
+    }
+    size_t key_len = pos - key_start;
+
+    if (key_len == 0) {
+      // Maybe hit a quote or closing brace
+      if (text[pos] == '}') {
+        break;
+      }
+      pos++;
+      continue;
+    }
+
+    char *key = malloc(key_len + 1);
+    if (!key) {
+      goto cleanup_error;
+    }
+    memcpy(key, text + key_start, key_len);
+    key[key_len] = '\0';
+
+    // Skip whitespace
+    while (pos < text_len && (text[pos] == ' ' || text[pos] == '\t' ||
+                              text[pos] == '\n' || text[pos] == '\r')) {
+      pos++;
+    }
+
+    // Read value (either quoted string or plain token)
+    char *value = NULL;
+
+    if (pos < text_len && text[pos] == '"') {
+      // Quoted string
+      pos++; // Skip opening quote
+      size_t val_start = pos;
+
+      // Find closing quote, handling escapes
+      while (pos < text_len) {
+        if (text[pos] == '\\' && pos + 1 < text_len) {
+          pos += 2;
+        } else if (text[pos] == '"') {
+          break;
+        } else {
+          pos++;
+        }
+      }
+
+      size_t val_len = pos - val_start;
+      value = malloc(val_len + 1);
+      if (!value) {
+        free(key);
+        goto cleanup_error;
+      }
+      memcpy(value, text + val_start, val_len);
+      value[val_len] = '\0';
+      unescape_string(value, val_len);
+
+      if (pos < text_len && text[pos] == '"') {
+        pos++; // Skip closing quote
+      }
+    } else {
+      // Plain token
+      size_t val_start = pos;
+      while (pos < text_len && text[pos] != ' ' && text[pos] != '\t' &&
+             text[pos] != '\n' && text[pos] != '}') {
+        pos++;
+      }
+      size_t val_len = pos - val_start;
+
+      value = malloc(val_len + 1);
+      if (!value) {
+        free(key);
+        goto cleanup_error;
+      }
+      memcpy(value, text + val_start, val_len);
+      value[val_len] = '\0';
+    }
+
+    // Handle special keys
+    if (strcmp(key, "id") == 0) {
+      if (strcmp(value, "new") == 0) {
+        out->is_new = true;
+        out->id = 0;
+      } else {
+        out->id = (uint32_t)strtoul(value, NULL, 10);
+        out->is_new = false;
+      }
+      has_id = true;
+      free(key);
+      free(value);
+    } else if (strcmp(key, "start") == 0) {
+      out->start = (size_t)strtoul(value, NULL, 10);
+      has_start = true;
+      free(key);
+      free(value);
+    } else if (strcmp(key, "end") == 0) {
+      out->end = (size_t)strtoul(value, NULL, 10);
+      has_end = true;
+      free(key);
+      free(value);
+    } else if (strcmp(key, "layer") == 0) {
+      out->layer = value;
+      has_layer = true;
+      free(key);
+    } else {
+      // Regular metadata key-value
+      if (kv_count < 64) {
+        keys[kv_count] = key;
+        values[kv_count] = value;
+        kv_count++;
+      } else {
+        free(key);
+        free(value);
+      }
+    }
+  }
+
+  // Validate required fields
+  if (!has_id || !has_start || !has_end || !has_layer) {
+    goto cleanup_error;
+  }
+
+  // Copy metadata to output
+  if (kv_count > 0) {
+    out->keys = malloc(kv_count * sizeof(char *));
+    out->values = malloc(kv_count * sizeof(char *));
+    if (!out->keys || !out->values) {
+      goto cleanup_error;
+    }
+    for (size_t i = 0; i < kv_count; i++) {
+      out->keys[i] = keys[i];
+      out->values[i] = values[i];
+    }
+    out->meta_count = kv_count;
+  }
+
+  out->valid = true;
+  return true;
+
+cleanup_error:
+  free(out->layer);
+  out->layer = NULL;
+  for (size_t i = 0; i < kv_count; i++) {
+    free(keys[i]);
+    free(values[i]);
+  }
+  return false;
+}
+
+// Parse all annotation blocks from editor buffer content
+// Returns array of AnnotEditBlock, count in out_count
+// Caller must free each block with annot_edit_block_free and free the array
+static AnnotEditBlock *parse_annot_blocks(const char *content, size_t content_len,
+                                          size_t *out_count) {
+  *out_count = 0;
+
+  // Count potential blocks
+  size_t block_cap = 16;
+  AnnotEditBlock *blocks = calloc(block_cap, sizeof(AnnotEditBlock));
+  if (!blocks) {
+    return NULL;
+  }
+
+  size_t pos = 0;
+  while (pos < content_len) {
+    // Skip to next '{'
+    while (pos < content_len && content[pos] != '{') {
+      // Skip comment lines
+      if (content[pos] == ';' && pos + 1 < content_len && content[pos + 1] == ';') {
+        while (pos < content_len && content[pos] != '\n') {
+          pos++;
+        }
+      }
+      pos++;
+    }
+
+    if (pos >= content_len) {
+      break;
+    }
+
+    // Find matching '}'
+    size_t block_start = pos;
+    int depth = 1;
+    pos++; // Skip opening '{'
+    bool in_string = false;
+
+    while (pos < content_len && depth > 0) {
+      if (content[pos] == '\\' && pos + 1 < content_len && in_string) {
+        pos += 2;
+        continue;
+      }
+      if (content[pos] == '"') {
+        in_string = !in_string;
+      } else if (!in_string) {
+        if (content[pos] == '{') {
+          depth++;
+        } else if (content[pos] == '}') {
+          depth--;
+        }
+      }
+      pos++;
+    }
+
+    if (depth != 0) {
+      // Unmatched braces
+      continue;
+    }
+
+    size_t block_len = pos - block_start;
+
+    // Parse this block
+    AnnotEditBlock block;
+    if (parse_annot_block(content + block_start, block_len, &block)) {
+      // Add to array
+      if (*out_count >= block_cap) {
+        block_cap *= 2;
+        AnnotEditBlock *new_blocks = realloc(blocks, block_cap * sizeof(AnnotEditBlock));
+        if (!new_blocks) {
+          annot_edit_block_free(&block);
+          for (size_t i = 0; i < *out_count; i++) {
+            annot_edit_block_free(&blocks[i]);
+          }
+          free(blocks);
+          return NULL;
+        }
+        blocks = new_blocks;
+      }
+      blocks[(*out_count)++] = block;
+    }
+  }
+
+  return blocks;
+}
+
+// weft::annot::edit-at ?pos? -> open annotation editor for annotations at position
+static int c_annot_edit_at(lcl_interp *interp, int argc, lcl_value **argv,
+                           lcl_value **out) {
+  LclHost *host = lcl_interp_get_user_data(interp);
+  Buffer *buffer = get_effective_doc_buffer(host);
+  if (!buffer) {
+    lcl_set_error(interp, "no buffer set");
+    return LCL_RC_ERR;
+  }
+
+  if (!host->buffer_manager || !host->layout_root_ptr) {
+    lcl_set_error(interp, "no buffer manager context");
+    return LCL_RC_ERR;
+  }
+
+  // Check if already editing
+  if (host->annot_edit.active) {
+    lcl_set_error(interp, "annotation edit already in progress");
+    return LCL_RC_ERR;
+  }
+
+  // Get position (default to cursor)
+  size_t pos = 0;
+  if (argc >= 1) {
+    long arg_pos;
+    if (lcl_value_to_int(argv[0], &arg_pos) != LCL_OK || arg_pos < 0) {
+      lcl_set_error(interp, "annot::edit-at: invalid position");
+      return LCL_RC_ERR;
+    }
+    pos = (size_t)arg_pos;
+  } else if (host->current_editor) {
+    pos = editor_get_cursor_pos(host->current_editor);
+  }
+
+  // Query annotations at position
+  AnnotQuery query = {0};
+  annot_store_at(buffer->annots, pos, NULL, &query);
+
+  // Store original IDs
+  uint32_t *original_ids = NULL;
+  if (query.count > 0) {
+    original_ids = malloc(query.count * sizeof(uint32_t));
+    if (!original_ids) {
+      annot_query_free(&query);
+      lcl_set_error(interp, "out of memory");
+      return LCL_RC_ERR;
+    }
+    memcpy(original_ids, query.ids, query.count * sizeof(uint32_t));
+  }
+  size_t original_count = query.count;
+
+  // Generate editor content
+  char *content = generate_annot_editor_content(buffer, query.ids, query.count,
+                                                 pos, pos, false);
+  annot_query_free(&query);
+
+  if (!content) {
+    free(original_ids);
+    lcl_set_error(interp, "failed to generate editor content");
+    return LCL_RC_ERR;
+  }
+
+  // Create editor buffer
+  Buffer *edit_buffer = buffer_manager_create(host->buffer_manager);
+  if (!edit_buffer) {
+    free(original_ids);
+    free(content);
+    lcl_set_error(interp, "failed to create buffer");
+    return LCL_RC_ERR;
+  }
+
+  document_insert(edit_buffer->document, 0, content, strlen(content));
+  free(content);
+
+  edit_buffer->file_path = strdup("*annot-edit*");
+
+  // Create pane
+  Pane *new_pane = pane_new(edit_buffer, host->char_width, host->line_height);
+  if (!new_pane) {
+    buffer_manager_close(host->buffer_manager, edit_buffer);
+    free(original_ids);
+    lcl_set_error(interp, "failed to create pane");
+    return LCL_RC_ERR;
+  }
+
+  // Apply viewlayer configuration
+  lcl_host_apply_viewlayers(host, new_pane);
+
+  // Split to show new pane
+  LayoutNode *root = *host->layout_root_ptr;
+  LayoutNode *new_split = layout_split_horizontal(root, new_pane);
+
+  if (new_split && !new_split->parent) {
+    *host->layout_root_ptr = new_split;
+  }
+
+  recompute_layout_bounds(host);
+
+  // Focus the new pane
+  if (host->focused_pane_ptr) {
+    *host->focused_pane_ptr = new_pane;
+  }
+
+  // Store state
+  host->annot_edit.target_buffer = buffer;
+  host->annot_edit.original_ids = original_ids;
+  host->annot_edit.original_count = original_count;
+  host->annot_edit.doc_rev = annot_store_get_doc_rev(buffer->annots);
+  host->annot_edit.query_start = pos;
+  host->annot_edit.query_end = pos;
+  host->annot_edit.is_range = false;
+  host->annot_edit.active = true;
+
+  *out = lcl_int_new((long)original_count);
+  return LCL_RC_OK;
+}
+
+// weft::annot::edit-range start end -> open annotation editor for range
+static int c_annot_edit_range(lcl_interp *interp, int argc, lcl_value **argv,
+                              lcl_value **out) {
+  LclHost *host = lcl_interp_get_user_data(interp);
+  Buffer *buffer = get_effective_doc_buffer(host);
+  if (!buffer) {
+    lcl_set_error(interp, "no buffer set");
+    return LCL_RC_ERR;
+  }
+
+  if (!host->buffer_manager || !host->layout_root_ptr) {
+    lcl_set_error(interp, "no buffer manager context");
+    return LCL_RC_ERR;
+  }
+
+  // Check if already editing
+  if (host->annot_edit.active) {
+    lcl_set_error(interp, "annotation edit already in progress");
+    return LCL_RC_ERR;
+  }
+
+  if (argc < 2) {
+    lcl_set_error(interp, "annot::edit-range requires start and end");
+    return LCL_RC_ERR;
+  }
+
+  long start, end;
+  if (lcl_value_to_int(argv[0], &start) != LCL_OK || start < 0) {
+    lcl_set_error(interp, "annot::edit-range: invalid start");
+    return LCL_RC_ERR;
+  }
+  if (lcl_value_to_int(argv[1], &end) != LCL_OK || end < 0) {
+    lcl_set_error(interp, "annot::edit-range: invalid end");
+    return LCL_RC_ERR;
+  }
+
+  // Query annotations in range
+  AnnotQuery query = {0};
+  annot_store_in_range(buffer->annots, (size_t)start, (size_t)end, NULL, &query);
+
+  // Store original IDs
+  uint32_t *original_ids = NULL;
+  if (query.count > 0) {
+    original_ids = malloc(query.count * sizeof(uint32_t));
+    if (!original_ids) {
+      annot_query_free(&query);
+      lcl_set_error(interp, "out of memory");
+      return LCL_RC_ERR;
+    }
+    memcpy(original_ids, query.ids, query.count * sizeof(uint32_t));
+  }
+  size_t original_count = query.count;
+
+  // Generate editor content
+  char *content = generate_annot_editor_content(buffer, query.ids, query.count,
+                                                 (size_t)start, (size_t)end, true);
+  annot_query_free(&query);
+
+  if (!content) {
+    free(original_ids);
+    lcl_set_error(interp, "failed to generate editor content");
+    return LCL_RC_ERR;
+  }
+
+  // Create editor buffer
+  Buffer *edit_buffer = buffer_manager_create(host->buffer_manager);
+  if (!edit_buffer) {
+    free(original_ids);
+    free(content);
+    lcl_set_error(interp, "failed to create buffer");
+    return LCL_RC_ERR;
+  }
+
+  document_insert(edit_buffer->document, 0, content, strlen(content));
+  free(content);
+
+  edit_buffer->file_path = strdup("*annot-edit*");
+
+  // Create pane
+  Pane *new_pane = pane_new(edit_buffer, host->char_width, host->line_height);
+  if (!new_pane) {
+    buffer_manager_close(host->buffer_manager, edit_buffer);
+    free(original_ids);
+    lcl_set_error(interp, "failed to create pane");
+    return LCL_RC_ERR;
+  }
+
+  // Apply viewlayer configuration
+  lcl_host_apply_viewlayers(host, new_pane);
+
+  // Split to show new pane
+  LayoutNode *root = *host->layout_root_ptr;
+  LayoutNode *new_split = layout_split_horizontal(root, new_pane);
+
+  if (new_split && !new_split->parent) {
+    *host->layout_root_ptr = new_split;
+  }
+
+  recompute_layout_bounds(host);
+
+  // Focus the new pane
+  if (host->focused_pane_ptr) {
+    *host->focused_pane_ptr = new_pane;
+  }
+
+  // Store state
+  host->annot_edit.target_buffer = buffer;
+  host->annot_edit.original_ids = original_ids;
+  host->annot_edit.original_count = original_count;
+  host->annot_edit.doc_rev = annot_store_get_doc_rev(buffer->annots);
+  host->annot_edit.query_start = (size_t)start;
+  host->annot_edit.query_end = (size_t)end;
+  host->annot_edit.is_range = true;
+  host->annot_edit.active = true;
+
+  *out = lcl_int_new((long)original_count);
+  return LCL_RC_OK;
+}
+
+// weft::annot::apply-edit -> apply pending annotation edits
+static int c_annot_apply_edit(lcl_interp *interp, int argc, lcl_value **argv,
+                              lcl_value **out) {
+  (void)argc;
+  (void)argv;
+
+  LclHost *host = lcl_interp_get_user_data(interp);
+  if (!host) {
+    lcl_set_error(interp, "no host context");
+    return LCL_RC_ERR;
+  }
+
+  if (!host->annot_edit.active) {
+    lcl_set_error(interp, "no annotation edit in progress");
+    return LCL_RC_ERR;
+  }
+
+  Buffer *target = host->annot_edit.target_buffer;
+  if (!target) {
+    annot_edit_clear(host);
+    lcl_set_error(interp, "target buffer no longer exists");
+    return LCL_RC_ERR;
+  }
+
+  // Check staleness
+  uint64_t current_rev = annot_store_get_doc_rev(target->annots);
+  if (current_rev != host->annot_edit.doc_rev) {
+    lcl_set_error(interp, "document modified since edit started - refusing to apply");
+    return LCL_RC_ERR;
+  }
+
+  // Get the editor buffer content
+  Buffer *edit_buffer = host->current_buffer;
+  if (!edit_buffer || !edit_buffer->file_path ||
+      strcmp(edit_buffer->file_path, "*annot-edit*") != 0) {
+    // Try to find it
+    edit_buffer = NULL;
+    if (host->focused_pane_ptr && *host->focused_pane_ptr) {
+      Editor *editor = (*host->focused_pane_ptr)->view;
+      if (editor) {
+        edit_buffer = editor_get_buffer(editor);
+      }
+    }
+    if (!edit_buffer || !edit_buffer->file_path ||
+        strcmp(edit_buffer->file_path, "*annot-edit*") != 0) {
+      annot_edit_clear(host);
+      lcl_set_error(interp, "annotation editor buffer not found");
+      return LCL_RC_ERR;
+    }
+  }
+
+  Document *doc = edit_buffer->document;
+  size_t content_len = document_length(doc);
+  char *content = malloc(content_len + 1);
+  if (!content) {
+    lcl_set_error(interp, "out of memory");
+    return LCL_RC_ERR;
+  }
+  document_get_text(doc, 0, content, content_len);
+  content[content_len] = '\0';
+
+  // Parse blocks from editor content
+  size_t block_count = 0;
+  AnnotEditBlock *blocks = parse_annot_blocks(content, content_len, &block_count);
+  free(content);
+
+  if (!blocks && block_count > 0) {
+    lcl_set_error(interp, "failed to parse annotation blocks");
+    return LCL_RC_ERR;
+  }
+
+  // Build set of IDs found in the editor
+  bool *id_found = NULL;
+  if (host->annot_edit.original_count > 0) {
+    id_found = calloc(host->annot_edit.original_count, sizeof(bool));
+    if (!id_found) {
+      for (size_t i = 0; i < block_count; i++) {
+        annot_edit_block_free(&blocks[i]);
+      }
+      free(blocks);
+      lcl_set_error(interp, "out of memory");
+      return LCL_RC_ERR;
+    }
+  }
+
+  AnnotStore *store = target->annots;
+  size_t added = 0, modified = 0, deleted = 0;
+
+  // Process each block
+  for (size_t i = 0; i < block_count; i++) {
+    AnnotEditBlock *b = &blocks[i];
+
+    if (b->is_new) {
+      // New annotation - add it
+      const char **keys = (const char **)b->keys;
+      const char **values = (const char **)b->values;
+
+      uint32_t new_id = annot_store_add(store, b->start, b->end, b->layer,
+                                         keys, values, b->meta_count);
+      if (new_id != 0) {
+        added++;
+      }
+    } else {
+      // Existing annotation - check if it's in our original set
+      bool is_original = false;
+      for (size_t j = 0; j < host->annot_edit.original_count; j++) {
+        if (host->annot_edit.original_ids[j] == b->id) {
+          is_original = true;
+          id_found[j] = true;
+          break;
+        }
+      }
+
+      if (!is_original) {
+        // ID not in original set - skip with warning
+        fprintf(stderr, "Warning: annotation ID %u not in original set, skipping\n",
+                b->id);
+        continue;
+      }
+
+      // Check if metadata changed
+      const AnnotRecord *rec = annot_store_get(store, b->id);
+      if (!rec) {
+        continue;
+      }
+
+      // Get original span (we use original positions, not edited ones)
+      size_t orig_start, orig_end;
+      annot_store_get_span(store, b->id, &orig_start, &orig_end);
+
+      // Count non-prov metadata in original
+      size_t orig_meta_count = 0;
+      for (size_t j = 0; j < rec->meta_count; j++) {
+        if (strncmp(rec->keys[j], "prov:", 5) != 0) {
+          orig_meta_count++;
+        }
+      }
+
+      // Check if metadata changed
+      bool changed = false;
+      if (b->meta_count != orig_meta_count) {
+        changed = true;
+      } else if (strcmp(b->layer, rec->layer ? rec->layer : "") != 0) {
+        changed = true;
+      } else {
+        // Compare each key-value
+        for (size_t j = 0; j < b->meta_count && !changed; j++) {
+          const char *orig_val = NULL;
+          for (size_t k = 0; k < rec->meta_count; k++) {
+            if (strncmp(rec->keys[k], "prov:", 5) != 0 &&
+                strcmp(rec->keys[k], b->keys[j]) == 0) {
+              orig_val = rec->values[k];
+              break;
+            }
+          }
+          if (!orig_val || strcmp(orig_val, b->values[j]) != 0) {
+            changed = true;
+          }
+        }
+      }
+
+      if (changed) {
+        // Delete and recreate with new metadata
+        annot_store_remove(store, b->id);
+
+        const char **keys = (const char **)b->keys;
+        const char **values = (const char **)b->values;
+
+        annot_store_add(store, orig_start, orig_end, b->layer,
+                        keys, values, b->meta_count);
+        modified++;
+      }
+    }
+  }
+
+  // Delete annotations that were removed from the editor
+  for (size_t i = 0; i < host->annot_edit.original_count; i++) {
+    if (!id_found[i]) {
+      annot_store_remove(store, host->annot_edit.original_ids[i]);
+      deleted++;
+    }
+  }
+
+  // Cleanup
+  free(id_found);
+  for (size_t i = 0; i < block_count; i++) {
+    annot_edit_block_free(&blocks[i]);
+  }
+  free(blocks);
+
+  // Clear state
+  annot_edit_clear(host);
+
+  // Close the editor pane
+  close_focused_pane(host);
+
+  // Return summary
+  char result[128];
+  snprintf(result, sizeof(result), "added %zu, modified %zu, deleted %zu",
+           added, modified, deleted);
+  *out = lcl_string_new(result);
+  return LCL_RC_OK;
+}
+
+// weft::annot::cancel-edit -> cancel pending annotation edits
+static int c_annot_cancel_edit(lcl_interp *interp, int argc, lcl_value **argv,
+                               lcl_value **out) {
+  (void)argc;
+  (void)argv;
+
+  LclHost *host = lcl_interp_get_user_data(interp);
+  if (!host) {
+    lcl_set_error(interp, "no host context");
+    return LCL_RC_ERR;
+  }
+
+  if (!host->annot_edit.active) {
+    *out = lcl_string_new("no edit in progress");
+    return LCL_RC_OK;
+  }
+
+  // Clear state
+  annot_edit_clear(host);
+
+  // Close the editor pane
+  close_focused_pane(host);
+
+  *out = lcl_string_new("edit cancelled");
+  return LCL_RC_OK;
+}
+
+// weft::annot::persist layer -> mark layer as persistent (saved to disk)
+static int c_annot_persist(lcl_interp *interp, int argc, lcl_value **argv,
+                           lcl_value **out) {
+  if (argc < 1) {
+    lcl_set_error(interp, "weft::annot::persist requires layer name");
+    return LCL_RC_ERR;
+  }
+
+  LclHost *host = lcl_interp_get_user_data(interp);
+  if (!host) {
+    lcl_set_error(interp, "no host context");
+    return LCL_RC_ERR;
+  }
+
+  const char *layer = lcl_value_to_string(argv[0]);
+  if (!layer) {
+    lcl_set_error(interp, "invalid layer name");
+    return LCL_RC_ERR;
+  }
+
+  lcl_host_set_layer_persistent(host, layer);
+  *out = lcl_int_new(1);
+  return LCL_RC_OK;
+}
+
+// weft::annot::ephemeral layer -> mark layer as ephemeral (not saved)
+static int c_annot_ephemeral(lcl_interp *interp, int argc, lcl_value **argv,
+                             lcl_value **out) {
+  if (argc < 1) {
+    lcl_set_error(interp, "weft::annot::ephemeral requires layer name");
+    return LCL_RC_ERR;
+  }
+
+  LclHost *host = lcl_interp_get_user_data(interp);
+  if (!host) {
+    lcl_set_error(interp, "no host context");
+    return LCL_RC_ERR;
+  }
+
+  const char *layer = lcl_value_to_string(argv[0]);
+  if (!layer) {
+    lcl_set_error(interp, "invalid layer name");
+    return LCL_RC_ERR;
+  }
+
+  lcl_host_set_layer_ephemeral(host, layer);
+  *out = lcl_int_new(1);
+  return LCL_RC_OK;
+}
+
+// weft::annot::orphans -> list orphaned annotations for current buffer
+static int c_annot_orphans(lcl_interp *interp, int argc, lcl_value **argv,
+                           lcl_value **out) {
+  (void)argc;
+  (void)argv;
+
+  LclHost *host = lcl_interp_get_user_data(interp);
+  if (!host) {
+    lcl_set_error(interp, "no host context");
+    return LCL_RC_ERR;
+  }
+
+  Buffer *buffer = host->current_buffer;
+  if (host->repl_attached_buffer) {
+    buffer = host->repl_attached_buffer;
+  }
+  if (!buffer) {
+    lcl_set_error(interp, "no current buffer");
+    return LCL_RC_ERR;
+  }
+
+  lcl_value *list = lcl_list_new();
+  size_t orphan_count = buffer_orphan_count(buffer);
+
+  for (size_t i = 0; i < orphan_count; i++) {
+    const PersistedAnnot *orphan = buffer_get_orphan(buffer, i);
+    if (!orphan) {
+      continue;
+    }
+
+    // Build entry: {index layer approx_start approx_end {key val ...}}
+    lcl_value *entry = lcl_list_new();
+    lcl_list_push(&entry, lcl_int_new((long)i));
+    lcl_list_push(&entry, lcl_string_new(orphan->layer ? orphan->layer : ""));
+    lcl_list_push(&entry, lcl_int_new((long)orphan->start.approx_pos));
+    lcl_list_push(&entry, lcl_int_new((long)orphan->end.approx_pos));
+
+    // Metadata as nested list
+    lcl_value *meta_list = lcl_list_new();
+    for (size_t j = 0; j < orphan->meta_count; j++) {
+      lcl_list_push(&meta_list, lcl_string_new(orphan->keys[j]));
+      lcl_list_push(&meta_list, lcl_string_new(orphan->values[j]));
+    }
+    lcl_list_push(&entry, meta_list);
+
+    lcl_list_push(&list, entry);
+  }
+
+  *out = list;
+  return LCL_RC_OK;
+}
+
+// weft::annot::resolve-orphan idx start end -> manually re-anchor orphan
+static int c_annot_resolve_orphan(lcl_interp *interp, int argc,
+                                  lcl_value **argv, lcl_value **out) {
+  if (argc < 3) {
+    lcl_set_error(interp, "weft::annot::resolve-orphan requires idx start end");
+    return LCL_RC_ERR;
+  }
+
+  LclHost *host = lcl_interp_get_user_data(interp);
+  if (!host) {
+    lcl_set_error(interp, "no host context");
+    return LCL_RC_ERR;
+  }
+
+  Buffer *buffer = host->current_buffer;
+  if (host->repl_attached_buffer) {
+    buffer = host->repl_attached_buffer;
+  }
+  if (!buffer) {
+    lcl_set_error(interp, "no current buffer");
+    return LCL_RC_ERR;
+  }
+
+  long idx, start, end;
+  if (lcl_value_to_int(argv[0], &idx) != LCL_OK || idx < 0) {
+    lcl_set_error(interp, "invalid index");
+    return LCL_RC_ERR;
+  }
+  if (lcl_value_to_int(argv[1], &start) != LCL_OK || start < 0) {
+    lcl_set_error(interp, "invalid start position");
+    return LCL_RC_ERR;
+  }
+  if (lcl_value_to_int(argv[2], &end) != LCL_OK || end < 0) {
+    lcl_set_error(interp, "invalid end position");
+    return LCL_RC_ERR;
+  }
+
+  uint32_t id = buffer_resolve_orphan(buffer, (size_t)idx, (size_t)start,
+                                      (size_t)end);
+
+  *out = lcl_int_new((long)id);
+  return LCL_RC_OK;
+}
+
+// weft::annot::discard-orphan idx -> discard orphaned annotation
+static int c_annot_discard_orphan(lcl_interp *interp, int argc,
+                                  lcl_value **argv, lcl_value **out) {
+  if (argc < 1) {
+    lcl_set_error(interp, "weft::annot::discard-orphan requires idx");
+    return LCL_RC_ERR;
+  }
+
+  LclHost *host = lcl_interp_get_user_data(interp);
+  if (!host) {
+    lcl_set_error(interp, "no host context");
+    return LCL_RC_ERR;
+  }
+
+  Buffer *buffer = host->current_buffer;
+  if (host->repl_attached_buffer) {
+    buffer = host->repl_attached_buffer;
+  }
+  if (!buffer) {
+    lcl_set_error(interp, "no current buffer");
+    return LCL_RC_ERR;
+  }
+
+  long idx;
+  if (lcl_value_to_int(argv[0], &idx) != LCL_OK || idx < 0) {
+    lcl_set_error(interp, "invalid index");
+    return LCL_RC_ERR;
+  }
+
+  buffer_discard_orphan(buffer, (size_t)idx);
+
+  *out = lcl_int_new(1);
   return LCL_RC_OK;
 }
 
@@ -1322,6 +2444,18 @@ static int c_buffer_save(lcl_interp *interp, int argc, lcl_value **argv,
   }
 
   bool success = buffer_save(buf);
+
+  // Save annotations after saving the file
+  if (success && host->data_dir && host->doc_registry) {
+    size_t layer_count = 0;
+    const char *const *layers =
+        lcl_host_get_persistent_layers(host, &layer_count);
+    buffer_save_annotations(buf, host->doc_registry, host->data_dir,
+                            layers, layer_count);
+    // Save the registry to persist any new doc_id mappings
+    doc_registry_save(host->doc_registry);
+  }
+
   *out = lcl_int_new(success ? 1 : 0);
   return LCL_RC_OK;
 }
@@ -1351,6 +2485,16 @@ static int c_buffer_open(lcl_interp *interp, int argc, lcl_value **argv,
   if (!new_buffer) {
     lcl_set_error(interp, "buffer::open: failed to open file");
     return LCL_RC_ERR;
+  }
+
+  // Load persisted annotations for this file
+  if (host->data_dir && host->doc_registry) {
+    size_t loaded = buffer_load_annotations(new_buffer, host->doc_registry,
+                                            host->data_dir);
+    if (loaded > 0) {
+      // Annotations were loaded
+      (void)loaded;
+    }
   }
 
   // Apply file type associations (syntax highlighting, etc.)
@@ -3857,6 +5001,24 @@ static void register_weft_bindings(lcl_interp *interp) {
   lcl_ns_def(annot_ns, "get", lcl_c_proc_new("weft::annot::get", c_annot_get));
   lcl_ns_def(annot_ns, "clear-layer",
              lcl_c_proc_new("weft::annot::clear-layer", c_annot_clear_layer));
+  lcl_ns_def(annot_ns, "edit-at",
+             lcl_c_proc_new("weft::annot::edit-at", c_annot_edit_at));
+  lcl_ns_def(annot_ns, "edit-range",
+             lcl_c_proc_new("weft::annot::edit-range", c_annot_edit_range));
+  lcl_ns_def(annot_ns, "apply-edit",
+             lcl_c_proc_new("weft::annot::apply-edit", c_annot_apply_edit));
+  lcl_ns_def(annot_ns, "cancel-edit",
+             lcl_c_proc_new("weft::annot::cancel-edit", c_annot_cancel_edit));
+  lcl_ns_def(annot_ns, "persist",
+             lcl_c_proc_new("weft::annot::persist", c_annot_persist));
+  lcl_ns_def(annot_ns, "ephemeral",
+             lcl_c_proc_new("weft::annot::ephemeral", c_annot_ephemeral));
+  lcl_ns_def(annot_ns, "orphans",
+             lcl_c_proc_new("weft::annot::orphans", c_annot_orphans));
+  lcl_ns_def(annot_ns, "resolve-orphan",
+             lcl_c_proc_new("weft::annot::resolve-orphan", c_annot_resolve_orphan));
+  lcl_ns_def(annot_ns, "discard-orphan",
+             lcl_c_proc_new("weft::annot::discard-orphan", c_annot_discard_orphan));
 
   // Create weft::interact namespace for interaction event context
   lcl_value *interact_ns = lcl_ns_new("interact");
@@ -4153,6 +5315,29 @@ LclHost *lcl_host_new(void) {
     }
   }
 
+  // Set up data directory for annotation persistence (~/.local/share/weft)
+  host->data_dir = get_xdg_data_dir("weft");
+  if (host->data_dir) {
+    mkdir_recursive(host->data_dir);
+    // Create annots subdirectory
+    char *annots_dir = path_join(host->data_dir, "annots");
+    if (annots_dir) {
+      mkdir_recursive(annots_dir);
+      free(annots_dir);
+    }
+
+    // Initialize document registry
+    host->doc_registry = doc_registry_new(host->data_dir);
+    if (host->doc_registry) {
+      doc_registry_load(host->doc_registry);
+    }
+  }
+
+  // Initialize persistent layers array
+  host->persistent_layers = NULL;
+  host->persistent_layer_count = 0;
+  host->persistent_layer_cap = 0;
+
   // Initialize tree-sitter language registry
   host->ts_registry = ts_lang_registry_new();
   if (!host->ts_registry) {
@@ -4295,6 +5480,19 @@ void lcl_host_free(LclHost *host) {
 
   free(host->config_dir);
 
+  // Save and free document registry
+  if (host->doc_registry) {
+    doc_registry_save(host->doc_registry);
+    doc_registry_free(host->doc_registry);
+  }
+  free(host->data_dir);
+
+  // Free persistent layers
+  for (size_t i = 0; i < host->persistent_layer_count; i++) {
+    free(host->persistent_layers[i]);
+  }
+  free(host->persistent_layers);
+
   // Free tree-sitter language registry
   if (host->ts_registry) {
     ts_lang_registry_free(host->ts_registry);
@@ -4307,6 +5505,9 @@ void lcl_host_free(LclHost *host) {
   if (host->pending_patch) {
     patch_free(host->pending_patch);
   }
+
+  // Free annotation editor state
+  free(host->annot_edit.original_ids);
 
   // Cleanup transform registry
   transform_registry_cleanup();
@@ -5553,4 +6754,108 @@ void lcl_host_cancel_transform_prompt(LclHost *host) {
   host->transform_prompt.start = 0;
   host->transform_prompt.end = 0;
   host->transform_prompt.active = false;
+}
+
+// === Annotation Persistence ===
+
+const char *lcl_host_get_data_dir(LclHost *host) {
+  return host ? host->data_dir : NULL;
+}
+
+DocRegistry *lcl_host_get_doc_registry(LclHost *host) {
+  return host ? host->doc_registry : NULL;
+}
+
+void lcl_host_set_layer_persistent(LclHost *host, const char *layer) {
+  if (!host || !layer) {
+    return;
+  }
+
+  // Check if already in list
+  for (size_t i = 0; i < host->persistent_layer_count; i++) {
+    if (strcmp(host->persistent_layers[i], layer) == 0) {
+      return; // Already persistent
+    }
+  }
+
+  // Grow array if needed
+  if (host->persistent_layer_count >= host->persistent_layer_cap) {
+    size_t new_cap = host->persistent_layer_cap == 0 ? 8 : host->persistent_layer_cap * 2;
+    char **new_layers = realloc(host->persistent_layers, new_cap * sizeof(char *));
+    if (!new_layers) {
+      return;
+    }
+    host->persistent_layers = new_layers;
+    host->persistent_layer_cap = new_cap;
+  }
+
+  host->persistent_layers[host->persistent_layer_count] = strdup(layer);
+  if (host->persistent_layers[host->persistent_layer_count]) {
+    host->persistent_layer_count++;
+  }
+}
+
+void lcl_host_set_layer_ephemeral(LclHost *host, const char *layer) {
+  if (!host || !layer) {
+    return;
+  }
+
+  // Find and remove from persistent list
+  for (size_t i = 0; i < host->persistent_layer_count; i++) {
+    if (strcmp(host->persistent_layers[i], layer) == 0) {
+      free(host->persistent_layers[i]);
+      // Shift remaining
+      for (size_t j = i; j < host->persistent_layer_count - 1; j++) {
+        host->persistent_layers[j] = host->persistent_layers[j + 1];
+      }
+      host->persistent_layer_count--;
+      return;
+    }
+  }
+}
+
+bool lcl_host_is_layer_persistent(LclHost *host, const char *layer) {
+  if (!host || !layer) {
+    return false;
+  }
+
+  // If no explicit list, use default behavior
+  if (host->persistent_layer_count == 0) {
+    // Default: ephemeral style/ts/plumb layers are not persistent
+    if (strcmp(layer, "style") == 0 || strcmp(layer, "ts") == 0 ||
+        strcmp(layer, "plumb") == 0) {
+      return false;
+    }
+    return true;
+  }
+
+  // Check explicit list
+  for (size_t i = 0; i < host->persistent_layer_count; i++) {
+    if (strcmp(host->persistent_layers[i], layer) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+const char *const *lcl_host_get_persistent_layers(LclHost *host,
+                                                   size_t *out_count) {
+  if (!host) {
+    if (out_count) {
+      *out_count = 0;
+    }
+    return NULL;
+  }
+
+  if (out_count) {
+    *out_count = host->persistent_layer_count;
+  }
+  return (const char *const *)host->persistent_layers;
+}
+
+bool lcl_host_save_registry(LclHost *host) {
+  if (!host || !host->doc_registry) {
+    return false;
+  }
+  return doc_registry_save(host->doc_registry);
 }
