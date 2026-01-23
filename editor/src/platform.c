@@ -1,5 +1,7 @@
 #include "platform.h"
 #include "SDL3/SDL_video.h"
+#include "SDL3_image/SDL_image.h"
+#include "embedded_icon.h"
 
 #include <stdlib.h>
 
@@ -22,6 +24,19 @@ Platform *platform_new(const char *title, int width, int height) {
     SDL_Quit();
     return NULL;
   }
+
+  // Set window icon from embedded PNG
+#if EMBEDDED_ICON_AVAILABLE
+  SDL_IOStream *icon_io =
+      SDL_IOFromConstMem(embedded_icon_data, embedded_icon_data_len);
+  if (icon_io) {
+    SDL_Surface *icon = IMG_Load_IO(icon_io, 1);
+    if (icon) {
+      SDL_SetWindowIcon(window, icon);
+      SDL_DestroySurface(icon);
+    }
+  }
+#endif
 
   // Position window centered before showing
   SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);

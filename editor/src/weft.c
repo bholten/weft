@@ -191,6 +191,15 @@ SDL_AppResult SDL_AppInit(void **app_state, int argc, char **argv) {
   // Apply file type associations to initial buffer (syntax highlighting, etc.)
   lcl_host_apply_filetypes(ctx->app.lcl, initial_buffer);
 
+  // Load persisted annotations for initial buffer (if it has a file path)
+  if (initial_buffer->file_path && initial_buffer->file_path[0] != '*') {
+    DocRegistry *reg = lcl_host_get_doc_registry(ctx->app.lcl);
+    const char *data_dir = lcl_host_get_data_dir(ctx->app.lcl);
+    if (reg && data_dir) {
+      buffer_load_annotations(initial_buffer, reg, data_dir);
+    }
+  }
+
   // Note: Acme-like middle-click handler is now configured in
   // ~/.config/weft/init.lcl This allows users to customize the behavior without
   // recompiling.

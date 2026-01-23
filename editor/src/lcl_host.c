@@ -62,6 +62,9 @@ static void recompute_layout_bounds(LclHost *host);
 static bool is_repl_buffer(const Buffer *buf);
 static Buffer *get_effective_doc_buffer(LclHost *host);
 static bool close_focused_pane(LclHost *host);
+static Pane *find_pane_for_buffer(LclHost *host, Buffer *buffer);
+static bool get_effective_selection_context(LclHost *host, Editor **out_editor,
+                                            Buffer **out_buffer);
 
 // === Internal: Weft Bindings ===
 
@@ -521,15 +524,17 @@ static int c_annot_clear_layer(lcl_interp *interp, int argc, lcl_value **argv,
 
 // Helper struct for parsing annotation blocks
 typedef struct {
-  uint32_t id;      // Annotation ID (0 = new)
-  bool is_new;      // true if id was "new"
-  size_t start;     // Start position
-  size_t end;       // End position
-  char *layer;      // Layer name (owned)
-  char **keys;      // Metadata keys (owned)
-  char **values;    // Metadata values (owned)
-  size_t meta_count;// Number of key/value pairs
-  bool valid;       // Parsing succeeded
+  uint32_t id;       // Annotation ID (0 = new)
+  bool is_new;       // true if id was "new"
+  size_t start;      // Start position
+  size_t end;        // End position
+  bool has_start;    // true if start was explicitly provided
+  bool has_end;      // true if end was explicitly provided
+  char *layer;       // Layer name (owned)
+  char **keys;       // Metadata keys (owned)
+  char **values;     // Metadata values (owned)
+  size_t meta_count; // Number of key/value pairs
+  bool valid;        // Parsing succeeded
 } AnnotEditBlock;
 
 // Free an AnnotEditBlock
@@ -670,10 +675,14 @@ static char *generate_annot_editor_content(Buffer *buffer, uint32_t *ids,
       return NULL;
     }
 
-    len += snprintf(output + len, cap - len,
-                    "{id %u start %zu end %zu layer \"%s\"",
-                    id, start_pos, end_pos, escaped_layer);
+    // Don't include start/end in output - positions come from the store
+    // and are implicit in the scope
+    len += snprintf(output + len, cap - len, "{id %u layer \"%s\"", id,
+                    escaped_layer);
     free(escaped_layer);
+
+    (void)start_pos; // Positions are available but not displayed
+    (void)end_pos;
 
     // Metadata (skip prov:* keys, they're auto-added)
     for (size_t j = 0; j < rec->meta_count; j++) {
@@ -708,9 +717,9 @@ static char *generate_annot_editor_content(Buffer *buffer, uint32_t *ids,
 
   // Footer with help text
   len += snprintf(output + len, cap - len,
-                  ";; To add: {id new start X end Y layer \"name\" key \"val\"}\n"
+                  ";; To add: {id new layer \"name\" key \"val\"}\n"
                   ";; To delete: remove the block entirely\n"
-                  ";; Note: start/end positions are read-only in this version\n");
+                  ";; New annotations use the scope range shown above\n");
 
   return output;
 }
@@ -847,11 +856,13 @@ static bool parse_annot_block(const char *text, size_t text_len,
       free(value);
     } else if (strcmp(key, "start") == 0) {
       out->start = (size_t)strtoul(value, NULL, 10);
+      out->has_start = true;
       has_start = true;
       free(key);
       free(value);
     } else if (strcmp(key, "end") == 0) {
       out->end = (size_t)strtoul(value, NULL, 10);
+      out->has_end = true;
       has_end = true;
       free(key);
       free(value);
@@ -872,10 +883,13 @@ static bool parse_annot_block(const char *text, size_t text_len,
     }
   }
 
-  // Validate required fields
-  if (!has_id || !has_start || !has_end || !has_layer) {
+  // Validate required fields (start/end are now optional)
+  if (!has_id || !has_layer) {
     goto cleanup_error;
   }
+
+  (void)has_start; // Now optional - used only for explicit overrides
+  (void)has_end;
 
   // Copy metadata to output
   if (kv_count > 0) {
@@ -1004,28 +1018,94 @@ static int c_annot_edit_at(lcl_interp *interp, int argc, lcl_value **argv,
     return LCL_RC_ERR;
   }
 
-  // Check if already editing
+  // Check if already editing - handle gracefully
   if (host->annot_edit.active) {
-    lcl_set_error(interp, "annotation edit already in progress");
-    return LCL_RC_ERR;
+    // Check if *annot-edit* buffer still exists
+    Buffer *edit_buf =
+        buffer_manager_find_by_path(host->buffer_manager, "*annot-edit*");
+    if (edit_buf) {
+      // Buffer exists - check if it has a pane
+      Pane *existing_pane = find_pane_for_buffer(host, edit_buf);
+      if (existing_pane) {
+        // Already visible - just focus it
+        if (host->focused_pane_ptr) {
+          *host->focused_pane_ptr = existing_pane;
+        }
+        *out = lcl_int_new((long)edit_buf->id);
+        return LCL_RC_OK;
+      } else {
+        // Hidden - re-summon it by creating a new pane
+        Pane *new_pane =
+            pane_new(edit_buf, host->char_width, host->line_height);
+        if (new_pane) {
+          lcl_host_apply_viewlayers(host, new_pane);
+          LayoutNode *root = *host->layout_root_ptr;
+          LayoutNode *new_split = layout_split_horizontal(root, new_pane);
+          if (new_split && !new_split->parent) {
+            *host->layout_root_ptr = new_split;
+          }
+          recompute_layout_bounds(host);
+          if (host->focused_pane_ptr) {
+            *host->focused_pane_ptr = new_pane;
+          }
+        }
+        *out = lcl_int_new((long)edit_buf->id);
+        return LCL_RC_OK;
+      }
+    } else {
+      // Buffer was killed but active flag not cleared - reset state
+      annot_edit_clear(host);
+      // Fall through to create new editor
+    }
   }
 
-  // Get position (default to cursor)
-  size_t pos = 0;
+  // Get position/range: use selection if present, else cursor or explicit arg
+  size_t query_start = 0;
+  size_t query_end = 0;
+  bool is_range = false;
+
   if (argc >= 1) {
+    // Explicit position given
     long arg_pos;
     if (lcl_value_to_int(argv[0], &arg_pos) != LCL_OK || arg_pos < 0) {
       lcl_set_error(interp, "annot::edit-at: invalid position");
       return LCL_RC_ERR;
     }
-    pos = (size_t)arg_pos;
-  } else if (host->current_editor) {
-    pos = editor_get_cursor_pos(host->current_editor);
+    query_start = (size_t)arg_pos;
+    query_end = query_start;
+  } else {
+    // No args - use selection if present, else cursor
+    Editor *ctx_editor = NULL;
+    Buffer *ctx_buffer = NULL;
+    if (get_effective_selection_context(host, &ctx_editor, &ctx_buffer) &&
+        ctx_buffer == buffer) {
+      // Use selection from the effective context
+      size_t sel_start, sel_end;
+      editor_get_selection(ctx_editor, &sel_start, &sel_end);
+      if (sel_start != sel_end) {
+        // There's a selection - use it as a range
+        query_start = sel_start;
+        query_end = sel_end;
+        is_range = true;
+      } else {
+        // No selection - use cursor
+        query_start = editor_get_cursor_pos(ctx_editor);
+        query_end = query_start;
+      }
+    } else if (host->current_editor) {
+      // Fallback to current editor's cursor
+      query_start = editor_get_cursor_pos(host->current_editor);
+      query_end = query_start;
+    }
   }
 
-  // Query annotations at position
+  // Query annotations at position or in range
   AnnotQuery query = {0};
-  annot_store_at(buffer->annots, pos, NULL, &query);
+  if (is_range) {
+    annot_store_in_range(buffer->annots, query_start, query_end, NULL, &query);
+  } else {
+    annot_store_at(buffer->annots, query_start, NULL, &query);
+  }
 
   // Store original IDs
   uint32_t *original_ids = NULL;
@@ -1042,7 +1122,8 @@ static int c_annot_edit_at(lcl_interp *interp, int argc, lcl_value **argv,
 
   // Generate editor content
   char *content = generate_annot_editor_content(buffer, query.ids, query.count,
-                                                 pos, pos, false);
+                                                 query_start, query_end,
+                                                 is_range);
   annot_query_free(&query);
 
   if (!content) {
@@ -1074,8 +1155,11 @@ static int c_annot_edit_at(lcl_interp *interp, int argc, lcl_value **argv,
     return LCL_RC_ERR;
   }
 
-  // Apply viewlayer configuration
-  lcl_host_apply_viewlayers(host, new_pane);
+  // Apply Lcl syntax highlighting to the annotation editor
+  ViewLayer *lcl_layer = tree_sitter_layer_new_lcl(0);
+  if (lcl_layer && new_pane->layer_stack) {
+    layer_stack_add(new_pane->layer_stack, lcl_layer);
+  }
 
   // Split to show new pane
   LayoutNode *root = *host->layout_root_ptr;
@@ -1097,9 +1181,9 @@ static int c_annot_edit_at(lcl_interp *interp, int argc, lcl_value **argv,
   host->annot_edit.original_ids = original_ids;
   host->annot_edit.original_count = original_count;
   host->annot_edit.doc_rev = annot_store_get_doc_rev(buffer->annots);
-  host->annot_edit.query_start = pos;
-  host->annot_edit.query_end = pos;
-  host->annot_edit.is_range = false;
+  host->annot_edit.query_start = query_start;
+  host->annot_edit.query_end = query_end;
+  host->annot_edit.is_range = is_range;
   host->annot_edit.active = true;
 
   *out = lcl_int_new((long)original_count);
@@ -1121,10 +1205,45 @@ static int c_annot_edit_range(lcl_interp *interp, int argc, lcl_value **argv,
     return LCL_RC_ERR;
   }
 
-  // Check if already editing
+  // Check if already editing - handle gracefully
   if (host->annot_edit.active) {
-    lcl_set_error(interp, "annotation edit already in progress");
-    return LCL_RC_ERR;
+    // Check if *annot-edit* buffer still exists
+    Buffer *edit_buf =
+        buffer_manager_find_by_path(host->buffer_manager, "*annot-edit*");
+    if (edit_buf) {
+      // Buffer exists - check if it has a pane
+      Pane *existing_pane = find_pane_for_buffer(host, edit_buf);
+      if (existing_pane) {
+        // Already visible - just focus it
+        if (host->focused_pane_ptr) {
+          *host->focused_pane_ptr = existing_pane;
+        }
+        *out = lcl_int_new((long)edit_buf->id);
+        return LCL_RC_OK;
+      } else {
+        // Hidden - re-summon it by creating a new pane
+        Pane *new_pane =
+            pane_new(edit_buf, host->char_width, host->line_height);
+        if (new_pane) {
+          lcl_host_apply_viewlayers(host, new_pane);
+          LayoutNode *root = *host->layout_root_ptr;
+          LayoutNode *new_split = layout_split_horizontal(root, new_pane);
+          if (new_split && !new_split->parent) {
+            *host->layout_root_ptr = new_split;
+          }
+          recompute_layout_bounds(host);
+          if (host->focused_pane_ptr) {
+            *host->focused_pane_ptr = new_pane;
+          }
+        }
+        *out = lcl_int_new((long)edit_buf->id);
+        return LCL_RC_OK;
+      }
+    } else {
+      // Buffer was killed but active flag not cleared - reset state
+      annot_edit_clear(host);
+      // Fall through to create new editor
+    }
   }
 
   if (argc < 2) {
@@ -1193,8 +1312,11 @@ static int c_annot_edit_range(lcl_interp *interp, int argc, lcl_value **argv,
     return LCL_RC_ERR;
   }
 
-  // Apply viewlayer configuration
-  lcl_host_apply_viewlayers(host, new_pane);
+  // Apply Lcl syntax highlighting to the annotation editor
+  ViewLayer *lcl_layer = tree_sitter_layer_new_lcl(0);
+  if (lcl_layer && new_pane->layer_stack) {
+    layer_stack_add(new_pane->layer_stack, lcl_layer);
+  }
 
   // Split to show new pane
   LayoutNode *root = *host->layout_root_ptr;
@@ -1319,11 +1441,15 @@ static int c_annot_apply_edit(lcl_interp *interp, int argc, lcl_value **argv,
 
     if (b->is_new) {
       // New annotation - add it
+      // Use explicit start/end if provided, otherwise use scope range
+      size_t start = b->has_start ? b->start : host->annot_edit.query_start;
+      size_t end = b->has_end ? b->end : host->annot_edit.query_end;
+
       const char **keys = (const char **)b->keys;
       const char **values = (const char **)b->values;
 
-      uint32_t new_id = annot_store_add(store, b->start, b->end, b->layer,
-                                         keys, values, b->meta_count);
+      uint32_t new_id =
+          annot_store_add(store, start, end, b->layer, keys, values, b->meta_count);
       if (new_id != 0) {
         added++;
       }
@@ -2259,18 +2385,19 @@ static int c_buffer_menu(lcl_interp *interp, int argc, lcl_value **argv,
   }
 
   // Build menu text and track action positions
-  // Max actions: 3 per buffer (Close, Attach, Save) * 64 buffers
-  BufferMenuAction actions[192];
+  // Max actions: 4 per buffer (Show, Kill, Attach/Detach, Save) * 64 buffers
+  BufferMenuAction actions[256];
   size_t action_count = 0;
 
   char menu[8192];
   size_t pos = 0;
 
-  pos += snprintf(menu + pos, sizeof(menu) - pos,
-                  ";; Buffers (middle-click to execute)\n");
+  pos += snprintf(menu + pos, sizeof(menu) - pos, ";; Buffers:\n");
 
   for (size_t i = 0; i < bm->count && pos < sizeof(menu) - 512; i++) {
     Buffer *buf = bm->buffers[i];
+    bool is_repl = buf->file_path && strcmp(buf->file_path, "*lcl*") == 0;
+    bool is_attached = (host->repl_attached_buffer == buf);
 
     // Get display name
     const char *filepath = buf->file_path;
@@ -2282,51 +2409,61 @@ static int c_buffer_menu(lcl_interp *interp, int argc, lcl_value **argv,
       }
     }
 
-    // Buffer ID and name
-    size_t line_start = pos;
-    pos += snprintf(menu + pos, sizeof(menu) - pos, "[B%u] %s%s  ",
-                    buf->id, display_name, buf->modified ? " *" : "");
-
-    // [Close] action
-    if (action_count < 192) {
+    // [Show] action
+    if (action_count < 256) {
       size_t action_start = pos;
-      pos += snprintf(menu + pos, sizeof(menu) - pos, "[Close]");
+      pos += snprintf(menu + pos, sizeof(menu) - pos, "[Show]");
       actions[action_count].start = action_start;
       actions[action_count].end = pos;
       snprintf(actions[action_count].handler, sizeof(actions[0].handler),
-               "weft::buffer::close %u\nweft::interact::handled", buf->id);
+               "weft::buffer::show %u\nweft::interact::handled", buf->id);
       action_count++;
     }
 
     pos += snprintf(menu + pos, sizeof(menu) - pos, " ");
 
-    // [Attach] action (for REPL attachment)
-    if (action_count < 192) {
+    // [Kill] action
+    if (action_count < 256) {
       size_t action_start = pos;
-      pos += snprintf(menu + pos, sizeof(menu) - pos, "[Attach]");
+      pos += snprintf(menu + pos, sizeof(menu) - pos, "[Kill]");
       actions[action_count].start = action_start;
       actions[action_count].end = pos;
       snprintf(actions[action_count].handler, sizeof(actions[0].handler),
-               "weft::repl::attach %u\nweft::interact::handled", buf->id);
+               "weft::buffer::kill %u\nweft::interact::handled", buf->id);
       action_count++;
     }
 
-    // [Save] action (only if modified)
-    if (buf->modified) {
+    // [Attach]/[Detach] action (not for *lcl* buffer)
+    if (!is_repl) {
       pos += snprintf(menu + pos, sizeof(menu) - pos, " ");
-      if (action_count < 192) {
-        size_t action_start = pos;
-        pos += snprintf(menu + pos, sizeof(menu) - pos, "[Save]");
-        actions[action_count].start = action_start;
-        actions[action_count].end = pos;
-        snprintf(actions[action_count].handler, sizeof(actions[0].handler),
-                 "weft::buffer::save %u\nweft::interact::handled", buf->id);
-        action_count++;
+      if (is_attached) {
+        // Show [Detach] for the currently attached buffer
+        if (action_count < 256) {
+          size_t action_start = pos;
+          pos += snprintf(menu + pos, sizeof(menu) - pos, "[Detach]");
+          actions[action_count].start = action_start;
+          actions[action_count].end = pos;
+          snprintf(actions[action_count].handler, sizeof(actions[0].handler),
+                   "weft::repl::detach\nweft::interact::handled");
+          action_count++;
+        }
+      } else {
+        // Show [Attach] for other non-REPL buffers
+        if (action_count < 256) {
+          size_t action_start = pos;
+          pos += snprintf(menu + pos, sizeof(menu) - pos, "[Attach]");
+          actions[action_count].start = action_start;
+          actions[action_count].end = pos;
+          snprintf(actions[action_count].handler, sizeof(actions[0].handler),
+                   "weft::repl::attach %u\nweft::interact::handled", buf->id);
+          action_count++;
+        }
       }
     }
 
-    pos += snprintf(menu + pos, sizeof(menu) - pos, "\n");
-    (void)line_start; // Unused for now
+    // Buffer ID and name
+    pos += snprintf(menu + pos, sizeof(menu) - pos, "   %u  %s%s\n", buf->id,
+                    display_name, buf->modified ? " (modified)" : "");
   }
 
   // Insert text at cursor
@@ -2378,9 +2515,9 @@ static int c_buffer_close(lcl_interp *interp, int argc, lcl_value **argv,
   LayoutNode *root = *host->layout_root_ptr;
   Pane *pane = layout_find_pane_with_buffer(root, buf);
   if (!pane) {
-    // Buffer exists but isn't displayed - just close the buffer
-    buffer_manager_close(host->buffer_manager, buf);
-    *out = lcl_int_new(1);
+    // Buffer exists but isn't displayed - nothing to close
+    // Buffer survives for re-summoning via weft::buffer::show
+    *out = lcl_int_new(0);
     return LCL_RC_OK;
   }
 
@@ -2457,6 +2594,163 @@ static int c_buffer_save(lcl_interp *interp, int argc, lcl_value **argv,
   }
 
   *out = lcl_int_new(success ? 1 : 0);
+  return LCL_RC_OK;
+}
+
+// weft::buffer::show id -> show buffer in pane (create pane if needed, focus if
+// exists)
+static int c_buffer_show(lcl_interp *interp, int argc, lcl_value **argv,
+                         lcl_value **out) {
+  if (argc < 1) {
+    lcl_set_error(interp, "buffer::show requires id");
+    return LCL_RC_ERR;
+  }
+
+  LclHost *host = lcl_interp_get_user_data(interp);
+  if (!host || !host->buffer_manager || !host->layout_root_ptr) {
+    lcl_set_error(interp, "no buffer manager context");
+    return LCL_RC_ERR;
+  }
+
+  long id;
+  if (lcl_value_to_int(argv[0], &id) != LCL_OK || id <= 0) {
+    lcl_set_error(interp, "buffer::show: id must be a positive integer");
+    return LCL_RC_ERR;
+  }
+
+  Buffer *buf = buffer_manager_find_by_id(host->buffer_manager, (uint32_t)id);
+  if (!buf) {
+    lcl_set_error(interp, "buffer::show: no buffer with that id");
+    return LCL_RC_ERR;
+  }
+
+  // Check if buffer already has a pane
+  Pane *existing_pane = find_pane_for_buffer(host, buf);
+  if (existing_pane) {
+    // Just focus it
+    if (host->focused_pane_ptr) {
+      *host->focused_pane_ptr = existing_pane;
+    }
+    *out = lcl_int_new((long)buf->id);
+    return LCL_RC_OK;
+  }
+
+  // Create new pane for the buffer
+  Pane *new_pane = pane_new(buf, host->char_width, host->line_height);
+  if (!new_pane) {
+    lcl_set_error(interp, "buffer::show: failed to create pane");
+    return LCL_RC_ERR;
+  }
+
+  // Apply viewlayer configuration
+  lcl_host_apply_viewlayers(host, new_pane);
+
+  // Split current layout horizontally to show new pane
+  LayoutNode *root = *host->layout_root_ptr;
+  LayoutNode *new_split = layout_split_horizontal(root, new_pane);
+
+  if (new_split && !new_split->parent) {
+    *host->layout_root_ptr = new_split;
+  }
+
+  // Recompute layout bounds
+  recompute_layout_bounds(host);
+
+  // Focus the new pane
+  if (host->focused_pane_ptr) {
+    *host->focused_pane_ptr = new_pane;
+  }
+
+  *out = lcl_int_new((long)buf->id);
+  return LCL_RC_OK;
+}
+
+// weft::buffer::kill id -> destroy buffer completely (close pane and free
+// buffer)
+static int c_buffer_kill(lcl_interp *interp, int argc, lcl_value **argv,
+                         lcl_value **out) {
+  if (argc < 1) {
+    lcl_set_error(interp, "buffer::kill requires id");
+    return LCL_RC_ERR;
+  }
+
+  LclHost *host = lcl_interp_get_user_data(interp);
+  if (!host || !host->buffer_manager || !host->layout_root_ptr) {
+    lcl_set_error(interp, "no buffer manager context");
+    return LCL_RC_ERR;
+  }
+
+  long id;
+  if (lcl_value_to_int(argv[0], &id) != LCL_OK || id <= 0) {
+    lcl_set_error(interp, "buffer::kill: id must be a positive integer");
+    return LCL_RC_ERR;
+  }
+
+  Buffer *buf = buffer_manager_find_by_id(host->buffer_manager, (uint32_t)id);
+  if (!buf) {
+    lcl_set_error(interp, "buffer::kill: no buffer with that id");
+    return LCL_RC_ERR;
+  }
+
+  // Clear associated state before closing
+  // If this buffer is the annotation edit target, clear that state
+  if (host->annot_edit.target_buffer == buf) {
+    annot_edit_clear(host);
+  }
+  // If this is the *annot-edit* buffer itself, clear annotation edit state
+  if (buf->file_path && strcmp(buf->file_path, "*annot-edit*") == 0) {
+    annot_edit_clear(host);
+  }
+  // If this buffer is the patch target, clear pending patch
+  if (host->patch_target_buffer == buf) {
+    if (host->pending_patch) {
+      patch_free(host->pending_patch);
+      host->pending_patch = NULL;
+    }
+    host->patch_target_buffer = NULL;
+  }
+  // If this is the *diff* buffer, clear pending patch
+  if (buf->file_path && strcmp(buf->file_path, "*diff*") == 0) {
+    if (host->pending_patch) {
+      patch_free(host->pending_patch);
+      host->pending_patch = NULL;
+    }
+    host->patch_target_buffer = NULL;
+  }
+  // If this buffer is the REPL attached buffer, detach
+  if (host->repl_attached_buffer == buf) {
+    host->repl_attached_buffer = NULL;
+  }
+
+  // Find pane containing this buffer and close it (if any)
+  LayoutNode *root = *host->layout_root_ptr;
+  Pane *pane = layout_find_pane_with_buffer(root, buf);
+
+  if (pane) {
+    // Find next pane to focus
+    Pane *next = layout_next_pane(root, pane);
+    if (next == pane) {
+      next = NULL;
+    }
+
+    // Close the pane
+    LayoutNode *new_root = layout_close_pane(root, pane);
+
+    if (new_root) {
+      *host->layout_root_ptr = new_root;
+      *host->focused_pane_ptr = next ? next : layout_first_pane(new_root);
+      recompute_layout_bounds(host);
+    } else {
+      // Last pane - don't destroy the buffer
+      lcl_set_error(interp, "buffer::kill: cannot kill last buffer");
+      return LCL_RC_ERR;
+    }
+  }
+
+  // Destroy the buffer
+  buffer_manager_close(host->buffer_manager, buf);
+
+  *out = lcl_int_new(1);
   return LCL_RC_OK;
 }
 
@@ -3008,6 +3302,209 @@ static int c_repl_goto(lcl_interp *interp, int argc, lcl_value **argv,
   editor_set_cursor_pos(pane->view, (size_t)pos);
 
   *out = lcl_int_new(pos);
+  return LCL_RC_OK;
+}
+
+// === Selection namespace ===
+
+// Helper: Get the effective selection context
+// Returns the editor and buffer to use for selection queries.
+// If in REPL and attached, uses the attached buffer; otherwise uses current.
+// Returns false if no valid context.
+static bool get_effective_selection_context(LclHost *host, Editor **out_editor,
+                                            Buffer **out_buffer) {
+  if (!host) {
+    return false;
+  }
+
+  // Check if we're in the REPL and attached to a buffer
+  if (host->current_buffer && is_repl_buffer(host->current_buffer) &&
+      host->repl_attached_buffer) {
+    // Use the attached buffer's selection
+    Pane *pane = find_pane_for_buffer(host, host->repl_attached_buffer);
+    if (pane && pane->view) {
+      *out_editor = pane->view;
+      *out_buffer = host->repl_attached_buffer;
+      return true;
+    }
+  }
+
+  // Use current editor/buffer
+  if (host->current_editor && host->current_buffer) {
+    *out_editor = host->current_editor;
+    *out_buffer = host->current_buffer;
+    return true;
+  }
+
+  return false;
+}
+
+// weft::sel::start -> get selection start (or cursor if no selection)
+static int c_sel_start(lcl_interp *interp, int argc, lcl_value **argv,
+                       lcl_value **out) {
+  (void)argc;
+  (void)argv;
+
+  LclHost *host = lcl_interp_get_user_data(interp);
+  Editor *editor;
+  Buffer *buffer;
+
+  if (!get_effective_selection_context(host, &editor, &buffer)) {
+    lcl_set_error(interp, "no selection context");
+    return LCL_RC_ERR;
+  }
+
+  size_t start, end;
+  editor_get_selection(editor, &start, &end);
+
+  *out = lcl_int_new((long)start);
+  return LCL_RC_OK;
+}
+
+// weft::sel::end -> get selection end (or cursor if no selection)
+static int c_sel_end(lcl_interp *interp, int argc, lcl_value **argv,
+                     lcl_value **out) {
+  (void)argc;
+  (void)argv;
+
+  LclHost *host = lcl_interp_get_user_data(interp);
+  Editor *editor;
+  Buffer *buffer;
+
+  if (!get_effective_selection_context(host, &editor, &buffer)) {
+    lcl_set_error(interp, "no selection context");
+    return LCL_RC_ERR;
+  }
+
+  size_t start, end;
+  editor_get_selection(editor, &start, &end);
+
+  *out = lcl_int_new((long)end);
+  return LCL_RC_OK;
+}
+
+// weft::sel::text -> get selected text (empty string if no selection)
+static int c_sel_text(lcl_interp *interp, int argc, lcl_value **argv,
+                      lcl_value **out) {
+  (void)argc;
+  (void)argv;
+
+  LclHost *host = lcl_interp_get_user_data(interp);
+  Editor *editor;
+  Buffer *buffer;
+
+  if (!get_effective_selection_context(host, &editor, &buffer)) {
+    lcl_set_error(interp, "no selection context");
+    return LCL_RC_ERR;
+  }
+
+  size_t start, end;
+  editor_get_selection(editor, &start, &end);
+
+  if (start == end) {
+    *out = lcl_string_new("");
+    return LCL_RC_OK;
+  }
+
+  size_t len = end - start;
+  char *text = malloc(len + 1);
+  if (!text) {
+    lcl_set_error(interp, "allocation failed");
+    return LCL_RC_ERR;
+  }
+
+  document_get_text(buffer->document, start, text, len);
+  text[len] = '\0';
+
+  *out = lcl_string_new(text);
+  free(text);
+  return LCL_RC_OK;
+}
+
+// weft::sel::buffer -> get buffer ID of selection context
+static int c_sel_buffer(lcl_interp *interp, int argc, lcl_value **argv,
+                        lcl_value **out) {
+  (void)argc;
+  (void)argv;
+
+  LclHost *host = lcl_interp_get_user_data(interp);
+  Editor *editor;
+  Buffer *buffer;
+
+  if (!get_effective_selection_context(host, &editor, &buffer)) {
+    lcl_set_error(interp, "no selection context");
+    return LCL_RC_ERR;
+  }
+
+  *out = lcl_int_new((long)buffer->id);
+  return LCL_RC_OK;
+}
+
+// weft::sel::exists? -> check if there's a non-empty selection
+static int c_sel_exists(lcl_interp *interp, int argc, lcl_value **argv,
+                        lcl_value **out) {
+  (void)argc;
+  (void)argv;
+
+  LclHost *host = lcl_interp_get_user_data(interp);
+  Editor *editor;
+  Buffer *buffer;
+
+  if (!get_effective_selection_context(host, &editor, &buffer)) {
+    *out = lcl_int_new(0);
+    return LCL_RC_OK;
+  }
+
+  size_t start, end;
+  editor_get_selection(editor, &start, &end);
+
+  *out = lcl_int_new(start != end ? 1 : 0);
+  return LCL_RC_OK;
+}
+
+// weft::sel::info -> get full selection info as dict {start end buffer text}
+static int c_sel_info(lcl_interp *interp, int argc, lcl_value **argv,
+                      lcl_value **out) {
+  (void)argc;
+  (void)argv;
+
+  LclHost *host = lcl_interp_get_user_data(interp);
+  Editor *editor;
+  Buffer *buffer;
+
+  if (!get_effective_selection_context(host, &editor, &buffer)) {
+    // Return empty list if no context
+    *out = lcl_list_new();
+    return LCL_RC_OK;
+  }
+
+  size_t start, end;
+  editor_get_selection(editor, &start, &end);
+
+  // Get text if there's a selection
+  char *text = NULL;
+  if (start != end) {
+    size_t len = end - start;
+    text = malloc(len + 1);
+    if (text) {
+      document_get_text(buffer->document, start, text, len);
+      text[len] = '\0';
+    }
+  }
+
+  // Build result: {start <n> end <n> buffer <id> text <str>}
+  lcl_value *result = lcl_list_new();
+  lcl_list_push(&result, lcl_string_new("start"));
+  lcl_list_push(&result, lcl_int_new((long)start));
+  lcl_list_push(&result, lcl_string_new("end"));
+  lcl_list_push(&result, lcl_int_new((long)end));
+  lcl_list_push(&result, lcl_string_new("buffer"));
+  lcl_list_push(&result, lcl_int_new((long)buffer->id));
+  lcl_list_push(&result, lcl_string_new("text"));
+  lcl_list_push(&result, lcl_string_new(text ? text : ""));
+
+  free(text);
+  *out = result;
   return LCL_RC_OK;
 }
 
@@ -4588,6 +5085,9 @@ static void show_patch_buffer(LclHost *host, Patch *patch, Buffer *target) {
     return;
   }
 
+  // Give the diff buffer a name so it appears in buffer list
+  diff_buf->file_path = strdup("*diff*");
+
   // Set buffer content
   document_insert(diff_buf->document, 0, diff, strlen(diff));
   free(diff);
@@ -5084,6 +5584,10 @@ static void register_weft_bindings(lcl_interp *interp) {
              lcl_c_proc_new("weft::buffer::close", c_buffer_close));
   lcl_ns_def(buffer_ns, "save",
              lcl_c_proc_new("weft::buffer::save", c_buffer_save));
+  lcl_ns_def(buffer_ns, "show",
+             lcl_c_proc_new("weft::buffer::show", c_buffer_show));
+  lcl_ns_def(buffer_ns, "kill",
+             lcl_c_proc_new("weft::buffer::kill", c_buffer_kill));
 
   // Create weft::pane namespace for pane operations
   lcl_value *pane_ns = lcl_ns_new("pane");
@@ -5124,6 +5628,20 @@ static void register_weft_bindings(lcl_interp *interp) {
   lcl_ns_def(repl_ns, "target-cursor",
              lcl_c_proc_new("weft::repl::target-cursor", c_repl_target_cursor));
   lcl_ns_def(repl_ns, "goto", lcl_c_proc_new("weft::repl::goto", c_repl_goto));
+
+  // Create weft::sel namespace for selection access
+  lcl_value *sel_ns = lcl_ns_new("sel");
+  lcl_ns_def(weft_ns, "sel", sel_ns);
+
+  lcl_ns_def(sel_ns, "start",
+             lcl_c_proc_new("weft::sel::start", c_sel_start));
+  lcl_ns_def(sel_ns, "end", lcl_c_proc_new("weft::sel::end", c_sel_end));
+  lcl_ns_def(sel_ns, "text", lcl_c_proc_new("weft::sel::text", c_sel_text));
+  lcl_ns_def(sel_ns, "buffer",
+             lcl_c_proc_new("weft::sel::buffer", c_sel_buffer));
+  lcl_ns_def(sel_ns, "exists?",
+             lcl_c_proc_new("weft::sel::exists?", c_sel_exists));
+  lcl_ns_def(sel_ns, "info", lcl_c_proc_new("weft::sel::info", c_sel_info));
 
   // Create weft::inspect namespace for annotation inspection
   lcl_value *inspect_ns = lcl_ns_new("inspect");
@@ -6568,12 +7086,15 @@ bool lcl_host_apply_viewlayers(LclHost *host, Pane *pane) {
     lcl_host_get_viewlayers(host, ext, &config_count);
   }
 
-  // If no custom config, add default style annotation layer
+  // Always add a "style" annotation layer at high priority for user styling
+  // This allows user annotations to override tree-sitter highlighting
+  ViewLayer *style_layer = annot_layer_new("style", 100);
+  if (style_layer) {
+    layer_stack_add(pane->layer_stack, style_layer);
+  }
+
+  // If no custom config, we're done
   if (config_count == 0) {
-    ViewLayer *style_layer = annot_layer_new("style", 0);
-    if (style_layer) {
-      layer_stack_add(pane->layer_stack, style_layer);
-    }
     return false; // No custom config applied
   }
 
@@ -6620,11 +7141,6 @@ bool lcl_host_apply_viewlayers(LclHost *host, Pane *pane) {
     if (layer) {
       layer_stack_add(pane->layer_stack, layer);
       applied_any = true;
-
-      // If using tree-sitter, clear any existing style annotations
-      if (config->type == VIEWLAYER_TREE_SITTER && buffer->annots) {
-        annot_store_clear_layer(buffer->annots, "style");
-      }
     }
   }
 
@@ -6821,9 +7337,9 @@ bool lcl_host_is_layer_persistent(LclHost *host, const char *layer) {
 
   // If no explicit list, use default behavior
   if (host->persistent_layer_count == 0) {
-    // Default: ephemeral style/ts/plumb layers are not persistent
-    if (strcmp(layer, "style") == 0 || strcmp(layer, "ts") == 0 ||
-        strcmp(layer, "plumb") == 0) {
+    // Default: ts/plumb layers are ephemeral (regenerated from content)
+    // The "style" layer is persistent for user annotations
+    if (strcmp(layer, "ts") == 0 || strcmp(layer, "plumb") == 0) {
       return false;
     }
     return true;
