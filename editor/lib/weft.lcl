@@ -143,9 +143,79 @@ proc filter-match {pattern lst} {
 proc filter-reject {pattern lst} {
   var result {}
   foreach item $lst {
-    if [! [regex::match $pattern $item]] {
+    if [not [regex::match $pattern $item]] {
       set! result [List::push $result $item]
     }
   }
   $result
+}
+
+;; === Transform DSL ===
+;; Allows string functions to work seamlessly with selections and buffers.
+;; When called with a transform context, they show a diff preview.
+;; When called with a plain string, they return the transformed string.
+
+;; Check if a value is a transform context (dict with start, end, buffer, text)
+proc transform-ctx? {val} {
+  if [not [dict? $val]] { return 0 }
+  if [not [has? $val "start"]] { return 0 }
+  if [not [has? $val "text"]] { return 0 }
+  1
+}
+
+;; Get selection as a transform context
+;; Returns {start N end N buffer N text "..."} or empty list if no selection
+proc sel {} { weft::sel::info }
+
+;; Get entire buffer as a transform context
+proc buffer {} {
+  let len [weft::doc::length]
+  let text [weft::doc::text 0 $len]
+  let id [weft::buffer::id]
+  #{start 0 end $len buffer $id text $text}
+}
+
+;; Apply a string function to input, showing diff if input is a context
+;; fn: a proc that takes a string and returns a string
+;; input: either a string or a transform context
+proc make-transform {fn input} {
+  if [transform-ctx? $input] {
+    let text [get $input "text"]
+    let result [$fn $text]
+    weft::transform::apply-ctx $input $result
+  } else {
+    $fn $input
+  }
+}
+
+;; === Context-Aware Transforms ===
+;; These functions work with both plain strings and selection/buffer contexts.
+
+;; Uppercase - works with strings or contexts
+proc upper {input} { make-transform String::upper $input }
+
+;; Lowercase - works with strings or contexts
+proc lower {input} { make-transform String::lower $input }
+
+;; Trim whitespace - works with strings or contexts
+proc trim {input} { make-transform String::trim $input }
+
+;; Sort lines - works with strings or contexts
+proc sort-lines {input} {
+  proc do-sort {s} {
+    let lns [lines $s]
+    let sorted [List::sort $lns]
+    join $sorted "\n"
+  }
+  make-transform do-sort $input
+}
+
+;; Reverse lines - works with strings or contexts
+proc reverse-lines {input} {
+  proc do-reverse {s} {
+    let lns [lines $s]
+    let reversed [List::reverse $lns]
+    join $reversed "\n"
+  }
+  make-transform do-reverse $input
 }

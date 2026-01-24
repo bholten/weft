@@ -925,34 +925,24 @@ bool annot_persist_save(const AnnotStore *store, const Document *doc,
       // ts/plumb are ephemeral (regenerated from content)
       // "style" is persistent for user annotations
       if (strcmp(layer, "ts") == 0 || strcmp(layer, "plumb") == 0) {
-        fprintf(stderr, "[DEBUG] is_persistent('%s') -> false (ephemeral default)\n", layer);
         return false;
       }
-      fprintf(stderr, "[DEBUG] is_persistent('%s') -> true (default)\n", layer);
       return true;
     }
     for (size_t i = 0; i < persistent_layer_count; i++) {
       if (strcmp(persistent_layers[i], layer) == 0) {
-        fprintf(stderr, "[DEBUG] is_persistent('%s') -> true (explicit)\n", layer);
         return true;
       }
     }
-    fprintf(stderr, "[DEBUG] is_persistent('%s') -> false (not in list)\n", layer);
     return false;
   }
 
-  fprintf(stderr, "[DEBUG] annot_persist_save: record_count=%zu\n", store->record_count);
-
   // Iterate through all annotations
-  size_t saved_count = 0;
   for (size_t i = 0; i < store->record_count; i++) {
     const AnnotRecord *rec = &store->records[i];
-    fprintf(stderr, "[DEBUG]   record[%zu]: layer='%s'\n", i, rec->layer ? rec->layer : "(null)");
     if (!rec->layer || !is_persistent(rec->layer)) {
-      fprintf(stderr, "[DEBUG]     -> skipped\n");
       continue;
     }
-    saved_count++;
 
     // Get span positions
     size_t start_pos = 0, end_pos = 0;
@@ -1030,7 +1020,6 @@ bool annot_persist_save(const AnnotStore *store, const Document *doc,
     context_anchor_free(&end_ca);
   }
 
-  fprintf(stderr, "[DEBUG] annot_persist_save: saved %zu annotations\n", saved_count);
   fclose(f);
   return true;
 }

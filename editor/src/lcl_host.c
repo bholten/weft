@@ -2721,6 +2721,11 @@ static int c_buffer_kill(lcl_interp *interp, int argc, lcl_value **argv,
   if (host->repl_attached_buffer == buf) {
     host->repl_attached_buffer = NULL;
   }
+  // If this buffer is the current buffer, clear it
+  if (host->current_buffer == buf) {
+    host->current_buffer = NULL;
+    host->current_editor = NULL;
+  }
 
   // Find pane containing this buffer and close it (if any)
   LayoutNode *root = *host->layout_root_ptr;
@@ -3492,16 +3497,12 @@ static int c_sel_info(lcl_interp *interp, int argc, lcl_value **argv,
     }
   }
 
-  // Build result: {start <n> end <n> buffer <id> text <str>}
-  lcl_value *result = lcl_list_new();
-  lcl_list_push(&result, lcl_string_new("start"));
-  lcl_list_push(&result, lcl_int_new((long)start));
-  lcl_list_push(&result, lcl_string_new("end"));
-  lcl_list_push(&result, lcl_int_new((long)end));
-  lcl_list_push(&result, lcl_string_new("buffer"));
-  lcl_list_push(&result, lcl_int_new((long)buffer->id));
-  lcl_list_push(&result, lcl_string_new("text"));
-  lcl_list_push(&result, lcl_string_new(text ? text : ""));
+  // Build result: #{start <n> end <n> buffer <id> text <str>}
+  lcl_value *result = lcl_dict_new();
+  lcl_dict_put(&result, "start", lcl_int_new((long)start));
+  lcl_dict_put(&result, "end", lcl_int_new((long)end));
+  lcl_dict_put(&result, "buffer", lcl_int_new((long)buffer->id));
+  lcl_dict_put(&result, "text", lcl_string_new(text ? text : ""));
 
   free(text);
   *out = result;
@@ -5347,8 +5348,14 @@ static int c_transform_apply(lcl_interp *interp, int argc, lcl_value **argv,
   }
 
   // Apply the patch
-  PatchResult result =
-      patch_apply(host->pending_patch, host->patch_target_buffer);
+  Buffer *target = host->patch_target_buffer;
+  PatchResult result = patch_apply(host->pending_patch, target);
+
+  // Clear selection in the target buffer's editor (old selection is now stale)
+  Pane *target_pane = find_pane_for_buffer(host, target);
+  if (target_pane && target_pane->view) {
+    editor_clear_selection(target_pane->view);
+  }
 
   // Clean up
   patch_free(host->pending_patch);
@@ -5393,6 +5400,101 @@ static int c_transform_reject(lcl_interp *interp, int argc, lcl_value **argv,
   close_focused_pane(host);
 
   *out = lcl_string_new("patch rejected");
+  return LCL_RC_OK;
+}
+
+// weft::transform::apply-ctx ctx new-text -> apply transformation to context
+// ctx is a dict with keys: start, end, buffer, text
+// Creates a patch and shows diff preview
+static int c_transform_apply_ctx(lcl_interp *interp, int argc, lcl_value **argv,
+                                 lcl_value **out) {
+  if (argc < 2) {
+    lcl_set_error(interp,
+                  "weft::transform::apply-ctx requires context and new-text");
+    return LCL_RC_ERR;
+  }
+
+  LclHost *host = lcl_interp_get_user_data(interp);
+  if (!host || !host->buffer_manager) {
+    lcl_set_error(interp, "no host context");
+    return LCL_RC_ERR;
+  }
+
+  // Parse context dict
+  lcl_value *ctx = argv[0];
+  if (lcl_value_type_of(ctx) != LCL_DICT) {
+    lcl_set_error(interp, "context must be a dict");
+    return LCL_RC_ERR;
+  }
+
+  // Extract fields from context: #{start N end N buffer N text "..."}
+  long start = -1, end = -1, buffer_id = -1;
+  const char *old_text = NULL;
+
+  lcl_value *val = NULL;
+  if (lcl_dict_get(ctx, "start", &val) == LCL_OK) {
+    lcl_value_to_int(val, &start);
+  }
+  if (lcl_dict_get(ctx, "end", &val) == LCL_OK) {
+    lcl_value_to_int(val, &end);
+  }
+  if (lcl_dict_get(ctx, "buffer", &val) == LCL_OK) {
+    lcl_value_to_int(val, &buffer_id);
+  }
+  if (lcl_dict_get(ctx, "text", &val) == LCL_OK) {
+    old_text = lcl_value_to_string(val);
+  }
+
+  if (start < 0 || end < 0 || buffer_id < 0) {
+    lcl_set_error(interp,
+                  "context must have start, end, and buffer fields");
+    return LCL_RC_ERR;
+  }
+
+  // Get the new text
+  const char *new_text = lcl_value_to_string(argv[1]);
+  if (!new_text) {
+    lcl_set_error(interp, "new-text must be a string");
+    return LCL_RC_ERR;
+  }
+
+  // Find the target buffer
+  Buffer *target_buffer =
+      buffer_manager_find_by_id(host->buffer_manager, (uint32_t)buffer_id);
+  if (!target_buffer) {
+    lcl_set_error(interp, "buffer not found");
+    return LCL_RC_ERR;
+  }
+
+  // If old text equals new text, nothing to do
+  if (old_text && strcmp(old_text, new_text) == 0) {
+    *out = lcl_string_new("no changes");
+    return LCL_RC_OK;
+  }
+
+  // Create a patch
+  Patch *patch = patch_new("transform");
+  if (!patch) {
+    lcl_set_error(interp, "failed to create patch");
+    return LCL_RC_ERR;
+  }
+
+  // Add the edit
+  patch_add(patch, (size_t)start, (size_t)end, new_text);
+  patch_set_target(patch, buffer_get_doc_rev(target_buffer),
+                   document_length(target_buffer->document));
+
+  // Store pending patch
+  if (host->pending_patch) {
+    patch_free(host->pending_patch);
+  }
+  host->pending_patch = patch;
+  host->patch_target_buffer = target_buffer;
+
+  // Show the diff buffer
+  show_patch_buffer(host, patch, target_buffer);
+
+  *out = lcl_string_new("patch created");
   return LCL_RC_OK;
 }
 
@@ -5692,6 +5794,8 @@ static void register_weft_bindings(lcl_interp *interp) {
              lcl_c_proc_new("weft::transform::apply", c_transform_apply));
   lcl_ns_def(transform_ns, "reject",
              lcl_c_proc_new("weft::transform::reject", c_transform_reject));
+  lcl_ns_def(transform_ns, "apply-ctx",
+             lcl_c_proc_new("weft::transform::apply-ctx", c_transform_apply_ctx));
   lcl_ns_def(transform_ns, "list",
              lcl_c_proc_new("weft::transform::list", c_transform_list));
   lcl_ns_def(transform_ns, "menu",
@@ -6516,6 +6620,7 @@ void lcl_host_clear_current_event(LclHost *host) {
   }
   host->current_event = NULL;
   host->current_editor = NULL;
+  host->current_buffer = NULL;
 }
 
 // Convert HandlerEventType to InteractType for comparison
