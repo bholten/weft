@@ -1,0 +1,159 @@
+;; Weft Configuration File
+;; This file is loaded at startup and configures file type associations,
+;; handlers, and other settings.
+
+;; === File Type Associations ===
+;; weft::config::filetype extension layer-name script-path
+;; Associates file extensions with syntax highlighting layers
+
+;; C/C++ files
+;; weft::config::filetype ".c" "style" "/home/brennan/dev/weft/editor/layers/syntax_c.lcl"
+;; weft::config::filetype ".h" "style" "/home/brennan/dev/weft/editor/layers/syntax_c.lcl"
+;; weft::config::filetype ".cpp" "style" "/home/brennan/dev/weft/editor/layers/syntax_c.lcl"
+;; weft::config::filetype ".hpp" "style" "/home/brennan/dev/weft/editor/layers/syntax_c.lcl"
+;; weft::config::filetype ".cc" "style" "/home/brennan/dev/weft/editor/layers/syntax_c.lcl"
+
+;; Lcl files (use tree-sitter for proper AST-based highlighting)
+;; weft::config::filetype ".lcl" "style" "/home/brennan/dev/weft/editor/layers/syntax_lcl_ts.lcl"
+
+weft::config::keybind "ctrl+t" { weft::transform::menu }
+weft::config::keybind "ctrl+b" { weft::buffer::menu }
+
+  ;; Annotation editor
+weft::config::keybind "ctrl+e" {
+    weft::annot::edit-at
+}
+
+weft::config::keybind "ctrl+shift+e" {
+    let _sel [weft::interact::selection]
+
+    if [>= [len $_sel] 2] {
+        weft::annot::edit-range [get $_sel 0] [get $_sel 1]
+    } else {
+        weft::annot::edit-at [weft::editor::cursor]
+    }
+}
+
+;; === Indent Settings ===
+;; Use: weft::config::indent extension tab-size use-tabs
+;; use-tabs: 0 = insert spaces, 1 = insert tabs
+
+;; C/C++ files: 4 spaces, use tabs
+weft::config::indent ".c" 4 1
+weft::config::indent ".h" 4 1
+weft::config::indent ".cpp" 4 1
+weft::config::indent ".hpp" 4 1
+weft::config::indent ".cc" 4 1
+
+;; Lcl files: 4 spaces, use spaces
+weft::config::indent ".lcl" 4 0
+
+;; Python: 4 spaces, use spaces (PEP 8)
+weft::config::indent ".py" 4 0
+
+;; JavaScript/TypeScript: 2 spaces
+weft::config::indent ".js" 2 0
+weft::config::indent ".ts" 2 0
+weft::config::indent ".jsx" 2 0
+weft::config::indent ".tsx" 2 0
+
+;; YAML/JSON: 2 spaces
+weft::config::indent ".yaml" 2 0
+weft::config::indent ".yml" 2 0
+weft::config::indent ".json" 2 0
+
+;; == View Layers ==
+
+;; === Dynamic Tree-Sitter Languages ===
+;; Register dynamically loaded tree-sitter parsers
+;; weft::config::language name library_path ?query_path?
+
+;; Map extensions to languages
+;; weft::config::language-ext extension language_name
+weft::config::language-ext ".c" "c"
+weft::config::language-ext ".h" "c"
+
+;; Use tree-sitter for C files
+weft::config::viewlayer ".lcl" "tree-sitter" "lcl" 2
+weft::config::viewlayer ".c" "tree-sitter" "c" 2
+weft::config::viewlayer ".h" "tree-sitter" "c" 2
+weft::config::viewlayer ".json" "tree-sitter" "json" 2
+weft::config::viewlayer ".sh" "tree-sitter" "bash" 2
+weft::config::viewlayer ".js" "tree-sitter" "javascript" 2
+
+;; === Wrap Settings ===
+;; Use: weft::config::wrap extension enabled wrap-width
+;; enabled: 0 = disabled, 1 = enabled
+;; wrap-width: character width to wrap at, 0 = use pane width
+
+;; Text files: wrap at 80 characters
+weft::config::wrap ".txt" 1 80
+
+;; Markdown: wrap at pane width
+weft::config::wrap ".md" 1 0
+
+;; === Custom Handlers ===
+;; weft::config::handler name event-type script
+;; Event types: left-click, middle-click, right-click, hover
+
+;; Acme-like middle-click handler
+;; - If text starts with weft:: or load, execute as Lcl
+;; - If text looks like file path (/...), open file
+;; - Otherwise execute as shell command
+weft::config::handler "acme" "middle-click" {
+    let _sel [weft::interact::selection]
+    var text ""
+
+    if [> [len $_sel] 0] {
+        set! text [List::index $_sel 2]
+    } else {
+        set! text [weft::interact::word-at-pos]
+    }
+
+    if [== $text ""] { return }
+
+    ;; Check for weft:: command (execute as Lcl)
+    if [== [String::find $text "weft::"] 0] {
+        eval $text
+        weft::interact::handled
+        return
+    }
+
+    ;; Check for load command (execute as Lcl)
+    if [== [String::find $text "load "] 0] {
+        eval $text
+        weft::interact::handled
+        return
+    }
+
+    ;; Check for Lcl expression [...]
+    if [== [String::index $text 0] "\["] {
+        eval $text
+        weft::interact::handled
+        return
+    }
+
+    ;; Check for absolute file path (starts with /)
+    if [== [String::index $text 0] "/"] {
+        weft::buffer::open $text
+        weft::interact::handled
+        return
+    }
+
+    ;; Execute as shell command
+    let result [weft::shell::exec $text]
+    let stdout [List::index $result 3]
+    let stderr [List::index $result 5]
+
+    if [> [len $stdout] 0] {
+        weft::buffer::open-output (str "+" $text) $stdout
+    } else {
+        if [> [len $stderr] 0] {
+            weft::buffer::open-output (str "!" $text) $stderr
+        }
+    }
+
+    weft::interact::handled
+}
+
+puts "Weft config loaded"
