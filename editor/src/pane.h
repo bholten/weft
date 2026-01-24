@@ -71,8 +71,8 @@ bool pane_contains_point(const Pane *p, int x, int y);
 void pane_window_to_local(const Pane *p, int wx, int wy, int *lx, int *ly);
 void pane_local_to_window(const Pane *p, int lx, int ly, int *wx, int *wy);
 
-// Tag bar, search bar, and status bar heights
-#define TAG_BAR_HEIGHT 20
+// Search bar and status bar heights (tag bar removed - use weft::buffer::menu)
+#define TAG_BAR_HEIGHT 0
 #define SEARCH_BAR_HEIGHT 24
 #define STATUS_BAR_HEIGHT 18
 

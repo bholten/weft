@@ -557,7 +557,32 @@ SDL_AppResult SDL_AppEvent(void *app_state, SDL_Event *event) {
       return SDL_APP_CONTINUE;
     }
 
-    // Ctrl+W: Close current pane
+    // Ctrl+Shift+W: Kill current buffer (destroy buffer completely)
+    if (key == SDLK_W && (event->key.mod & SDL_KMOD_SHIFT)) {
+      if (ctx->app.focused_pane && ctx->app.layout_root) {
+        Buffer *buf = pane_get_buffer(ctx->app.focused_pane);
+        if (buf) {
+          // Build kill command with buffer ID
+          char cmd[64];
+          snprintf(cmd, sizeof(cmd), "weft::buffer::kill %u", buf->id);
+          const char *error_msg = NULL;
+          if (!lcl_host_eval(ctx->app.lcl, cmd, &error_msg)) {
+            fprintf(stderr, "Failed to kill buffer: %s\n",
+                    error_msg ? error_msg : "unknown");
+          }
+          // Update layout after potential pane closure
+          if (ctx->app.layout_root) {
+            layout_compute_bounds(ctx->app.layout_root, get_window_rect(ctx));
+          } else {
+            ctx->app.running = false;
+            return SDL_APP_SUCCESS;
+          }
+        }
+      }
+      return SDL_APP_CONTINUE;
+    }
+
+    // Ctrl+W: Close current pane (buffer survives)
     if (key == SDLK_W) {
       Pane *next =
           layout_next_pane(ctx->app.layout_root, ctx->app.focused_pane);
@@ -1058,6 +1083,7 @@ typedef struct {
   Renderer *renderer;
   Pane *focused_pane;
   uint64_t time;
+  Buffer *repl_target; // Buffer attached to REPL (for visual indicator)
 } RenderContext;
 
 // Context for updating panes
@@ -1082,6 +1108,26 @@ static void render_pane_callback(Pane *pane, void *data) {
   RenderContext *rc = (RenderContext *)data;
   bool focused = (pane == rc->focused_pane);
   pane_render(pane, rc->renderer, focused);
+
+  // Draw border if this pane's buffer is the REPL target
+  if (rc->repl_target && pane_get_buffer(pane) == rc->repl_target) {
+    SDL_Rect bounds = pane_get_bounds(pane);
+    SDL_Color border_color = {.r = 200, .g = 80, .b = 80, .a = 255}; // Reddish
+    int thickness = 2;
+
+    // Top edge
+    renderer_draw_rect(rc->renderer, bounds.x, bounds.y, bounds.w, thickness,
+                       border_color);
+    // Bottom edge
+    renderer_draw_rect(rc->renderer, bounds.x, bounds.y + bounds.h - thickness,
+                       bounds.w, thickness, border_color);
+    // Left edge
+    renderer_draw_rect(rc->renderer, bounds.x, bounds.y, thickness, bounds.h,
+                       border_color);
+    // Right edge
+    renderer_draw_rect(rc->renderer, bounds.x + bounds.w - thickness, bounds.y,
+                       thickness, bounds.h, border_color);
+  }
 }
 
 // Draw dividers between panes
@@ -1153,7 +1199,8 @@ SDL_AppResult SDL_AppIterate(void *app_state) {
   // Render all panes
   RenderContext rc = {.renderer = ctx->app.renderer,
                       .focused_pane = ctx->app.focused_pane,
-                      .time = now};
+                      .time = now,
+                      .repl_target = lcl_host_get_repl_attached_buffer(ctx->app.lcl)};
   layout_for_each_pane(ctx->app.layout_root, render_pane_callback, &rc);
 
   // Draw dividers

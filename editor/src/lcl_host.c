@@ -62,6 +62,7 @@ static void recompute_layout_bounds(LclHost *host);
 static bool is_repl_buffer(const Buffer *buf);
 static Buffer *get_effective_doc_buffer(LclHost *host);
 static bool close_focused_pane(LclHost *host);
+static bool kill_focused_pane(LclHost *host);
 static Pane *find_pane_for_buffer(LclHost *host, Buffer *buffer);
 static bool get_effective_selection_context(LclHost *host, Editor **out_editor,
                                             Buffer **out_buffer);
@@ -1544,8 +1545,8 @@ static int c_annot_apply_edit(lcl_interp *interp, int argc, lcl_value **argv,
   // Clear state
   annot_edit_clear(host);
 
-  // Close the editor pane
-  close_focused_pane(host);
+  // Kill the editor pane (destroys *annot-edit* buffer)
+  kill_focused_pane(host);
 
   // Return summary
   char result[128];
@@ -1575,8 +1576,8 @@ static int c_annot_cancel_edit(lcl_interp *interp, int argc, lcl_value **argv,
   // Clear state
   annot_edit_clear(host);
 
-  // Close the editor pane
-  close_focused_pane(host);
+  // Kill the editor pane (destroys *annot-edit* buffer)
+  kill_focused_pane(host);
 
   *out = lcl_string_new("edit cancelled");
   return LCL_RC_OK;
@@ -2458,6 +2459,20 @@ static int c_buffer_menu(lcl_interp *interp, int argc, lcl_value **argv,
                    "weft::repl::attach %u\nweft::interact::handled", buf->id);
           action_count++;
         }
+      }
+    }
+
+    // [Save] action (only for buffers with a file path)
+    if (filepath && filepath[0] != '*') {
+      pos += snprintf(menu + pos, sizeof(menu) - pos, " ");
+      if (action_count < 256) {
+        size_t action_start = pos;
+        pos += snprintf(menu + pos, sizeof(menu) - pos, "[Save]");
+        actions[action_count].start = action_start;
+        actions[action_count].end = pos;
+        snprintf(actions[action_count].handler, sizeof(actions[0].handler),
+                 "weft::buffer::save %u\nweft::interact::handled", buf->id);
+        action_count++;
       }
     }
 
@@ -3966,6 +3981,77 @@ static bool close_focused_pane(LclHost *host) {
   }
 }
 
+// Helper to kill the focused pane (close pane AND destroy buffer)
+// Used for temporary buffers like *diff* and *annot-edit*
+static bool kill_focused_pane(LclHost *host) {
+  if (!host || !host->layout_root_ptr || !host->focused_pane_ptr ||
+      !host->buffer_manager) {
+    return false;
+  }
+
+  Pane *focused = *host->focused_pane_ptr;
+  if (!focused) {
+    return false;
+  }
+
+  Buffer *buf = pane_get_buffer(focused);
+  if (!buf) {
+    return close_focused_pane(host);
+  }
+
+  // Clear associated state before destroying
+  if (host->annot_edit.target_buffer == buf) {
+    annot_edit_clear(host);
+  }
+  if (buf->file_path && strcmp(buf->file_path, "*annot-edit*") == 0) {
+    annot_edit_clear(host);
+  }
+  if (host->patch_target_buffer == buf) {
+    if (host->pending_patch) {
+      patch_free(host->pending_patch);
+      host->pending_patch = NULL;
+    }
+    host->patch_target_buffer = NULL;
+  }
+  if (buf->file_path && strcmp(buf->file_path, "*diff*") == 0) {
+    if (host->pending_patch) {
+      patch_free(host->pending_patch);
+      host->pending_patch = NULL;
+    }
+    host->patch_target_buffer = NULL;
+  }
+  if (host->repl_attached_buffer == buf) {
+    host->repl_attached_buffer = NULL;
+  }
+  if (host->current_buffer == buf) {
+    host->current_buffer = NULL;
+    host->current_editor = NULL;
+  }
+
+  // Close the pane first
+  LayoutNode *root = *host->layout_root_ptr;
+  Pane *next = layout_next_pane(root, focused);
+  if (next == focused) {
+    next = NULL;
+  }
+
+  LayoutNode *new_root = layout_close_pane(root, focused);
+
+  if (new_root) {
+    *host->layout_root_ptr = new_root;
+    *host->focused_pane_ptr = next ? next : layout_first_pane(new_root);
+    recompute_layout_bounds(host);
+  } else {
+    // Last pane - don't kill
+    return false;
+  }
+
+  // Destroy the buffer
+  buffer_manager_close(host->buffer_manager, buf);
+
+  return true;
+}
+
 // weft::pane::close -> close the currently focused pane
 static int c_pane_close(lcl_interp *interp, int argc, lcl_value **argv,
                         lcl_value **out) {
@@ -5367,8 +5453,8 @@ static int c_transform_apply(lcl_interp *interp, int argc, lcl_value **argv,
     return LCL_RC_ERR;
   }
 
-  // Close the diff buffer (currently focused pane)
-  close_focused_pane(host);
+  // Kill the diff buffer (destroys *diff* buffer)
+  kill_focused_pane(host);
 
   *out = lcl_string_new("patch applied");
   return LCL_RC_OK;
@@ -5396,8 +5482,8 @@ static int c_transform_reject(lcl_interp *interp, int argc, lcl_value **argv,
   host->pending_patch = NULL;
   host->patch_target_buffer = NULL;
 
-  // Close the diff buffer (currently focused pane)
-  close_focused_pane(host);
+  // Kill the diff buffer (destroys *diff* buffer)
+  kill_focused_pane(host);
 
   *out = lcl_string_new("patch rejected");
   return LCL_RC_OK;

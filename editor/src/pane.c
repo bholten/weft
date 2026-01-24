@@ -111,9 +111,7 @@ static size_t doc_offset_to_visual_col(const char *line_buf, size_t line_len,
   return visual_col;
 }
 
-// Tag bar command strings and their positions (computed during render)
-static const char *TAG_COMMANDS[] = {"New", "Open", "Save", "SaveAs", "Del"};
-static const int TAG_COMMAND_COUNT = 5;
+// Tag bar removed - commands now available via weft::buffer::menu (Ctrl+B)
 
 Pane *pane_new(Buffer *buffer, int char_width, int line_height) {
   if (!buffer) {
@@ -303,56 +301,6 @@ void pane_render(Pane *p, Renderer *r, bool focused) {
   SDL_Color bg_color = {.r = 30, .g = 30, .b = 30, .a = 255};
   renderer_draw_rect(r, p->bounds.x, p->bounds.y, p->bounds.w, p->bounds.h,
                      bg_color);
-
-  // Draw tag bar background
-  SDL_Color tag_bg =
-      focused
-          ? (SDL_Color){.r = 70, .g = 130, .b = 180, .a = 255}
-          // Blue when focused
-          : (SDL_Color){
-                .r = 60, .g = 60, .b = 70, .a = 255}; // Gray when not focused
-  renderer_draw_rect(r, p->bounds.x, p->bounds.y, p->bounds.w, TAG_BAR_HEIGHT,
-                     tag_bg);
-
-  // Draw tag bar content
-  SDL_Color tag_text = {.r = 255, .g = 255, .b = 255, .a = 255};
-  int tag_x = p->bounds.x + 4;
-  int tag_y = p->bounds.y + 2;
-
-  // Draw buffer ID
-  char id_buf[16];
-  snprintf(id_buf, sizeof(id_buf), "[B%u]", buf->id);
-  renderer_draw_text(r, id_buf, tag_x, tag_y, tag_text);
-  tag_x += (int)strlen(id_buf) * char_width + 4;
-
-  // Draw filename (or "untitled")
-  const char *filepath = buffer_get_file_path(buf);
-  const char *display_name = filepath ? filepath : "[untitled]";
-
-  // If path is long, just show the filename part
-  if (filepath) {
-    const char *last_slash = strrchr(filepath, '/');
-    if (last_slash) {
-      display_name = last_slash + 1;
-    }
-  }
-
-  // Add modified indicator
-  char name_buf[128];
-  if (buffer_is_modified(buf)) {
-    snprintf(name_buf, sizeof(name_buf), "*%s", display_name);
-    display_name = name_buf;
-  }
-
-  renderer_draw_text(r, display_name, tag_x, tag_y, tag_text);
-
-  // Draw commands on the right side
-  int cmd_x = p->bounds.x + p->bounds.w - 4;
-  for (int i = TAG_COMMAND_COUNT - 1; i >= 0; i--) {
-    int cmd_len = (int)strlen(TAG_COMMANDS[i]);
-    cmd_x -= cmd_len * char_width + 8; // 8px spacing between commands
-    renderer_draw_text(r, TAG_COMMANDS[i], cmd_x, tag_y, tag_text);
-  }
 
   // Draw search bar if visible
   if (p->search_visible) {
@@ -1012,43 +960,18 @@ Buffer *pane_get_buffer(Pane *p) {
 }
 
 bool pane_point_in_tag_bar(Pane *p, int x, int y) {
-  if (!p) {
-    return false;
-  }
-  return x >= p->bounds.x && x < p->bounds.x + p->bounds.w &&
-         y >= p->bounds.y && y < p->bounds.y + TAG_BAR_HEIGHT;
+  (void)p;
+  (void)x;
+  (void)y;
+  // Tag bar removed - use weft::buffer::menu (Ctrl+B) instead
+  return false;
 }
 
 TagCommand pane_tag_bar_hit_test(Pane *p, int x, int y) {
-  if (!p || !pane_point_in_tag_bar(p, x, y)) {
-    return TAG_CMD_NONE;
-  }
-
-  int char_width = p->char_width;
-
-  // Commands are drawn right-to-left starting from right edge
-  int cmd_x = p->bounds.x + p->bounds.w - 4;
-
-  // Check each command from right to left (reverse order of TAG_COMMANDS)
-  for (int i = TAG_COMMAND_COUNT - 1; i >= 0; i--) {
-    int cmd_len = (int)strlen(TAG_COMMANDS[i]);
-    int cmd_start = cmd_x - cmd_len * char_width - 8;
-    int cmd_end = cmd_x;
-
-    if (x >= cmd_start && x < cmd_end) {
-      // Map index to command
-      switch (i) {
-      case 0: return TAG_CMD_NEW;
-      case 1: return TAG_CMD_OPEN;
-      case 2: return TAG_CMD_SAVE;
-      case 3: return TAG_CMD_SAVEAS;
-      case 4: return TAG_CMD_DEL;
-      }
-    }
-
-    cmd_x = cmd_start;
-  }
-
+  (void)p;
+  (void)x;
+  (void)y;
+  // Tag bar removed - use weft::buffer::menu (Ctrl+B) instead
   return TAG_CMD_NONE;
 }
 
