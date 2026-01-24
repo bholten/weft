@@ -486,8 +486,48 @@ void pane_render(Pane *p, Renderer *r, bool focused) {
   // Get tab size from editor
   int tab_size = e->tab_size > 0 ? e->tab_size : 4;
 
+  // Draw column selection highlight (Alt+Drag block selection)
+  if (editor_in_column_mode(e)) {
+    size_t col_start_line, col_end_line;
+    int col_left_vcol, col_right_vcol;
+    editor_get_column_selection(e, &col_start_line, &col_end_line, &col_left_vcol,
+                                &col_right_vcol);
+
+    SDL_Color col_sel_color = {.r = 70, .g = 130, .b = 180, .a = 180};
+
+    for (size_t line = col_start_line; line <= col_end_line; line++) {
+      size_t line_start_pos = document_line_start(doc, line);
+      size_t line_end_pos = document_line_end(doc, line);
+      size_t line_len = line_end_pos - line_start_pos;
+
+      // Get line text for tab-aware column calculation
+      char col_line_buf[256];
+      if (line_len > sizeof(col_line_buf) - 1) {
+        line_len = sizeof(col_line_buf) - 1;
+      }
+      document_get_text(doc, line_start_pos, col_line_buf, line_len);
+
+      // Calculate x positions for left and right columns
+      int left_x = text_x + col_left_vcol * char_width;
+      int right_x = text_x + col_right_vcol * char_width;
+      int y_pos = text_y + (int)line * line_height - scroll_y;
+
+      // Clip to pane bounds
+      if (y_pos >= p->bounds.y + header_height &&
+          y_pos < p->bounds.y + p->bounds.h - STATUS_BAR_HEIGHT) {
+        // Draw selection rectangle (may be zero-width for cursor line)
+        int sel_width = right_x - left_x;
+        if (sel_width < 2) {
+          sel_width = 2; // Minimum width for visibility
+        }
+        renderer_draw_rect(r, left_x, y_pos, sel_width, line_height,
+                           col_sel_color);
+      }
+    }
+  }
+
   // Draw selection highlight
-  if (editor_has_selection(e)) {
+  if (!editor_in_column_mode(e) && editor_has_selection(e)) {
     size_t sel_start, sel_end;
     editor_get_selection(e, &sel_start, &sel_end);
 
@@ -903,18 +943,56 @@ void pane_render(Pane *p, Renderer *r, bool focused) {
   // in dialog input)
   if (!p->search_visible && !p->goto_visible && !p->prompt_visible &&
       editor_cursor_is_visible(e)) {
-    int cursor_x, cursor_y;
-    editor_pos_to_screen(e, editor_get_cursor_pos(e), &cursor_x, &cursor_y);
-
-    // Translate to window coordinates (add gutter and header_height for text
-    // area offset)
-    cursor_x += p->bounds.x + gutter_width;
-    cursor_y += p->bounds.y + header_height;
-
     SDL_Color cursor_color = {.r = 255, .g = 255, .b = 255, .a = 255};
-    if (cursor_y >= p->bounds.y + header_height &&
-        cursor_y < p->bounds.y + p->bounds.h - STATUS_BAR_HEIGHT) {
-      renderer_draw_rect(r, cursor_x, cursor_y, 2, line_height, cursor_color);
+
+    if (editor_in_column_mode(e)) {
+      // Draw multiple cursors for column mode
+      size_t col_start_line, col_end_line;
+      int col_left_vcol, col_right_vcol;
+      editor_get_column_selection(e, &col_start_line, &col_end_line,
+                                  &col_left_vcol, &col_right_vcol);
+
+      // Cursor is at the left column (insertion point)
+      int cursor_vcol = col_left_vcol;
+      if (col_right_vcol > col_left_vcol) {
+        // If there's a selection, cursor is at the active end (cursor_vcol)
+        // For now, show cursors at left edge
+      }
+
+      for (size_t line = col_start_line; line <= col_end_line; line++) {
+        int cursor_x = text_x + cursor_vcol * char_width;
+        int cursor_y = text_y + (int)line * line_height - scroll_y;
+
+        // Translate to window coordinates
+        cursor_x += p->bounds.x + gutter_width - text_x;
+        cursor_y += p->bounds.y + header_height - text_y + scroll_y;
+
+        // Recalculate properly
+        cursor_x = p->bounds.x + gutter_width + p->text_offset_x +
+                   cursor_vcol * char_width;
+        cursor_y = p->bounds.y + header_height + p->text_offset_y +
+                   (int)line * line_height - scroll_y;
+
+        if (cursor_y >= p->bounds.y + header_height &&
+            cursor_y < p->bounds.y + p->bounds.h - STATUS_BAR_HEIGHT) {
+          renderer_draw_rect(r, cursor_x, cursor_y, 2, line_height,
+                             cursor_color);
+        }
+      }
+    } else {
+      // Normal single cursor
+      int cursor_x, cursor_y;
+      editor_pos_to_screen(e, editor_get_cursor_pos(e), &cursor_x, &cursor_y);
+
+      // Translate to window coordinates (add gutter and header_height for text
+      // area offset)
+      cursor_x += p->bounds.x + gutter_width;
+      cursor_y += p->bounds.y + header_height;
+
+      if (cursor_y >= p->bounds.y + header_height &&
+          cursor_y < p->bounds.y + p->bounds.h - STATUS_BAR_HEIGHT) {
+        renderer_draw_rect(r, cursor_x, cursor_y, 2, line_height, cursor_color);
+      }
     }
   }
 }

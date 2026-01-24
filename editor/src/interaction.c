@@ -96,9 +96,22 @@ void interact_event_populate_context(InteractEvent *ie, Editor *editor) {
     return;
   }
 
-  // Get selection info
-  ie->has_selection = editor_has_selection(editor);
-  if (ie->has_selection) {
+  // Check for column selection first
+  if (editor_in_column_mode(editor)) {
+    char *col_text = editor_get_column_selection_text(editor);
+    if (col_text && col_text[0] != '\0') {
+      ie->has_selection = true;
+      ie->selected_text = col_text;
+      // For column selection, sel_start/sel_end represent the cursor position
+      ie->sel_start = editor_get_cursor_pos(editor);
+      ie->sel_end = ie->sel_start;
+    } else {
+      free(col_text);
+    }
+  }
+  // Fall back to regular selection
+  else if (editor_has_selection(editor)) {
+    ie->has_selection = true;
     editor_get_selection(editor, &ie->sel_start, &ie->sel_end);
 
     // Extract selected text

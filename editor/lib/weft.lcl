@@ -219,3 +219,60 @@ proc reverse-lines {input} {
   }
   make-transform do-reverse $input
 }
+
+;; === Acme-style Execution ===
+
+;; Execute a single command in Acme style
+;; Handles: weft:: commands, [expr], load, file paths, shell commands
+;; Returns 1 if executed, 0 if empty/skipped
+proc acme-exec {text} {
+  let trimmed [trim $text]
+  if [== $trimmed ""] { return 0 }
+
+  ;; Check for weft:: command (execute as Lcl)
+  if [starts-with? $trimmed "weft::"] {
+    eval $trimmed
+    return 1
+  }
+
+  ;; Check for load command (execute as Lcl)
+  if [starts-with? $trimmed "load "] {
+    eval $trimmed
+    return 1
+  }
+
+  ;; Check for Lcl expression [...]
+  if [== [String::index $trimmed 0] "\["] {
+    eval $trimmed
+    return 1
+  }
+
+  ;; Check for absolute file path (starts with /)
+  if [== [String::index $trimmed 0] "/"] {
+    weft::buffer::open $trimmed
+    return 1
+  }
+
+  ;; Execute as shell command
+  let result [weft::shell::exec $trimmed]
+  let stdout [List::index $result 3]
+  let stderr [List::index $result 5]
+
+  if [> [len $stdout] 0] {
+    weft::buffer::open-output [String::join [list "+" $trimmed] ""] $stdout
+  } else {
+    if [> [len $stderr] 0] {
+      weft::buffer::open-output [String::join [list "!" $trimmed] ""] $stderr
+    }
+  }
+  return 1
+}
+
+;; Execute multiple lines in Acme style
+;; Splits text by newlines and executes each non-empty line
+proc acme-exec-lines {text} {
+  let text_lines [lines $text]
+  foreach line $text_lines {
+    acme-exec $line
+  }
+}

@@ -276,3 +276,33 @@ target_compile_definitions(weft PRIVATE
   ${WEFT_TS_PARSER_DEFINES}
   WEFT_SUBMODULES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../submodules"
 )
+
+# === Tests ===
+option(WEFT_BUILD_TESTS "Build test executables" ON)
+
+if(WEFT_BUILD_TESTS)
+  enable_testing()
+
+  # Test for document module
+  add_executable(test_document
+    tests/test_document.c
+    src/document.c
+  )
+  target_compile_options(test_document PRIVATE ${WEFT_COMPILE_OPTIONS})
+  add_test(NAME document COMMAND test_document)
+
+  # Test for annotation store module
+  add_executable(test_annot_store
+    tests/test_annot_store.c
+    src/annot_store.c
+  )
+  target_compile_options(test_annot_store PRIVATE ${WEFT_COMPILE_OPTIONS})
+  add_test(NAME annot_store COMMAND test_annot_store)
+
+  # Custom target to run all tests
+  add_custom_target(check
+    COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
+    DEPENDS test_document test_annot_store
+    COMMENT "Running all tests"
+  )
+endif()

@@ -31,6 +31,13 @@ typedef struct Editor {
       selection_anchor; // SIZE_MAX = no selection, otherwise start of selection
   bool mouse_dragging;  // True while dragging to select
 
+  // Column selection state (Alt+Drag)
+  bool column_mode;          // true when in column/block selection
+  size_t column_anchor_line; // line number where selection started
+  int column_anchor_vcol;    // visual column where selection started
+  size_t column_cursor_line; // current line number
+  int column_cursor_vcol;    // current visual column
+
   // Undo/redo stacks
   EditOp *undo_stack; // Operations that can be undone
   EditOp *redo_stack; // Operations that can be redone
@@ -122,6 +129,19 @@ void editor_get_selection(const Editor *e, size_t *start, size_t *end);
 void editor_clear_selection(Editor *e);
 void editor_select_all(Editor *e);
 void editor_delete_selection(Editor *e);
+
+// Column selection (Alt+Drag block selection)
+bool editor_in_column_mode(const Editor *e);
+void editor_clear_column_mode(Editor *e);
+void editor_get_column_selection(const Editor *e, size_t *start_line,
+                                 size_t *end_line, int *left_vcol,
+                                 int *right_vcol);
+int editor_pos_to_vcol(const Editor *e, size_t pos);
+size_t editor_vcol_to_pos(const Editor *e, size_t line, int vcol);
+void editor_column_insert_char(Editor *e, const char *text, size_t len);
+void editor_column_delete_backward(Editor *e);
+void editor_column_delete_forward(Editor *e);
+char *editor_get_column_selection_text(const Editor *e); // Returns malloc'd string, caller frees
 
 // Clipboard
 bool editor_copy(

@@ -497,7 +497,16 @@ bool editor_handle_event(Editor *e, const InputEvent *event) {
     bool ctrl_held = (event->key.mod & SDL_KMOD_CTRL) != 0;
 
     switch (key) {
+    case SDLK_ESCAPE:
+      if (e->column_mode) {
+        editor_clear_column_mode(e);
+        reset_blink(e, now);
+        return true;
+      }
+      break;
+
     case SDLK_LEFT:
+      editor_clear_column_mode(e);
       if (shift_held) {
         if (e->selection_anchor == SIZE_MAX) {
           e->selection_anchor = e->cursor_pos;
@@ -514,6 +523,7 @@ bool editor_handle_event(Editor *e, const InputEvent *event) {
       return true;
 
     case SDLK_RIGHT:
+      editor_clear_column_mode(e);
       if (shift_held) {
         if (e->selection_anchor == SIZE_MAX) {
           e->selection_anchor = e->cursor_pos;
@@ -530,6 +540,7 @@ bool editor_handle_event(Editor *e, const InputEvent *event) {
       return true;
 
     case SDLK_UP:
+      editor_clear_column_mode(e);
       if (shift_held) {
         if (e->selection_anchor == SIZE_MAX) {
           e->selection_anchor = e->cursor_pos;
@@ -542,6 +553,7 @@ bool editor_handle_event(Editor *e, const InputEvent *event) {
       return true;
 
     case SDLK_DOWN:
+      editor_clear_column_mode(e);
       if (shift_held) {
         if (e->selection_anchor == SIZE_MAX) {
           e->selection_anchor = e->cursor_pos;
@@ -554,6 +566,7 @@ bool editor_handle_event(Editor *e, const InputEvent *event) {
       return true;
 
     case SDLK_HOME:
+      editor_clear_column_mode(e);
       if (shift_held) {
         if (e->selection_anchor == SIZE_MAX) {
           e->selection_anchor = e->cursor_pos;
@@ -566,6 +579,7 @@ bool editor_handle_event(Editor *e, const InputEvent *event) {
       return true;
 
     case SDLK_END:
+      editor_clear_column_mode(e);
       if (shift_held) {
         if (e->selection_anchor == SIZE_MAX) {
           e->selection_anchor = e->cursor_pos;
@@ -578,6 +592,7 @@ bool editor_handle_event(Editor *e, const InputEvent *event) {
       return true;
 
     case SDLK_PAGEUP:
+      editor_clear_column_mode(e);
       if (shift_held) {
         if (e->selection_anchor == SIZE_MAX) {
           e->selection_anchor = e->cursor_pos;
@@ -590,6 +605,7 @@ bool editor_handle_event(Editor *e, const InputEvent *event) {
       return true;
 
     case SDLK_PAGEDOWN:
+      editor_clear_column_mode(e);
       if (shift_held) {
         if (e->selection_anchor == SIZE_MAX) {
           e->selection_anchor = e->cursor_pos;
@@ -602,7 +618,9 @@ bool editor_handle_event(Editor *e, const InputEvent *event) {
       return true;
 
     case SDLK_BACKSPACE:
-      if (ctrl_held) {
+      if (e->column_mode) {
+        editor_column_delete_backward(e);
+      } else if (ctrl_held) {
         editor_delete_word_backward(e);
       } else {
         editor_delete_backward(e);
@@ -611,7 +629,9 @@ bool editor_handle_event(Editor *e, const InputEvent *event) {
       return true;
 
     case SDLK_DELETE:
-      if (ctrl_held) {
+      if (e->column_mode) {
+        editor_column_delete_forward(e);
+      } else if (ctrl_held) {
         editor_delete_word_forward(e);
       } else {
         editor_delete_forward(e);
@@ -620,22 +640,38 @@ bool editor_handle_event(Editor *e, const InputEvent *event) {
       return true;
 
     case SDLK_RETURN:
+      // Exit column mode before inserting newline
+      editor_clear_column_mode(e);
       editor_insert_text(e, "\n", 1);
       reset_blink(e, now);
       return true;
 
     case SDLK_TAB:
-      if (e->use_tabs) {
-        editor_insert_text(e, "\t", 1);
-      } else {
-        // Insert spaces instead of tab
-        char spaces[16];
-        int count = e->tab_size > 0 ? e->tab_size : 4;
-        if (count > 16) {
-          count = 16;
+      if (e->column_mode) {
+        if (e->use_tabs) {
+          editor_column_insert_char(e, "\t", 1);
+        } else {
+          char spaces[16];
+          int count = e->tab_size > 0 ? e->tab_size : 4;
+          if (count > 16) {
+            count = 16;
+          }
+          memset(spaces, ' ', (size_t)count);
+          editor_column_insert_char(e, spaces, (size_t)count);
         }
-        memset(spaces, ' ', (size_t)count);
-        editor_insert_text(e, spaces, (size_t)count);
+      } else {
+        if (e->use_tabs) {
+          editor_insert_text(e, "\t", 1);
+        } else {
+          // Insert spaces instead of tab
+          char spaces[16];
+          int count = e->tab_size > 0 ? e->tab_size : 4;
+          if (count > 16) {
+            count = 16;
+          }
+          memset(spaces, ' ', (size_t)count);
+          editor_insert_text(e, spaces, (size_t)count);
+        }
       }
       reset_blink(e, now);
       return true;
@@ -706,7 +742,11 @@ bool editor_handle_event(Editor *e, const InputEvent *event) {
   case INPUT_TEXT: {
     size_t len = strlen(event->text.text);
     if (len > 0) {
-      editor_insert_text(e, event->text.text, len);
+      if (e->column_mode) {
+        editor_column_insert_char(e, event->text.text, len);
+      } else {
+        editor_insert_text(e, event->text.text, len);
+      }
       reset_blink(e, now);
       return true;
     }
@@ -717,19 +757,41 @@ bool editor_handle_event(Editor *e, const InputEvent *event) {
     if (event->mouse.button == 1) { // Left click
       size_t pos = editor_screen_to_pos(e, event->mouse.x, event->mouse.y);
       bool shift_held = (event->mouse.mod & SDL_KMOD_SHIFT) != 0;
+      bool ctrl_held = (event->mouse.mod & SDL_KMOD_CTRL) != 0;
 
-      if (shift_held) {
+      if (ctrl_held && !shift_held) {
+        // Ctrl+click: start column selection
+        editor_clear_selection(e);
+        e->column_mode = true;
+        e->mouse_dragging = true;
+
+        size_t line = document_pos_to_line(e->buffer->document, pos);
+
+        // Calculate visual column directly from x coordinate
+        // This allows selecting into "virtual space" past line ends
+        int relative_x = event->mouse.x - e->text_offset_x;
+        int vcol = (relative_x > 0) ? (relative_x / e->char_width) : 0;
+
+        e->column_anchor_line = line;
+        e->column_anchor_vcol = vcol;
+        e->column_cursor_line = line;
+        e->column_cursor_vcol = vcol;
+        e->cursor_pos = pos;
+      } else if (shift_held) {
         // Shift+click: extend selection from current cursor
+        editor_clear_column_mode(e);
         if (e->selection_anchor == SIZE_MAX) {
           e->selection_anchor = e->cursor_pos;
         }
+        e->cursor_pos = pos;
       } else {
         // Plain click: start drag selection
+        editor_clear_column_mode(e);
         e->selection_anchor = pos;
         e->mouse_dragging = true;
+        e->cursor_pos = pos;
       }
 
-      e->cursor_pos = pos;
       update_target_column(e);
       reset_blink(e, now);
       return true;
@@ -752,6 +814,28 @@ bool editor_handle_event(Editor *e, const InputEvent *event) {
   case INPUT_MOUSE_MOVE: {
     if (e->mouse_dragging) {
       size_t pos = editor_screen_to_pos(e, event->mouse.x, event->mouse.y);
+
+      if (e->column_mode) {
+        // Update column selection cursor
+        // Calculate line from y coordinate
+        int relative_y = event->mouse.y + e->scroll_y - e->text_offset_y;
+        size_t line = 0;
+        if (relative_y > 0) {
+          line = (size_t)(relative_y / e->line_height);
+        }
+        size_t line_count = document_line_count(e->buffer->document);
+        if (line >= line_count) {
+          line = line_count > 0 ? line_count - 1 : 0;
+        }
+
+        // Calculate visual column directly from x (allows virtual columns)
+        int relative_x = event->mouse.x - e->text_offset_x;
+        int vcol = (relative_x > 0) ? (relative_x / e->char_width) : 0;
+
+        e->column_cursor_line = line;
+        e->column_cursor_vcol = vcol;
+      }
+
       e->cursor_pos = pos;
       update_target_column(e);
       reset_blink(e, now);
@@ -1903,4 +1987,374 @@ void editor_scroll_to_cursor(Editor *e) {
   if (e->scroll_y < 0) {
     e->scroll_y = 0;
   }
+}
+
+// === Column Selection ===
+
+bool editor_in_column_mode(const Editor *e) {
+  return e && e->column_mode;
+}
+
+void editor_clear_column_mode(Editor *e) {
+  if (!e) {
+    return;
+  }
+  e->column_mode = false;
+  e->column_anchor_line = 0;
+  e->column_anchor_vcol = 0;
+  e->column_cursor_line = 0;
+  e->column_cursor_vcol = 0;
+}
+
+int editor_pos_to_vcol(const Editor *e, size_t pos) {
+  if (!e || !e->buffer || !e->buffer->document) {
+    return 0;
+  }
+
+  Document *doc = e->buffer->document;
+  size_t line = document_pos_to_line(doc, pos);
+  size_t line_start = document_line_start(doc, line);
+  size_t line_end = document_line_end(doc, line);
+  size_t offset = pos - line_start;
+
+  // Get line content
+  char line_buf[256];
+  size_t line_len = line_end - line_start;
+  if (line_len > sizeof(line_buf) - 1) {
+    line_len = sizeof(line_buf) - 1;
+  }
+  document_get_text(doc, line_start, line_buf, line_len);
+
+  // Convert to visual column using existing helper
+  return (int)doc_col_to_visual(line_buf, line_len, offset, e->tab_size);
+}
+
+size_t editor_vcol_to_pos(const Editor *e, size_t line, int vcol) {
+  if (!e || !e->buffer || !e->buffer->document) {
+    return 0;
+  }
+
+  Document *doc = e->buffer->document;
+  size_t line_count = document_line_count(doc);
+  if (line >= line_count) {
+    line = line_count > 0 ? line_count - 1 : 0;
+  }
+
+  size_t line_start = document_line_start(doc, line);
+  size_t line_end = document_line_end(doc, line);
+
+  // Get line content
+  char line_buf[256];
+  size_t line_len = line_end - line_start;
+  if (line_len > sizeof(line_buf) - 1) {
+    line_len = sizeof(line_buf) - 1;
+  }
+  document_get_text(doc, line_start, line_buf, line_len);
+
+  // Convert visual column to document offset using existing helper
+  size_t doc_offset =
+      visual_col_to_doc(line_buf, line_len, (size_t)vcol, e->tab_size);
+
+  return line_start + doc_offset;
+}
+
+void editor_get_column_selection(const Editor *e, size_t *start_line,
+                                 size_t *end_line, int *left_vcol,
+                                 int *right_vcol) {
+  if (!e || !start_line || !end_line || !left_vcol || !right_vcol) {
+    return;
+  }
+
+  // Normalize line range (start <= end)
+  if (e->column_anchor_line <= e->column_cursor_line) {
+    *start_line = e->column_anchor_line;
+    *end_line = e->column_cursor_line;
+  } else {
+    *start_line = e->column_cursor_line;
+    *end_line = e->column_anchor_line;
+  }
+
+  // Normalize column range (left <= right)
+  if (e->column_anchor_vcol <= e->column_cursor_vcol) {
+    *left_vcol = e->column_anchor_vcol;
+    *right_vcol = e->column_cursor_vcol;
+  } else {
+    *left_vcol = e->column_cursor_vcol;
+    *right_vcol = e->column_anchor_vcol;
+  }
+}
+
+// Helper: Pad line with spaces to reach target visual column
+static void ensure_line_length(Editor *e, size_t line, int target_vcol) {
+  if (!e || !e->buffer || !e->buffer->document) {
+    return;
+  }
+
+  Document *doc = e->buffer->document;
+  size_t line_end = document_line_end(doc, line);
+
+  // Get current visual length of line
+  int current_vcol = editor_pos_to_vcol(e, line_end);
+
+  if (current_vcol < target_vcol) {
+    // Need to add spaces
+    int spaces_needed = target_vcol - current_vcol;
+    char spaces[256];
+    if (spaces_needed > (int)sizeof(spaces) - 1) {
+      spaces_needed = (int)sizeof(spaces) - 1;
+    }
+    memset(spaces, ' ', (size_t)spaces_needed);
+
+    document_insert(doc, line_end, spaces, (size_t)spaces_needed);
+    annot_store_on_insert(e->buffer->annots, line_end, (size_t)spaces_needed);
+    record_edit(e, EDIT_INSERT, line_end, spaces, (size_t)spaces_needed);
+  }
+}
+
+void editor_column_insert_char(Editor *e, const char *text, size_t len) {
+  if (!e || !text || len == 0 || !e->column_mode) {
+    return;
+  }
+
+  size_t start_line, end_line;
+  int left_vcol, right_vcol;
+  editor_get_column_selection(e, &start_line, &end_line, &left_vcol,
+                              &right_vcol);
+
+  // Process lines in reverse order to keep byte offsets valid
+  for (size_t i = end_line + 1; i > start_line; i--) {
+    size_t line = i - 1;
+
+    // First, ensure line is long enough
+    ensure_line_length(e, line, left_vcol);
+
+    // If selection has width, delete the selected portion
+    if (right_vcol > left_vcol) {
+      size_t del_start = editor_vcol_to_pos(e, line, left_vcol);
+      size_t del_end = editor_vcol_to_pos(e, line, right_vcol);
+
+      if (del_end > del_start) {
+        size_t del_len = del_end - del_start;
+
+        // Get deleted text for undo
+        char *deleted = malloc(del_len + 1);
+        if (deleted) {
+          document_get_text(e->buffer->document, del_start, deleted, del_len);
+          deleted[del_len] = '\0';
+
+          document_delete(e->buffer->document, del_start, del_len);
+          annot_store_on_delete(e->buffer->annots, del_start, del_len);
+          record_edit(e, EDIT_DELETE, del_start, deleted, del_len);
+          free(deleted);
+        }
+      }
+    }
+
+    // Insert text at the left column
+    size_t insert_pos = editor_vcol_to_pos(e, line, left_vcol);
+    document_insert(e->buffer->document, insert_pos, text, len);
+    annot_store_on_insert(e->buffer->annots, insert_pos, len);
+    record_edit(e, EDIT_INSERT, insert_pos, text, len);
+  }
+
+  // Update column cursor position (move right by inserted text width)
+  e->column_anchor_vcol = left_vcol + (int)len;
+  e->column_cursor_vcol = e->column_anchor_vcol;
+
+  // Update regular cursor to match
+  e->cursor_pos = editor_vcol_to_pos(e, e->column_cursor_line, e->column_cursor_vcol);
+  editor_scroll_to_cursor(e);
+}
+
+void editor_column_delete_backward(Editor *e) {
+  if (!e || !e->column_mode) {
+    return;
+  }
+
+  size_t start_line, end_line;
+  int left_vcol, right_vcol;
+  editor_get_column_selection(e, &start_line, &end_line, &left_vcol,
+                              &right_vcol);
+
+  // If selection has width, delete selection
+  // Otherwise, delete one character before cursor column on each line
+  bool has_width = (right_vcol > left_vcol);
+  int del_start_vcol = has_width ? left_vcol : (left_vcol > 0 ? left_vcol - 1 : 0);
+  int del_end_vcol = has_width ? right_vcol : left_vcol;
+
+  if (del_start_vcol >= del_end_vcol && !has_width && left_vcol == 0) {
+    return; // Nothing to delete
+  }
+
+  // Process lines in reverse order
+  for (size_t i = end_line + 1; i > start_line; i--) {
+    size_t line = i - 1;
+
+    size_t del_start = editor_vcol_to_pos(e, line, del_start_vcol);
+    size_t del_end = editor_vcol_to_pos(e, line, del_end_vcol);
+
+    // Only delete if there's actual content
+    size_t line_end = document_line_end(e->buffer->document, line);
+    if (del_start >= line_end) {
+      continue; // Line too short, nothing to delete
+    }
+    if (del_end > line_end) {
+      del_end = line_end;
+    }
+
+    if (del_end > del_start) {
+      size_t del_len = del_end - del_start;
+
+      char *deleted = malloc(del_len + 1);
+      if (deleted) {
+        document_get_text(e->buffer->document, del_start, deleted, del_len);
+        deleted[del_len] = '\0';
+
+        document_delete(e->buffer->document, del_start, del_len);
+        annot_store_on_delete(e->buffer->annots, del_start, del_len);
+        record_edit(e, EDIT_DELETE, del_start, deleted, del_len);
+        free(deleted);
+      }
+    }
+  }
+
+  // Update column cursor
+  e->column_anchor_vcol = del_start_vcol;
+  e->column_cursor_vcol = del_start_vcol;
+  e->cursor_pos = editor_vcol_to_pos(e, e->column_cursor_line, e->column_cursor_vcol);
+  editor_scroll_to_cursor(e);
+}
+
+char *editor_get_column_selection_text(const Editor *e) {
+  if (!e || !e->column_mode || !e->buffer || !e->buffer->document) {
+    return NULL;
+  }
+
+  size_t start_line, end_line;
+  int left_vcol, right_vcol;
+  editor_get_column_selection(e, &start_line, &end_line, &left_vcol, &right_vcol);
+
+  // If zero width, return NULL (no selection)
+  if (left_vcol >= right_vcol) {
+    return NULL;
+  }
+
+  Document *doc = e->buffer->document;
+
+  // Calculate total buffer size needed
+  size_t total_len = 0;
+  size_t num_lines = end_line - start_line + 1;
+
+  for (size_t line = start_line; line <= end_line; line++) {
+    size_t line_start = document_line_start(doc, line);
+    size_t line_end = document_line_end(doc, line);
+
+    size_t sel_start_pos = editor_vcol_to_pos(e, line, left_vcol);
+    size_t sel_end_pos = editor_vcol_to_pos(e, line, right_vcol);
+
+    // Clamp to line bounds
+    if (sel_start_pos > line_end) {
+      sel_start_pos = line_end;
+    }
+    if (sel_end_pos > line_end) {
+      sel_end_pos = line_end;
+    }
+
+    if (sel_end_pos > sel_start_pos) {
+      total_len += sel_end_pos - sel_start_pos;
+    }
+  }
+
+  // Add space for newlines between lines
+  total_len += num_lines - 1;
+
+  char *result = malloc(total_len + 1);
+  if (!result) {
+    return NULL;
+  }
+
+  // Extract text from each line
+  size_t pos = 0;
+  for (size_t line = start_line; line <= end_line; line++) {
+    if (line > start_line) {
+      result[pos++] = '\n';
+    }
+
+    size_t line_start = document_line_start(doc, line);
+    size_t line_end = document_line_end(doc, line);
+
+    size_t sel_start_pos = editor_vcol_to_pos(e, line, left_vcol);
+    size_t sel_end_pos = editor_vcol_to_pos(e, line, right_vcol);
+
+    // Clamp to line bounds
+    if (sel_start_pos > line_end) {
+      sel_start_pos = line_end;
+    }
+    if (sel_end_pos > line_end) {
+      sel_end_pos = line_end;
+    }
+
+    if (sel_end_pos > sel_start_pos) {
+      size_t len = sel_end_pos - sel_start_pos;
+      document_get_text(doc, sel_start_pos, result + pos, len);
+      pos += len;
+    }
+  }
+
+  result[pos] = '\0';
+  return result;
+}
+
+void editor_column_delete_forward(Editor *e) {
+  if (!e || !e->column_mode) {
+    return;
+  }
+
+  size_t start_line, end_line;
+  int left_vcol, right_vcol;
+  editor_get_column_selection(e, &start_line, &end_line, &left_vcol,
+                              &right_vcol);
+
+  // If selection has width, delete selection
+  // Otherwise, delete one character at cursor column on each line
+  bool has_width = (right_vcol > left_vcol);
+  int del_end_vcol = has_width ? right_vcol : left_vcol + 1;
+
+  // Process lines in reverse order
+  for (size_t i = end_line + 1; i > start_line; i--) {
+    size_t line = i - 1;
+
+    size_t del_start = editor_vcol_to_pos(e, line, left_vcol);
+    size_t del_end = editor_vcol_to_pos(e, line, del_end_vcol);
+
+    // Only delete if there's actual content
+    size_t line_end = document_line_end(e->buffer->document, line);
+    if (del_start >= line_end) {
+      continue; // Line too short, nothing to delete
+    }
+    if (del_end > line_end) {
+      del_end = line_end;
+    }
+
+    if (del_end > del_start) {
+      size_t del_len = del_end - del_start;
+
+      char *deleted = malloc(del_len + 1);
+      if (deleted) {
+        document_get_text(e->buffer->document, del_start, deleted, del_len);
+        deleted[del_len] = '\0';
+
+        document_delete(e->buffer->document, del_start, del_len);
+        annot_store_on_delete(e->buffer->annots, del_start, del_len);
+        record_edit(e, EDIT_DELETE, del_start, deleted, del_len);
+        free(deleted);
+      }
+    }
+  }
+
+  // Column cursor stays at left_vcol
+  e->column_anchor_vcol = left_vcol;
+  e->column_cursor_vcol = left_vcol;
+  e->cursor_pos = editor_vcol_to_pos(e, e->column_cursor_line, e->column_cursor_vcol);
+  editor_scroll_to_cursor(e);
 }
