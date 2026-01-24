@@ -97,61 +97,24 @@ weft::config::wrap ".md" 1 0
 ;; Event types: left-click, middle-click, right-click, hover
 
 ;; Acme-like middle-click handler
+;; - Supports multi-line selections (executes each line)
 ;; - If text starts with weft:: or load, execute as Lcl
 ;; - If text looks like file path (/...), open file
 ;; - Otherwise execute as shell command
 weft::config::handler "acme" "middle-click" {
     let _sel [weft::interact::selection]
-    var text ""
+    var _text ""
 
     if [> [len $_sel] 0] {
-        set! text [List::index $_sel 2]
+        set! _text [List::index $_sel 2]
     } else {
-        set! text [weft::interact::word-at-pos]
+        set! _text [weft::interact::word-at-pos]
     }
 
-    if [== $text ""] { return }
+    if [== $_text ""] { return }
 
-    ;; Check for weft:: command (execute as Lcl)
-    if [== [String::find $text "weft::"] 0] {
-        eval $text
-        weft::interact::handled
-        return
-    }
-
-    ;; Check for load command (execute as Lcl)
-    if [== [String::find $text "load "] 0] {
-        eval $text
-        weft::interact::handled
-        return
-    }
-
-    ;; Check for Lcl expression [...]
-    if [== [String::index $text 0] "\["] {
-        eval $text
-        weft::interact::handled
-        return
-    }
-
-    ;; Check for absolute file path (starts with /)
-    if [== [String::index $text 0] "/"] {
-        weft::buffer::open $text
-        weft::interact::handled
-        return
-    }
-
-    ;; Execute as shell command
-    let result [weft::shell::exec $text]
-    let stdout [List::index $result 3]
-    let stderr [List::index $result 5]
-
-    if [> [len $stdout] 0] {
-        weft::buffer::open-output (str "+" $text) $stdout
-    } else {
-        if [> [len $stderr] 0] {
-            weft::buffer::open-output (str "!" $text) $stderr
-        }
-    }
+    ;; Execute each line (handles both single and multi-line)
+    acme-exec-lines $_text
 
     weft::interact::handled
 }
