@@ -2785,6 +2785,63 @@ static int c_buffer_kill(lcl_interp *interp, int argc, lcl_value **argv,
   return LCL_RC_OK;
 }
 
+// weft::buffer::new -> opens a new buffer
+static int c_buffer_new(lcl_interp *interp, int argc, lcl_value **argv,
+                        lcl_value **out) {
+  LclHost *host = lcl_interp_get_user_data(interp);
+
+  if (!host || !host->buffer_manager || !host->layout_root_ptr) {
+    lcl_set_error(interp, "no buffer manager context");
+    return LCL_RC_ERR;
+  }
+
+  Buffer *new_buffer = buffer_manager_create(host->buffer_manager);
+
+  if (!new_buffer) {
+    lcl_set_error(interp, "failed to create new buffer");
+    return LCL_RC_ERR;
+  }
+
+  // Create a new pane for this buffer using renderer metrics
+  Pane *new_pane = pane_new(new_buffer, host->char_width, host->line_height);
+
+  if (!new_pane) {
+    buffer_manager_close(host->buffer_manager, new_buffer);
+    lcl_set_error(interp, "buffer::new: failed to create pane");
+    return LCL_RC_ERR;
+  }
+
+  // Apply viewlayer configuration based on file type
+  lcl_host_apply_viewlayers(host, new_pane);
+
+  // Apply indent settings based on file type
+  lcl_host_apply_indent(host, pane_get_editor(new_pane));
+
+  // Apply wrap settings based on file type
+  lcl_host_apply_wrap(host, pane_get_editor(new_pane));
+
+  // Split current pane horizontally to show new pane
+  // Find the current focused pane's layout node
+  LayoutNode *root = *host->layout_root_ptr;
+  LayoutNode *new_split = layout_split_horizontal(root, new_pane);
+
+  if (new_split && !new_split->parent) {
+    *host->layout_root_ptr = new_split;
+  }
+
+  // Recompute layout bounds
+  recompute_layout_bounds(host);
+
+  // Focus the new pane
+  if (host->focused_pane_ptr) {
+    *host->focused_pane_ptr = new_pane;
+  }
+
+  *out = lcl_list_new();
+
+  return LCL_RC_OK;
+}
+
 // weft::buffer::open path -> open file in new pane
 static int c_buffer_open(lcl_interp *interp, int argc, lcl_value **argv,
                          lcl_value **out) {
@@ -2827,6 +2884,7 @@ static int c_buffer_open(lcl_interp *interp, int argc, lcl_value **argv,
 
   // Create a new pane for this buffer using renderer metrics
   Pane *new_pane = pane_new(new_buffer, host->char_width, host->line_height);
+
   if (!new_pane) {
     buffer_manager_close(host->buffer_manager, new_buffer);
     lcl_set_error(interp, "buffer::open: failed to create pane");
@@ -5865,6 +5923,8 @@ static void register_weft_bindings(lcl_interp *interp) {
              lcl_c_proc_new("weft::buffer::show", c_buffer_show));
   lcl_ns_def(buffer_ns, "kill",
              lcl_c_proc_new("weft::buffer::kill", c_buffer_kill));
+  lcl_ns_def(buffer_ns, "new",
+             lcl_c_proc_new("weft::buffer::new", c_buffer_new));
 
   // Create weft::pane namespace for pane operations
   lcl_value *pane_ns = lcl_ns_new("pane");

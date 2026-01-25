@@ -18,6 +18,7 @@
 
 weft::config::keybind "ctrl+t" { weft::transform::menu }
 weft::config::keybind "ctrl+b" { weft::buffer::menu }
+weft::config::keybind "ctrl+n" { weft::buffer::new }
 
   ;; Annotation editor
 weft::config::keybind "ctrl+e" {
