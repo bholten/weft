@@ -64,6 +64,7 @@ static Buffer *get_effective_doc_buffer(LclHost *host);
 static bool close_focused_pane(LclHost *host);
 static bool kill_focused_pane(LclHost *host);
 static Pane *find_pane_for_buffer(LclHost *host, Buffer *buffer);
+static char *expand_path(const char *path);
 static bool get_effective_selection_context(LclHost *host, Editor **out_editor,
                                             Buffer **out_buffer);
 
@@ -2856,18 +2857,61 @@ static int c_buffer_open(lcl_interp *interp, int argc, lcl_value **argv,
     return LCL_RC_ERR;
   }
 
-  const char *path = lcl_value_to_string(argv[0]);
-  if (!path) {
+  const char *path_arg = lcl_value_to_string(argv[0]);
+  if (!path_arg) {
     lcl_set_error(interp, "buffer::open: path must be a string");
     return LCL_RC_ERR;
+  }
+
+  // Expand ~ and make path absolute
+  char *path = expand_path(path_arg);
+  if (!path) {
+    lcl_set_error(interp, "buffer::open: failed to expand path");
+    return LCL_RC_ERR;
+  }
+
+  // Check if buffer already exists for this file
+  Buffer *existing = buffer_manager_find_by_path(host->buffer_manager, path);
+  if (existing) {
+    // Buffer exists - check if it has a pane
+    Pane *existing_pane = find_pane_for_buffer(host, existing);
+    if (existing_pane) {
+      // Just focus it
+      if (host->focused_pane_ptr) {
+        *host->focused_pane_ptr = existing_pane;
+      }
+      free(path);
+      *out = lcl_int_new((long)existing->id);
+      return LCL_RC_OK;
+    }
+
+    // Buffer exists but has no pane - create one
+    Pane *new_pane = pane_new(existing, host->char_width, host->line_height);
+    if (new_pane) {
+      lcl_host_apply_viewlayers(host, new_pane);
+      LayoutNode *root = *host->layout_root_ptr;
+      LayoutNode *new_split = layout_split_horizontal(root, new_pane);
+      if (new_split && !new_split->parent) {
+        *host->layout_root_ptr = new_split;
+      }
+      recompute_layout_bounds(host);
+      if (host->focused_pane_ptr) {
+        *host->focused_pane_ptr = new_pane;
+      }
+    }
+    free(path);
+    *out = lcl_int_new((long)existing->id);
+    return LCL_RC_OK;
   }
 
   // Open file in buffer manager
   Buffer *new_buffer = buffer_manager_open_file(host->buffer_manager, path);
   if (!new_buffer) {
     lcl_set_error(interp, "buffer::open: failed to open file");
+    free(path);
     return LCL_RC_ERR;
   }
+  free(path);
 
   // Load persisted annotations for this file
   if (host->data_dir && host->doc_registry) {
@@ -2917,7 +2961,7 @@ static int c_buffer_open(lcl_interp *interp, int argc, lcl_value **argv,
     *host->focused_pane_ptr = new_pane;
   }
 
-  *out = lcl_list_new();
+  *out = lcl_int_new((long)new_buffer->id);
   return LCL_RC_OK;
 }
 
@@ -3095,6 +3139,53 @@ static int c_repl_open(lcl_interp *interp, int argc, lcl_value **argv,
 // Helper: Check if a buffer is the REPL buffer
 static bool is_repl_buffer(const Buffer *buf) {
   return buf && buf->file_path && strcmp(buf->file_path, "*lcl*") == 0;
+}
+
+// Helper: Expand path with ~ home directory and make absolute
+// Returns a newly allocated string that must be freed, or NULL on error
+static char *expand_path(const char *path) {
+  if (!path) {
+    return NULL;
+  }
+
+  char expanded[PATH_MAX];
+
+  if (path[0] == '~') {
+    // Expand ~ to home directory
+    const char *home = getenv("HOME");
+    if (!home) {
+      return NULL;
+    }
+    if (path[1] == '\0') {
+      // Just "~"
+      snprintf(expanded, sizeof(expanded), "%s", home);
+    } else if (path[1] == '/') {
+      // "~/something"
+      snprintf(expanded, sizeof(expanded), "%s%s", home, path + 1);
+    } else {
+      // "~user" - not supported, just use as-is
+      snprintf(expanded, sizeof(expanded), "%s", path);
+    }
+  } else if (path[0] != '/') {
+    // Relative path - make absolute from cwd
+    char cwd[PATH_MAX];
+    if (getcwd(cwd, sizeof(cwd)) == NULL) {
+      return NULL;
+    }
+    snprintf(expanded, sizeof(expanded), "%s/%s", cwd, path);
+  } else {
+    // Already absolute
+    snprintf(expanded, sizeof(expanded), "%s", path);
+  }
+
+  // Normalize the path using realpath if possible (resolves .., symlinks)
+  char *resolved = realpath(expanded, NULL);
+  if (resolved) {
+    return resolved;
+  }
+
+  // realpath failed (file doesn't exist yet?) - return expanded path
+  return strdup(expanded);
 }
 
 // Helper: Get the effective buffer for doc commands
@@ -3921,6 +4012,28 @@ static int c_inspect_at(lcl_interp *interp, int argc, lcl_value **argv,
   return LCL_RC_OK;
 }
 
+// Helper: Jump editor to a specific line (1-indexed)
+static void jump_to_line(Editor *editor, Buffer *buffer, long line_num) {
+  if (!editor || !buffer || !buffer->document) {
+    return;
+  }
+
+  // Convert 1-indexed line to 0-indexed
+  size_t line_idx = (size_t)(line_num - 1);
+  size_t line_count = document_line_count(buffer->document);
+
+  // Clamp to valid range
+  if (line_idx >= line_count) {
+    line_idx = line_count > 0 ? line_count - 1 : 0;
+  }
+
+  // Get byte position of line start
+  size_t pos = document_line_start(buffer->document, line_idx);
+  editor->cursor_pos = pos;
+  editor->selection_anchor = SIZE_MAX; // Clear any selection
+  editor_scroll_to_cursor(editor);
+}
+
 // weft::buffer::open-at path line -> open file and jump to line
 static int c_buffer_open_at(lcl_interp *interp, int argc, lcl_value **argv,
                             lcl_value **out) {
@@ -3935,8 +4048,8 @@ static int c_buffer_open_at(lcl_interp *interp, int argc, lcl_value **argv,
     return LCL_RC_ERR;
   }
 
-  const char *path = lcl_value_to_string(argv[0]);
-  if (!path) {
+  const char *path_arg = lcl_value_to_string(argv[0]);
+  if (!path_arg) {
     lcl_set_error(interp, "buffer::open-at: path must be a string");
     return LCL_RC_ERR;
   }
@@ -3947,12 +4060,57 @@ static int c_buffer_open_at(lcl_interp *interp, int argc, lcl_value **argv,
     return LCL_RC_ERR;
   }
 
+  // Expand ~ and make path absolute
+  char *path = expand_path(path_arg);
+  if (!path) {
+    lcl_set_error(interp, "buffer::open-at: failed to expand path");
+    return LCL_RC_ERR;
+  }
+
+  // Check if buffer already exists for this file
+  Buffer *existing = buffer_manager_find_by_path(host->buffer_manager, path);
+  if (existing) {
+    // Buffer exists - check if it has a pane
+    Pane *existing_pane = find_pane_for_buffer(host, existing);
+    if (existing_pane) {
+      // Focus and jump to line
+      if (host->focused_pane_ptr) {
+        *host->focused_pane_ptr = existing_pane;
+      }
+      jump_to_line(pane_get_editor(existing_pane), existing, line_num);
+      free(path);
+      *out = lcl_int_new((long)existing->id);
+      return LCL_RC_OK;
+    }
+
+    // Buffer exists but has no pane - create one
+    Pane *new_pane = pane_new(existing, host->char_width, host->line_height);
+    if (new_pane) {
+      lcl_host_apply_viewlayers(host, new_pane);
+      LayoutNode *root = *host->layout_root_ptr;
+      LayoutNode *new_split = layout_split_horizontal(root, new_pane);
+      if (new_split && !new_split->parent) {
+        *host->layout_root_ptr = new_split;
+      }
+      recompute_layout_bounds(host);
+      if (host->focused_pane_ptr) {
+        *host->focused_pane_ptr = new_pane;
+      }
+      jump_to_line(pane_get_editor(new_pane), existing, line_num);
+    }
+    free(path);
+    *out = lcl_int_new((long)existing->id);
+    return LCL_RC_OK;
+  }
+
   // Open file in buffer manager
   Buffer *new_buffer = buffer_manager_open_file(host->buffer_manager, path);
   if (!new_buffer) {
     lcl_set_error(interp, "buffer::open-at: failed to open file");
+    free(path);
     return LCL_RC_ERR;
   }
+  free(path);
 
   // Apply file type associations (syntax highlighting, etc.)
   lcl_host_apply_filetypes(host, new_buffer);
@@ -3991,25 +4149,10 @@ static int c_buffer_open_at(lcl_interp *interp, int argc, lcl_value **argv,
     *host->focused_pane_ptr = new_pane;
   }
 
-  // Jump to the specified line (1-indexed)
-  if (editor && new_buffer->document) {
-    // Convert 1-indexed line to 0-indexed
-    size_t line_idx = (size_t)(line_num - 1);
-    size_t line_count = document_line_count(new_buffer->document);
+  // Jump to the specified line
+  jump_to_line(editor, new_buffer, line_num);
 
-    // Clamp to valid range
-    if (line_idx >= line_count) {
-      line_idx = line_count > 0 ? line_count - 1 : 0;
-    }
-
-    // Get byte position of line start
-    size_t pos = document_line_start(new_buffer->document, line_idx);
-    editor->cursor_pos = pos;
-    editor->selection_anchor = SIZE_MAX; // Clear any selection
-    editor_scroll_to_cursor(editor);
-  }
-
-  *out = lcl_list_new();
+  *out = lcl_int_new((long)new_buffer->id);
   return LCL_RC_OK;
 }
 
@@ -4303,18 +4446,14 @@ static int c_fs_ls(lcl_interp *interp, int argc, lcl_value **argv,
   if (argc > 0) {
     const char *arg = lcl_value_to_string(argv[0]);
 
-    if (arg[0] == '/') {
-      snprintf(path, sizeof(path), "%s", arg);
-    } else {
-      // Relative path - resolve from cwd
-      if (getcwd(path, sizeof(path)) == NULL) {
-        lcl_set_error(interp, "fs::ls: cannot get cwd");
-        return LCL_RC_ERR;
-      }
-
-      size_t len = strlen(path);
-      snprintf(path + len, sizeof(path) - len, "/%s", arg);
+    // Expand ~ and relative paths
+    char *expanded = expand_path(arg);
+    if (!expanded) {
+      lcl_set_error(interp, "fs::ls: failed to expand path");
+      return LCL_RC_ERR;
     }
+    snprintf(path, sizeof(path), "%s", expanded);
+    free(expanded);
   } else {
     if (getcwd(path, sizeof(path)) == NULL) {
       lcl_set_error(interp, "fs::ls: cannot get cwd");
@@ -4352,8 +4491,8 @@ static int c_fs_ls(lcl_interp *interp, int argc, lcl_value **argv,
   struct dirent *ent;
 
   while ((ent = readdir(dir)) != NULL) {
-    // Skip . and ..
-    if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+    // Skip . (but keep ..)
+    if (strcmp(ent->d_name, ".") == 0) {
       continue;
     }
 
@@ -4569,6 +4708,54 @@ static int c_fs_ls(lcl_interp *interp, int argc, lcl_value **argv,
   }
 
   *out = lcl_list_new();
+  return LCL_RC_OK;
+}
+
+// weft::fs::cd path -> change current directory
+static int c_fs_cd(lcl_interp *interp, int argc, lcl_value **argv,
+                   lcl_value **out) {
+  if (argc < 1) {
+    lcl_set_error(interp, "fs::cd requires path");
+    return LCL_RC_ERR;
+  }
+
+  const char *path_arg = lcl_value_to_string(argv[0]);
+  if (!path_arg) {
+    lcl_set_error(interp, "fs::cd: path must be a string");
+    return LCL_RC_ERR;
+  }
+
+  // Expand ~ and relative paths
+  char *path = expand_path(path_arg);
+  if (!path) {
+    lcl_set_error(interp, "fs::cd: failed to expand path");
+    return LCL_RC_ERR;
+  }
+
+  if (chdir(path) != 0) {
+    free(path);
+    lcl_set_error(interp, "fs::cd: failed to change directory");
+    return LCL_RC_ERR;
+  }
+
+  free(path);
+  *out = lcl_int_new(1);
+  return LCL_RC_OK;
+}
+
+// weft::fs::pwd -> get current working directory
+static int c_fs_pwd(lcl_interp *interp, int argc, lcl_value **argv,
+                    lcl_value **out) {
+  (void)argc;
+  (void)argv;
+
+  char cwd[PATH_MAX];
+  if (getcwd(cwd, sizeof(cwd)) == NULL) {
+    lcl_set_error(interp, "fs::pwd: failed to get current directory");
+    return LCL_RC_ERR;
+  }
+
+  *out = lcl_string_new(cwd);
   return LCL_RC_OK;
 }
 
@@ -5947,6 +6134,8 @@ static void register_weft_bindings(lcl_interp *interp) {
   lcl_ns_def(weft_ns, "fs", fs_ns);
 
   lcl_ns_def(fs_ns, "ls", lcl_c_proc_new("weft::fs::ls", c_fs_ls));
+  lcl_ns_def(fs_ns, "cd", lcl_c_proc_new("weft::fs::cd", c_fs_cd));
+  lcl_ns_def(fs_ns, "pwd", lcl_c_proc_new("weft::fs::pwd", c_fs_pwd));
 
   // Create weft::plumb namespace for plumber operations
   lcl_value *plumb_ns = lcl_ns_new("plumb");
