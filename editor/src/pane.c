@@ -436,8 +436,10 @@ void pane_render(Pane *p, Renderer *r, bool focused) {
 
   // Draw column selection highlight (Alt+Drag block selection)
   if (editor_in_column_mode(e)) {
-    size_t col_start_line, col_end_line;
-    int col_left_vcol, col_right_vcol;
+    size_t col_start_line;
+    size_t col_end_line;
+    int col_left_vcol;
+    int col_right_vcol;
     editor_get_column_selection(e, &col_start_line, &col_end_line,
                                 &col_left_vcol, &col_right_vcol);
 
@@ -476,7 +478,8 @@ void pane_render(Pane *p, Renderer *r, bool focused) {
 
   // Draw selection highlight
   if (!editor_in_column_mode(e) && editor_has_selection(e)) {
-    size_t sel_start, sel_end;
+    size_t sel_start;
+    size_t sel_end;
     editor_get_selection(e, &sel_start, &sel_end);
 
     SDL_Color sel_color = {.r = 70, .g = 130, .b = 180, .a = 180};
@@ -592,7 +595,8 @@ void pane_render(Pane *p, Renderer *r, bool focused) {
   }
 
   // Calculate document range for layers
-  size_t vis_start, vis_end;
+  size_t vis_start;
+  size_t vis_end;
   if (wrap_mode) {
     vis_start = e->visual_line_starts[first_vis_line];
     vis_end = (last_vis_line + 1 < e->visual_line_count)
@@ -624,7 +628,9 @@ void pane_render(Pane *p, Renderer *r, bool focused) {
     }
 
     // Determine line positions
-    size_t line_start, line_end, doc_line_num;
+    size_t line_start;
+    size_t line_end;
+    size_t doc_line_num;
     bool show_line_number;
 
     if (wrap_mode) {
@@ -895,8 +901,10 @@ void pane_render(Pane *p, Renderer *r, bool focused) {
 
     if (editor_in_column_mode(e)) {
       // Draw multiple cursors for column mode
-      size_t col_start_line, col_end_line;
-      int col_left_vcol, col_right_vcol;
+      size_t col_start_line;
+      size_t col_end_line;
+      int col_left_vcol;
+      int col_right_vcol;
       editor_get_column_selection(e, &col_start_line, &col_end_line,
                                   &col_left_vcol, &col_right_vcol);
 
@@ -929,7 +937,8 @@ void pane_render(Pane *p, Renderer *r, bool focused) {
       }
     } else {
       // Normal single cursor
-      int cursor_x, cursor_y;
+      int cursor_x;
+      int cursor_y;
       editor_pos_to_screen(e, editor_get_cursor_pos(e), &cursor_x, &cursor_y);
 
       // Translate to window coordinates (add gutter and header_height for text
@@ -1411,7 +1420,7 @@ bool pane_search_handle_text(Pane *p, const char *text) {
 
   // Insert text at cursor
   memmove(query + *cursor + text_len, query + *cursor, len - *cursor + 1);
-  memcpy(query + *cursor, text, text_len);
+  strcpy(query + *cursor, text);
   *cursor += text_len;
 
   // Re-search if search query changed

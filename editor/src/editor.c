@@ -1754,7 +1754,8 @@ void editor_delete_selection(Editor *e) {
     return;
   }
 
-  size_t start, end;
+  size_t start;
+  size_t end;
   editor_get_selection(e, &start, &end);
   size_t len = end - start;
 
@@ -1784,7 +1785,8 @@ bool editor_copy(Editor *e) {
     return false;
   }
 
-  size_t start, end;
+  size_t start;
+  size_t end;
   editor_get_selection(e, &start, &end);
   size_t len = end - start;
 
@@ -2116,8 +2118,10 @@ void editor_column_insert_char(Editor *e, const char *text, size_t len) {
     return;
   }
 
-  size_t start_line, end_line;
-  int left_vcol, right_vcol;
+  size_t start_line;
+  size_t end_line;
+  int left_vcol;
+  int right_vcol;
   editor_get_column_selection(e, &start_line, &end_line, &left_vcol,
                               &right_vcol);
 
@@ -2172,8 +2176,10 @@ void editor_column_delete_backward(Editor *e) {
     return;
   }
 
-  size_t start_line, end_line;
-  int left_vcol, right_vcol;
+  size_t start_line;
+  size_t end_line;
+  int left_vcol;
+  int right_vcol;
   editor_get_column_selection(e, &start_line, &end_line, &left_vcol,
                               &right_vcol);
 
@@ -2233,8 +2239,10 @@ char *editor_get_column_selection_text(const Editor *e) {
     return NULL;
   }
 
-  size_t start_line, end_line;
-  int left_vcol, right_vcol;
+  size_t start_line;
+  size_t end_line;
+  int left_vcol;
+  int right_vcol;
   editor_get_column_selection(e, &start_line, &end_line, &left_vcol,
                               &right_vcol);
 
@@ -2314,8 +2322,10 @@ void editor_column_delete_forward(Editor *e) {
     return;
   }
 
-  size_t start_line, end_line;
-  int left_vcol, right_vcol;
+  size_t start_line;
+  size_t end_line;
+  int left_vcol;
+  int right_vcol;
   editor_get_column_selection(e, &start_line, &end_line, &left_vcol,
                               &right_vcol);
 

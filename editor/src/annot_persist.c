@@ -939,7 +939,8 @@ bool annot_persist_save(const AnnotStore *store, const Document *doc,
     }
 
     // Get span positions
-    size_t start_pos = 0, end_pos = 0;
+    size_t start_pos = 0;
+    size_t end_pos = 0;
     if (!annot_store_get_span(store, rec->id, &start_pos, &end_pos)) {
       continue;
     }

@@ -155,7 +155,8 @@ SDL_AppResult SDL_AppInit(void **app_state, int argc, char **argv) {
   // Set up app context for buffer operations
   int char_width = renderer_get_char_width(ctx->app.renderer);
   int line_height = renderer_get_line_height(ctx->app.renderer);
-  int win_w, win_h;
+  int win_w;
+  int win_h;
   SDL_GetWindowSize(platform_get_window(ctx->app.platform), &win_w, &win_h);
   lcl_host_set_app_context(ctx->app.lcl, ctx->app.buffers,
                            &ctx->app.layout_root, &ctx->app.focused_pane, ctx,
@@ -278,7 +279,8 @@ static Pane *create_new_pane(AppContext *ctx) {
 
 // Helper to get window bounds
 static SDL_Rect get_window_rect(AppContext *ctx) {
-  int w, h;
+  int w;
+  int h;
   SDL_GetWindowSize(platform_get_window(ctx->app.platform), &w, &h);
   return (SDL_Rect){.x = 0, .y = 0, .w = w, .h = h};
 }
@@ -631,7 +633,8 @@ SDL_AppResult SDL_AppEvent(void *app_state, SDL_Event *event) {
           ctx->app.focused_pane = next ? next : layout_first_pane(new_root);
 
           // Recompute layout bounds
-          int win_w, win_h;
+          int win_w;
+          int win_h;
           SDL_GetWindowSize(platform_get_window(ctx->app.platform), &win_w,
                             &win_h);
           SDL_Rect available = {0, 0, win_w, win_h};
@@ -689,7 +692,8 @@ SDL_AppResult SDL_AppEvent(void *app_state, SDL_Event *event) {
 
           if (editor_has_selection(editor)) {
             // Use selected text
-            size_t sel_start, sel_end;
+            size_t sel_start;
+            size_t sel_end;
             editor_get_selection(editor, &sel_start, &sel_end);
             text_len = sel_end - sel_start;
             insert_pos = sel_end;
@@ -884,7 +888,8 @@ SDL_AppResult SDL_AppEvent(void *app_state, SDL_Event *event) {
 
       // Get editor and translate coordinates
       Editor *editor = pane_get_editor(target);
-      int local_x, local_y;
+      int local_x;
+      int local_y;
       pane_window_to_local(target, x, y, &local_x, &local_y);
 
       // For middle-click and right-click, try interaction dispatch
@@ -935,7 +940,8 @@ SDL_AppResult SDL_AppEvent(void *app_state, SDL_Event *event) {
 
     // Translate to focused pane coordinates
     if (ctx->app.focused_pane) {
-      int local_x, local_y;
+      int local_x;
+      int local_y;
       pane_window_to_local(ctx->app.focused_pane, x, y, &local_x, &local_y);
 
       input_event.type = INPUT_MOUSE_UP;
@@ -965,7 +971,8 @@ SDL_AppResult SDL_AppEvent(void *app_state, SDL_Event *event) {
 
     // Translate to focused pane coordinates (for drag operations)
     if (ctx->app.focused_pane) {
-      int local_x, local_y;
+      int local_x;
+      int local_y;
       pane_window_to_local(ctx->app.focused_pane, x, y, &local_x, &local_y);
 
       input_event.type = INPUT_MOUSE_MOVE;

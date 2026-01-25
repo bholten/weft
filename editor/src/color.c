@@ -10,7 +10,9 @@ bool color_parse_hex(const char *str, SDL_Color *out) {
   }
 
   size_t len = strlen(str);
-  unsigned int r, g, b;
+  unsigned int r;
+  unsigned int g;
+  unsigned int b;
 
   if (len == 7) {
     // #RRGGBB

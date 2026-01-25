@@ -1,5 +1,3 @@
-#include "lcl_host.h"
-
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -24,6 +22,7 @@
 #include "layer.h"
 #include "layer_stack.h"
 #include "layout.h"
+#include "lcl_host.h"
 #include "pane.h"
 #include "patch.h"
 #include "transform.h"
@@ -142,7 +141,8 @@ static int c_doc_text(lcl_interp *interp, int argc, lcl_value **argv,
     return LCL_RC_ERR;
   }
 
-  long start, len;
+  long start;
+  long len;
   if (lcl_value_to_int(argv[0], &start) != LCL_OK || start < 0) {
     lcl_set_error(interp, "doc::text: invalid start position");
     return LCL_RC_ERR;
@@ -423,7 +423,8 @@ static int c_annot_in_range(lcl_interp *interp, int argc, lcl_value **argv,
     return LCL_RC_ERR;
   }
 
-  long start, end;
+  long start;
+  long end;
   if (lcl_value_to_int(argv[0], &start) != LCL_OK || start < 0) {
     lcl_set_error(interp, "annot::in-range: invalid start");
     return LCL_RC_ERR;
@@ -482,7 +483,8 @@ static int c_annot_get(lcl_interp *interp, int argc, lcl_value **argv,
 
   // Get the anchor positions
   AnnotStore *store = buffer->annots;
-  size_t start_pos = 0, end_pos = 0;
+  size_t start_pos = 0;
+  size_t end_pos = 0;
   for (size_t i = 0; i < store->anchor_count; i++) {
     if (store->anchors[i].id == rec->start_anchor) {
       start_pos = store->anchors[i].pos;
@@ -672,7 +674,8 @@ static char *generate_annot_editor_content(Buffer *buffer, uint32_t *ids,
     }
 
     // Get span positions
-    size_t start_pos = 0, end_pos = 0;
+    size_t start_pos = 0;
+    size_t end_pos = 0;
     annot_store_get_span(store, id, &start_pos, &end_pos);
 
     // Ensure we have space
@@ -1089,7 +1092,8 @@ static int c_annot_edit_at(lcl_interp *interp, int argc, lcl_value **argv,
     if (get_effective_selection_context(host, &ctx_editor, &ctx_buffer) &&
         ctx_buffer == buffer) {
       // Use selection from the effective context
-      size_t sel_start, sel_end;
+      size_t sel_start;
+      size_t sel_end;
       editor_get_selection(ctx_editor, &sel_start, &sel_end);
       if (sel_start != sel_end) {
         // There's a selection - use it as a range
@@ -1246,7 +1250,8 @@ static int c_annot_edit_range(lcl_interp *interp, int argc, lcl_value **argv,
     return LCL_RC_ERR;
   }
 
-  long start, end;
+  long start;
+  long end;
   if (lcl_value_to_int(argv[0], &start) != LCL_OK || start < 0) {
     lcl_set_error(interp, "annot::edit-range: invalid start");
     return LCL_RC_ERR;
@@ -1431,7 +1436,9 @@ static int c_annot_apply_edit(lcl_interp *interp, int argc, lcl_value **argv,
   }
 
   AnnotStore *store = target->annots;
-  size_t added = 0, modified = 0, deleted = 0;
+  size_t added = 0;
+  size_t modified = 0;
+  size_t deleted = 0;
 
   // Process each block
   for (size_t i = 0; i < block_count; i++) {
@@ -1477,7 +1484,8 @@ static int c_annot_apply_edit(lcl_interp *interp, int argc, lcl_value **argv,
       }
 
       // Get original span (we use original positions, not edited ones)
-      size_t orig_start, orig_end;
+      size_t orig_start;
+      size_t orig_end;
 
       annot_store_get_span(store, b->id, &orig_start, &orig_end);
 
@@ -1707,7 +1715,9 @@ static int c_annot_resolve_orphan(lcl_interp *interp, int argc,
     return LCL_RC_ERR;
   }
 
-  long idx, start, end;
+  long idx;
+  long start;
+  long end;
   if (lcl_value_to_int(argv[0], &idx) != LCL_OK || idx < 0) {
     lcl_set_error(interp, "invalid index");
     return LCL_RC_ERR;
@@ -1996,7 +2006,8 @@ static int c_editor_delete(lcl_interp *interp, int argc, lcl_value **argv,
     return LCL_RC_ERR;
   }
 
-  long start, end;
+  long start;
+  long end;
   if (lcl_value_to_int(argv[0], &start) != LCL_OK || start < 0) {
     lcl_set_error(interp, "editor::delete: invalid start");
     return LCL_RC_ERR;
@@ -2028,7 +2039,8 @@ static int c_editor_delete(lcl_interp *interp, int argc, lcl_value **argv,
 // Helper: Execute command and capture output
 static int shell_exec_internal(const char *cmd, char **out_stdout,
                                char **out_stderr, int *status) {
-  int stdout_pipe[2], stderr_pipe[2];
+  int stdout_pipe[2];
+  int stderr_pipe[2];
 
   if (pipe(stdout_pipe) < 0 || pipe(stderr_pipe) < 0) {
     return -1;
@@ -2180,7 +2192,8 @@ static int c_shell_pipe_selection(lcl_interp *interp, int argc,
   // Get selection or word at cursor
   Editor *e = host->current_editor;
   Buffer *buf = editor_get_buffer(e);
-  size_t start, end;
+  size_t start;
+  size_t end;
 
   if (editor_has_selection(e)) {
     editor_get_selection(e, &start, &end);
@@ -2576,11 +2589,14 @@ static int c_buffer_save(lcl_interp *interp, int argc, lcl_value **argv,
   if (argc >= 1) {
     // Save by ID
     long id;
+
     if (lcl_value_to_int(argv[0], &id) != LCL_OK || id <= 0) {
       lcl_set_error(interp, "buffer::save: id must be a positive integer");
       return LCL_RC_ERR;
     }
+
     buf = buffer_manager_find_by_id(host->buffer_manager, (uint32_t)id);
+
     if (!buf) {
       lcl_set_error(interp, "buffer::save: no buffer with that id");
       return LCL_RC_ERR;
@@ -2588,6 +2604,7 @@ static int c_buffer_save(lcl_interp *interp, int argc, lcl_value **argv,
   } else {
     // Save current buffer
     buf = get_effective_doc_buffer(host);
+
     if (!buf) {
       lcl_set_error(interp, "no current buffer");
       return LCL_RC_ERR;
@@ -2632,12 +2649,14 @@ static int c_buffer_show(lcl_interp *interp, int argc, lcl_value **argv,
   }
 
   long id;
+
   if (lcl_value_to_int(argv[0], &id) != LCL_OK || id <= 0) {
     lcl_set_error(interp, "buffer::show: id must be a positive integer");
     return LCL_RC_ERR;
   }
 
   Buffer *buf = buffer_manager_find_by_id(host->buffer_manager, (uint32_t)id);
+
   if (!buf) {
     lcl_set_error(interp, "buffer::show: no buffer with that id");
     return LCL_RC_ERR;
@@ -3373,7 +3392,8 @@ static int c_repl_target_selection(lcl_interp *interp, int argc,
   }
 
   Editor *editor = pane->view;
-  size_t sel_start, sel_end;
+  size_t sel_start;
+  size_t sel_end;
   editor_get_selection(editor, &sel_start, &sel_end);
 
   if (sel_start == sel_end) {
@@ -3524,7 +3544,8 @@ static int c_sel_start(lcl_interp *interp, int argc, lcl_value **argv,
     return LCL_RC_ERR;
   }
 
-  size_t start, end;
+  size_t start;
+  size_t end;
   editor_get_selection(editor, &start, &end);
 
   *out = lcl_int_new((long)start);
@@ -3546,7 +3567,8 @@ static int c_sel_end(lcl_interp *interp, int argc, lcl_value **argv,
     return LCL_RC_ERR;
   }
 
-  size_t start, end;
+  size_t start;
+  size_t end;
   editor_get_selection(editor, &start, &end);
 
   *out = lcl_int_new((long)end);
@@ -3568,7 +3590,8 @@ static int c_sel_text(lcl_interp *interp, int argc, lcl_value **argv,
     return LCL_RC_ERR;
   }
 
-  size_t start, end;
+  size_t start;
+  size_t end;
   editor_get_selection(editor, &start, &end);
 
   if (start == end) {
@@ -3625,7 +3648,8 @@ static int c_sel_exists(lcl_interp *interp, int argc, lcl_value **argv,
     return LCL_RC_OK;
   }
 
-  size_t start, end;
+  size_t start;
+  size_t end;
   editor_get_selection(editor, &start, &end);
 
   *out = lcl_int_new(start != end ? 1 : 0);
@@ -3648,7 +3672,8 @@ static int c_sel_info(lcl_interp *interp, int argc, lcl_value **argv,
     return LCL_RC_OK;
   }
 
-  size_t start, end;
+  size_t start;
+  size_t end;
   editor_get_selection(editor, &start, &end);
 
   // Get text if there's a selection
@@ -3767,7 +3792,8 @@ static int c_inspect_at(lcl_interp *interp, int argc, lcl_value **argv,
       }
 
       // Get span positions
-      size_t start_pos = 0, end_pos = 0;
+      size_t start_pos = 0;
+      size_t end_pos = 0;
       annot_store_get_span(store, id, &start_pos, &end_pos);
 
       // Extract the annotated text (up to 80 chars)
@@ -5444,7 +5470,9 @@ static void show_patch_buffer(LclHost *host, Patch *patch, Buffer *target) {
 
   // Build header with actions
   char header[512];
-  size_t additions, deletions, edit_count;
+  size_t additions;
+  size_t deletions;
+  size_t edit_count;
   patch_stats(patch, &additions, &deletions, &edit_count);
   snprintf(header, sizeof(header),
            ";; Patch: %s\n"
@@ -5622,7 +5650,8 @@ static int c_transform_run(lcl_interp *interp, int argc, lcl_value **argv,
   }
 
   // Get selection range from target editor
-  size_t start, end;
+  size_t start;
+  size_t end;
   if (editor_has_selection(target_editor)) {
     editor_get_selection(target_editor, &start, &end);
   } else {
@@ -5769,7 +5798,9 @@ static int c_transform_apply_ctx(lcl_interp *interp, int argc, lcl_value **argv,
   }
 
   // Extract fields from context: #{start N end N buffer N text "..."}
-  long start = -1, end = -1, buffer_id = -1;
+  long start = -1;
+  long end = -1;
+  long buffer_id = -1;
   const char *old_text = NULL;
 
   lcl_value *val = NULL;

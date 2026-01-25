@@ -569,7 +569,8 @@ static Patch *parse_lcl_transform_result(lcl_value *result, const char *name,
       lcl_list_get(edit, 1, &e_val);
       lcl_list_get(edit, 2, &t_val);
 
-      long s = 0, e = 0;
+      long s = 0;
+      long e = 0;
       lcl_value_to_int(s_val, &s);
       lcl_value_to_int(e_val, &e);
       const char *t = lcl_value_to_string(t_val);

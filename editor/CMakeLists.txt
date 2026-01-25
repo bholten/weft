@@ -39,7 +39,14 @@ set(WEFT_SOURCES
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(WEFT_COMPILE_OPTIONS -Wall -Wextra)
+
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# === Clang Tools (optional) ===
+option(WEFT_ENABLE_CLANG_TIDY "Run clang-tidy during build" OFF)
+
+find_program(CLANG_TIDY_EXE NAMES clang-tidy)
+find_program(CLANG_FORMAT_EXE NAMES clang-format)
 
 # === AddressSanitizer (ASan) Support ===
 option(WEFT_ENABLE_ASAN "Enable AddressSanitizer for debug builds" OFF)
@@ -293,6 +300,12 @@ target_compile_definitions(weft PRIVATE
 )
 target_compile_options(weft PRIVATE ${WEFT_COMPILE_OPTIONS})
 
+# Run clang-tidy during build (only on weft sources, not dependencies)
+if(WEFT_ENABLE_CLANG_TIDY AND CLANG_TIDY_EXE)
+  set_target_properties(weft PROPERTIES C_CLANG_TIDY "${CLANG_TIDY_EXE}")
+  message(STATUS "clang-tidy enabled for weft target")
+endif()
+
 # Add ASan linker flags if enabled
 if(WEFT_ENABLE_ASAN)
   target_link_options(weft PRIVATE ${ASAN_LINK_FLAGS})
@@ -332,4 +345,37 @@ if(WEFT_BUILD_TESTS)
     DEPENDS test_document test_annot_store
     COMMENT "Running all tests"
   )
+endif()
+
+# === Clang Tools Targets ===
+# Collect all source files for formatting/linting
+set(WEFT_ALL_SOURCES "")
+foreach(src ${WEFT_SOURCES})
+  list(APPEND WEFT_ALL_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/${src}")
+endforeach()
+
+# Also include headers
+file(GLOB WEFT_HEADERS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.h")
+list(APPEND WEFT_ALL_SOURCES ${WEFT_HEADERS})
+
+# make format - run clang-format on all sources
+if(CLANG_FORMAT_EXE)
+  add_custom_target(format
+    COMMAND ${CLANG_FORMAT_EXE} -i ${WEFT_ALL_SOURCES}
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMENT "Running clang-format on weft sources"
+    VERBATIM
+  )
+  message(STATUS "clang-format found: ${CLANG_FORMAT_EXE} (use 'make format')")
+endif()
+
+# make tidy - run clang-tidy manually (separate from build)
+if(CLANG_TIDY_EXE)
+  add_custom_target(tidy
+    COMMAND ${CLANG_TIDY_EXE} -p ${CMAKE_BINARY_DIR} ${WEFT_ALL_SOURCES}
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMENT "Running clang-tidy on weft sources"
+    VERBATIM
+  )
+  message(STATUS "clang-tidy found: ${CLANG_TIDY_EXE} (use 'make tidy')")
 endif()
