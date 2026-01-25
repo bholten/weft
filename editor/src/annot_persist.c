@@ -143,11 +143,12 @@ void doc_generate_uuid(char out[DOC_ID_LEN]) {
   bytes[8] = (bytes[8] & 0x3F) | 0x80; // Variant 1
 
   // Format as UUID string
-  snprintf(out, DOC_ID_LEN,
-           "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-           bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
-           bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11],
-           bytes[12], bytes[13], bytes[14], bytes[15]);
+  snprintf(
+      out, DOC_ID_LEN,
+      "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+      bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+      bytes[7], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13],
+      bytes[14], bytes[15]);
 }
 
 // === Context Anchor Operations ===
@@ -165,12 +166,14 @@ ContextAnchor context_anchor_create(const Document *doc, size_t pos,
   size_t doc_len = document_length(doc);
 
   // Get before context
-  size_t before_start = (pos > CONTEXT_WINDOW_SIZE) ? pos - CONTEXT_WINDOW_SIZE : 0;
+  size_t before_start =
+      (pos > CONTEXT_WINDOW_SIZE) ? pos - CONTEXT_WINDOW_SIZE : 0;
   size_t before_len = pos - before_start;
   if (before_len > 0) {
     ca.before_ctx = malloc(before_len + 1);
     if (ca.before_ctx) {
-      ca.before_len = document_get_text(doc, before_start, ca.before_ctx, before_len);
+      ca.before_len =
+          document_get_text(doc, before_start, ca.before_ctx, before_len);
       ca.before_ctx[ca.before_len] = '\0';
     }
   }
@@ -304,8 +307,7 @@ size_t context_anchor_resolve(const ContextAnchor *ca, const Document *doc,
   }
 
   // Expand search radius
-  size_t search_radius =
-      (max_search_radius > 0) ? max_search_radius : doc_len;
+  size_t search_radius = (max_search_radius > 0) ? max_search_radius : doc_len;
   size_t start =
       (ca->approx_pos > search_radius) ? ca->approx_pos - search_radius : 0;
   size_t end = (ca->approx_pos + search_radius < doc_len)
@@ -422,18 +424,10 @@ static size_t unescape_string(char *s, size_t len) {
     if (s[i] == '\\' && i + 1 < len) {
       i++;
       switch (s[i]) {
-      case 'n':
-        s[j++] = '\n';
-        break;
-      case 'r':
-        s[j++] = '\r';
-        break;
-      case 't':
-        s[j++] = '\t';
-        break;
-      default:
-        s[j++] = s[i];
-        break;
+      case 'n': s[j++] = '\n'; break;
+      case 'r': s[j++] = '\r'; break;
+      case 't': s[j++] = '\t'; break;
+      default: s[j++] = s[i]; break;
       }
     } else {
       s[j++] = s[i];
@@ -643,9 +637,8 @@ static size_t parse_block(const char *text, size_t text_len, size_t start_pos,
   // Parse key-value pairs until '}'
   while (pos < text_len && text[pos] != '}') {
     // Skip whitespace
-    while (pos < text_len &&
-           (text[pos] == ' ' || text[pos] == '\t' || text[pos] == '\n' ||
-            text[pos] == '\r')) {
+    while (pos < text_len && (text[pos] == ' ' || text[pos] == '\t' ||
+                              text[pos] == '\n' || text[pos] == '\r')) {
       pos++;
     }
 
@@ -677,9 +670,8 @@ static size_t parse_block(const char *text, size_t text_len, size_t start_pos,
     key[key_len] = '\0';
 
     // Skip whitespace
-    while (pos < text_len &&
-           (text[pos] == ' ' || text[pos] == '\t' || text[pos] == '\n' ||
-            text[pos] == '\r')) {
+    while (pos < text_len && (text[pos] == ' ' || text[pos] == '\t' ||
+                              text[pos] == '\n' || text[pos] == '\r')) {
       pos++;
     }
 
@@ -828,7 +820,8 @@ bool doc_registry_load(DocRegistry *reg) {
     char **values = NULL;
     size_t count = 0;
 
-    size_t next_pos = parse_block(content, bytes_read, pos, &keys, &values, &count);
+    size_t next_pos =
+        parse_block(content, bytes_read, pos, &keys, &values, &count);
     if (next_pos == 0) {
       break;
     }
@@ -865,7 +858,8 @@ bool doc_registry_load(DocRegistry *reg) {
         strncpy(entry->id, id, DOC_ID_LEN - 1);
         entry->id[DOC_ID_LEN - 1] = '\0';
       }
-      entry->last_modified = mtime_str ? (uint64_t)strtoull(mtime_str, NULL, 10) : 0;
+      entry->last_modified =
+          mtime_str ? (uint64_t)strtoull(mtime_str, NULL, 10) : 0;
       reg->count++;
     }
 
@@ -982,7 +976,8 @@ bool annot_persist_save(const AnnotStore *store, const Document *doc,
         free(escaped);
       }
     }
-    fprintf(f, "  start-bias %s\n", start_ca.bias == ANCHOR_LEFT ? "left" : "right");
+    fprintf(f, "  start-bias %s\n",
+            start_ca.bias == ANCHOR_LEFT ? "left" : "right");
 
     // End anchor
     fprintf(f, "  end-approx %zu\n", end_ca.approx_pos);
@@ -1000,7 +995,8 @@ bool annot_persist_save(const AnnotStore *store, const Document *doc,
         free(escaped);
       }
     }
-    fprintf(f, "  end-bias %s\n", end_ca.bias == ANCHOR_LEFT ? "left" : "right");
+    fprintf(f, "  end-bias %s\n",
+            end_ca.bias == ANCHOR_LEFT ? "left" : "right");
 
     // Metadata (skip prov:* keys)
     for (size_t j = 0; j < rec->meta_count; j++) {
@@ -1086,7 +1082,8 @@ PersistedAnnot *annot_persist_load(const char *doc_id, const char *data_dir,
     char **values = NULL;
     size_t count = 0;
 
-    size_t next_pos = parse_block(content, bytes_read, pos, &keys, &values, &count);
+    size_t next_pos =
+        parse_block(content, bytes_read, pos, &keys, &values, &count);
     if (next_pos == 0) {
       break;
     }
@@ -1135,31 +1132,36 @@ PersistedAnnot *annot_persist_load(const char *doc_id, const char *data_dir,
     const char *start_after = block_get(keys, values, count, "start-after");
     const char *start_bias = block_get(keys, values, count, "start-bias");
 
-    pa->start.approx_pos = start_approx ? (size_t)strtoull(start_approx, NULL, 10) : 0;
+    pa->start.approx_pos =
+        start_approx ? (size_t)strtoull(start_approx, NULL, 10) : 0;
     pa->start.before_ctx = start_before ? strdup(start_before) : NULL;
-    pa->start.before_len = pa->start.before_ctx ? strlen(pa->start.before_ctx) : 0;
+    pa->start.before_len =
+        pa->start.before_ctx ? strlen(pa->start.before_ctx) : 0;
     pa->start.after_ctx = start_after ? strdup(start_after) : NULL;
     pa->start.after_len = pa->start.after_ctx ? strlen(pa->start.after_ctx) : 0;
-    pa->start.bias = (start_bias && strcmp(start_bias, "right") == 0) ? ANCHOR_RIGHT : ANCHOR_LEFT;
+    pa->start.bias = (start_bias && strcmp(start_bias, "right") == 0)
+                         ? ANCHOR_RIGHT
+                         : ANCHOR_LEFT;
 
     const char *end_approx = block_get(keys, values, count, "end-approx");
     const char *end_before = block_get(keys, values, count, "end-before");
     const char *end_after = block_get(keys, values, count, "end-after");
     const char *end_bias = block_get(keys, values, count, "end-bias");
 
-    pa->end.approx_pos = end_approx ? (size_t)strtoull(end_approx, NULL, 10) : 0;
+    pa->end.approx_pos =
+        end_approx ? (size_t)strtoull(end_approx, NULL, 10) : 0;
     pa->end.before_ctx = end_before ? strdup(end_before) : NULL;
     pa->end.before_len = pa->end.before_ctx ? strlen(pa->end.before_ctx) : 0;
     pa->end.after_ctx = end_after ? strdup(end_after) : NULL;
     pa->end.after_len = pa->end.after_ctx ? strlen(pa->end.after_ctx) : 0;
-    pa->end.bias = (end_bias && strcmp(end_bias, "left") == 0) ? ANCHOR_LEFT : ANCHOR_RIGHT;
+    pa->end.bias = (end_bias && strcmp(end_bias, "left") == 0) ? ANCHOR_LEFT
+                                                               : ANCHOR_RIGHT;
 
     // Collect metadata (non-system keys)
     size_t meta_count = 0;
     for (size_t i = 0; i < count; i++) {
       // Skip system keys
-      if (strcmp(keys[i], "layer") == 0 ||
-          strncmp(keys[i], "start-", 6) == 0 ||
+      if (strcmp(keys[i], "layer") == 0 || strncmp(keys[i], "start-", 6) == 0 ||
           strncmp(keys[i], "end-", 4) == 0) {
         continue;
       }
@@ -1224,7 +1226,8 @@ ReanchorResult *annot_persist_reanchor(const PersistedAnnot *annots,
 
     // Resolve start position
     int start_confidence = 0;
-    res->new_start = context_anchor_resolve(&pa->start, doc, 1000, &start_confidence);
+    res->new_start =
+        context_anchor_resolve(&pa->start, doc, 1000, &start_confidence);
 
     // Resolve end position
     int end_confidence = 0;

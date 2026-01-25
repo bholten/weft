@@ -1200,7 +1200,8 @@ SDL_AppResult SDL_AppIterate(void *app_state) {
   RenderContext rc = {.renderer = ctx->app.renderer,
                       .focused_pane = ctx->app.focused_pane,
                       .time = now,
-                      .repl_target = lcl_host_get_repl_attached_buffer(ctx->app.lcl)};
+                      .repl_target =
+                          lcl_host_get_repl_attached_buffer(ctx->app.lcl)};
   layout_for_each_pane(ctx->app.layout_root, render_pane_callback, &rc);
 
   // Draw dividers

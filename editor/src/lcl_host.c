@@ -11,8 +11,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include <lcl.h>
 #include <lcl-regex.h>
+#include <lcl.h>
 
 #include "annot_layer.h"
 #include "annot_persist.h"
@@ -254,7 +254,7 @@ static int c_annot_add(lcl_interp *interp, int argc, lcl_value **argv,
   }
 
   long start;
-  long  end;
+  long end;
 
   if (lcl_value_to_int(argv[0], &start) != LCL_OK || start < 0) {
     lcl_set_error(interp, "annot::add: invalid start position");
@@ -634,20 +634,20 @@ static char *generate_annot_editor_content(Buffer *buffer, uint32_t *ids,
 
   // Header
   const char *path = buffer->file_path ? buffer->file_path : "(untitled)";
-  len += snprintf(output + len, cap - len,
-                  ";; Annotation Editor - B%u (%s)\n", buffer->id, path);
+  len += snprintf(output + len, cap - len, ";; Annotation Editor - B%u (%s)\n",
+                  buffer->id, path);
 
   if (is_range) {
-    len += snprintf(output + len, cap - len,
-                    ";; Scope: range [%zu, %zu)\n", query_start, query_end);
+    len += snprintf(output + len, cap - len, ";; Scope: range [%zu, %zu)\n",
+                    query_start, query_end);
   } else {
-    len += snprintf(output + len, cap - len,
-                    ";; Scope: position %zu\n", query_start);
+    len += snprintf(output + len, cap - len, ";; Scope: position %zu\n",
+                    query_start);
   }
 
   uint64_t rev = annot_store_get_doc_rev(store);
-  len += snprintf(output + len, cap - len,
-                  ";; Revision: %lu\n", (unsigned long)rev);
+  len += snprintf(output + len, cap - len, ";; Revision: %lu\n",
+                  (unsigned long)rev);
   len += snprintf(output + len, cap - len,
                   "[weft::annot::apply-edit]  [weft::annot::cancel-edit]\n\n");
 
@@ -714,8 +714,8 @@ static char *generate_annot_editor_content(Buffer *buffer, uint32_t *ids,
         return NULL;
       }
 
-      len += snprintf(output + len, cap - len,
-                      "\n  %s \"%s\"", rec->keys[j], escaped_val);
+      len += snprintf(output + len, cap - len, "\n  %s \"%s\"", rec->keys[j],
+                      escaped_val);
       free(escaped_val);
     }
 
@@ -928,8 +928,8 @@ cleanup_error:
 // Parse all annotation blocks from editor buffer content
 // Returns array of AnnotEditBlock, count in out_count
 // Caller must free each block with annot_edit_block_free and free the array
-static AnnotEditBlock *parse_annot_blocks(const char *content, size_t content_len,
-                                          size_t *out_count) {
+static AnnotEditBlock *
+parse_annot_blocks(const char *content, size_t content_len, size_t *out_count) {
   *out_count = 0;
 
   // Count potential blocks
@@ -944,7 +944,8 @@ static AnnotEditBlock *parse_annot_blocks(const char *content, size_t content_le
     // Skip to next '{'
     while (pos < content_len && content[pos] != '{') {
       // Skip comment lines
-      if (content[pos] == ';' && pos + 1 < content_len && content[pos + 1] == ';') {
+      if (content[pos] == ';' && pos + 1 < content_len &&
+          content[pos + 1] == ';') {
         while (pos < content_len && content[pos] != '\n') {
           pos++;
         }
@@ -992,7 +993,8 @@ static AnnotEditBlock *parse_annot_blocks(const char *content, size_t content_le
       // Add to array
       if (*out_count >= block_cap) {
         block_cap *= 2;
-        AnnotEditBlock *new_blocks = realloc(blocks, block_cap * sizeof(AnnotEditBlock));
+        AnnotEditBlock *new_blocks =
+            realloc(blocks, block_cap * sizeof(AnnotEditBlock));
         if (!new_blocks) {
           annot_edit_block_free(&block);
           for (size_t i = 0; i < *out_count; i++) {
@@ -1010,7 +1012,8 @@ static AnnotEditBlock *parse_annot_blocks(const char *content, size_t content_le
   return blocks;
 }
 
-// weft::annot::edit-at ?pos? -> open annotation editor for annotations at position
+// weft::annot::edit-at ?pos? -> open annotation editor for annotations at
+// position
 static int c_annot_edit_at(lcl_interp *interp, int argc, lcl_value **argv,
                            lcl_value **out) {
   LclHost *host = lcl_interp_get_user_data(interp);
@@ -1128,9 +1131,8 @@ static int c_annot_edit_at(lcl_interp *interp, int argc, lcl_value **argv,
   size_t original_count = query.count;
 
   // Generate editor content
-  char *content = generate_annot_editor_content(buffer, query.ids, query.count,
-                                                 query_start, query_end,
-                                                 is_range);
+  char *content = generate_annot_editor_content(
+      buffer, query.ids, query.count, query_start, query_end, is_range);
   annot_query_free(&query);
 
   if (!content) {
@@ -1270,7 +1272,8 @@ static int c_annot_edit_range(lcl_interp *interp, int argc, lcl_value **argv,
 
   // Query annotations in range
   AnnotQuery query = {0};
-  annot_store_in_range(buffer->annots, (size_t)start, (size_t)end, NULL, &query);
+  annot_store_in_range(buffer->annots, (size_t)start, (size_t)end, NULL,
+                       &query);
 
   // Store original IDs
   uint32_t *original_ids = NULL;
@@ -1286,8 +1289,8 @@ static int c_annot_edit_range(lcl_interp *interp, int argc, lcl_value **argv,
   size_t original_count = query.count;
 
   // Generate editor content
-  char *content = generate_annot_editor_content(buffer, query.ids, query.count,
-                                                 (size_t)start, (size_t)end, true);
+  char *content = generate_annot_editor_content(
+      buffer, query.ids, query.count, (size_t)start, (size_t)end, true);
   annot_query_free(&query);
 
   if (!content) {
@@ -1381,7 +1384,8 @@ static int c_annot_apply_edit(lcl_interp *interp, int argc, lcl_value **argv,
   // Check staleness
   uint64_t current_rev = annot_store_get_doc_rev(target->annots);
   if (current_rev != host->annot_edit.doc_rev) {
-    lcl_set_error(interp, "document modified since edit started - refusing to apply");
+    lcl_set_error(interp,
+                  "document modified since edit started - refusing to apply");
     return LCL_RC_ERR;
   }
 
@@ -1417,7 +1421,8 @@ static int c_annot_apply_edit(lcl_interp *interp, int argc, lcl_value **argv,
 
   // Parse blocks from editor content
   size_t block_count = 0;
-  AnnotEditBlock *blocks = parse_annot_blocks(content, content_len, &block_count);
+  AnnotEditBlock *blocks =
+      parse_annot_blocks(content, content_len, &block_count);
   free(content);
 
   if (!blocks && block_count > 0) {
@@ -1455,8 +1460,8 @@ static int c_annot_apply_edit(lcl_interp *interp, int argc, lcl_value **argv,
       const char **keys = (const char **)b->keys;
       const char **values = (const char **)b->values;
 
-      uint32_t new_id =
-          annot_store_add(store, start, end, b->layer, keys, values, b->meta_count);
+      uint32_t new_id = annot_store_add(store, start, end, b->layer, keys,
+                                        values, b->meta_count);
       if (new_id != 0) {
         added++;
       }
@@ -1473,7 +1478,8 @@ static int c_annot_apply_edit(lcl_interp *interp, int argc, lcl_value **argv,
 
       if (!is_original) {
         // ID not in original set - skip with warning
-        fprintf(stderr, "Warning: annotation ID %u not in original set, skipping\n",
+        fprintf(stderr,
+                "Warning: annotation ID %u not in original set, skipping\n",
                 b->id);
         continue;
       }
@@ -1486,7 +1492,7 @@ static int c_annot_apply_edit(lcl_interp *interp, int argc, lcl_value **argv,
 
       // Get original span (we use original positions, not edited ones)
       size_t orig_start, orig_end;
-      
+
       annot_store_get_span(store, b->id, &orig_start, &orig_end);
 
       // Count non-prov metadata in original
@@ -1527,8 +1533,8 @@ static int c_annot_apply_edit(lcl_interp *interp, int argc, lcl_value **argv,
         const char **keys = (const char **)b->keys;
         const char **values = (const char **)b->values;
 
-        annot_store_add(store, orig_start, orig_end, b->layer,
-                        keys, values, b->meta_count);
+        annot_store_add(store, orig_start, orig_end, b->layer, keys, values,
+                        b->meta_count);
         modified++;
       }
     }
@@ -1729,8 +1735,8 @@ static int c_annot_resolve_orphan(lcl_interp *interp, int argc,
     return LCL_RC_ERR;
   }
 
-  uint32_t id = buffer_resolve_orphan(buffer, (size_t)idx, (size_t)start,
-                                      (size_t)end);
+  uint32_t id =
+      buffer_resolve_orphan(buffer, (size_t)idx, (size_t)start, (size_t)end);
 
   *out = lcl_int_new((long)id);
   return LCL_RC_OK;
@@ -2330,8 +2336,7 @@ static int c_buffer_by_id(lcl_interp *interp, int argc, lcl_value **argv,
   // Return {id path modified}
   lcl_value *result = lcl_list_new();
   lcl_list_push(&result, lcl_int_new((long)buf->id));
-  lcl_list_push(&result,
-                lcl_string_new(buf->file_path ? buf->file_path : ""));
+  lcl_list_push(&result, lcl_string_new(buf->file_path ? buf->file_path : ""));
   lcl_list_push(&result, lcl_int_new(buf->modified ? 1 : 0));
   *out = result;
   return LCL_RC_OK;
@@ -2356,8 +2361,7 @@ static int c_buffer_list(lcl_interp *interp, int argc, lcl_value **argv,
     Buffer *buf = bm->buffers[i];
     lcl_value *entry = lcl_list_new();
     lcl_list_push(&entry, lcl_int_new((long)buf->id));
-    lcl_list_push(&entry,
-                  lcl_string_new(buf->file_path ? buf->file_path : ""));
+    lcl_list_push(&entry, lcl_string_new(buf->file_path ? buf->file_path : ""));
     lcl_list_push(&entry, lcl_int_new(buf->modified ? 1 : 0));
     lcl_list_push(&result, entry);
   }
@@ -2609,8 +2613,8 @@ static int c_buffer_save(lcl_interp *interp, int argc, lcl_value **argv,
     size_t layer_count = 0;
     const char *const *layers =
         lcl_host_get_persistent_layers(host, &layer_count);
-    buffer_save_annotations(buf, host->doc_registry, host->data_dir,
-                            layers, layer_count);
+    buffer_save_annotations(buf, host->doc_registry, host->data_dir, layers,
+                            layer_count);
     // Save the registry to persist any new doc_id mappings
     doc_registry_save(host->doc_registry);
   }
@@ -2810,8 +2814,8 @@ static int c_buffer_open(lcl_interp *interp, int argc, lcl_value **argv,
 
   // Load persisted annotations for this file
   if (host->data_dir && host->doc_registry) {
-    size_t loaded = buffer_load_annotations(new_buffer, host->doc_registry,
-                                            host->data_dir);
+    size_t loaded =
+        buffer_load_annotations(new_buffer, host->doc_registry, host->data_dir);
     if (loaded > 0) {
       // Annotations were loaded
       (void)loaded;
@@ -4237,8 +4241,10 @@ static int c_fs_ls(lcl_interp *interp, int argc, lcl_value **argv,
 
   // Get path (default to current directory)
   char path[PATH_MAX];
+
   if (argc > 0) {
     const char *arg = lcl_value_to_string(argv[0]);
+
     if (arg[0] == '/') {
       snprintf(path, sizeof(path), "%s", arg);
     } else {
@@ -4247,6 +4253,7 @@ static int c_fs_ls(lcl_interp *interp, int argc, lcl_value **argv,
         lcl_set_error(interp, "fs::ls: cannot get cwd");
         return LCL_RC_ERR;
       }
+
       size_t len = strlen(path);
       snprintf(path + len, sizeof(path) - len, "/%s", arg);
     }
@@ -4259,12 +4266,14 @@ static int c_fs_ls(lcl_interp *interp, int argc, lcl_value **argv,
 
   // Normalize path (remove trailing slash unless root)
   size_t plen = strlen(path);
+
   if (plen > 1 && path[plen - 1] == '/') {
     path[plen - 1] = '\0';
   }
 
   // Open directory
   DIR *dir = opendir(path);
+
   if (!dir) {
     lcl_set_error(interp, "fs::ls: cannot open directory");
     return LCL_RC_ERR;
@@ -4275,6 +4284,7 @@ static int c_fs_ls(lcl_interp *interp, int argc, lcl_value **argv,
   size_t entry_count = 0;
   size_t entry_cap = 64;
   entries = malloc(entry_cap * sizeof(struct dirent *));
+
   if (!entries) {
     closedir(dir);
     lcl_set_error(interp, "out of memory");
@@ -4282,6 +4292,7 @@ static int c_fs_ls(lcl_interp *interp, int argc, lcl_value **argv,
   }
 
   struct dirent *ent;
+
   while ((ent = readdir(dir)) != NULL) {
     // Skip . and ..
     if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
@@ -4328,6 +4339,7 @@ static int c_fs_ls(lcl_interp *interp, int argc, lcl_value **argv,
   // Format: "name\n" for files, "name/\n" for directories
   size_t content_cap = 4096;
   char *content = malloc(content_cap);
+
   if (!content) {
     for (size_t i = 0; i < entry_count; i++) {
       free(entries[i]);
@@ -4350,9 +4362,11 @@ static int c_fs_ls(lcl_interp *interp, int argc, lcl_value **argv,
 
   if (!entry_info) {
     free(content);
+
     for (size_t i = 0; i < entry_count; i++) {
       free(entries[i]);
     }
+
     free(entries);
     lcl_set_error(interp, "out of memory");
     return LCL_RC_ERR;
@@ -4367,6 +4381,7 @@ static int c_fs_ls(lcl_interp *interp, int argc, lcl_value **argv,
       char full[PATH_MAX];
       snprintf(full, sizeof(full), "%s/%s", path, name);
       struct stat st;
+
       if (stat(full, &st) == 0) {
         is_dir = S_ISDIR(st.st_mode);
       }
@@ -4382,9 +4397,11 @@ static int c_fs_ls(lcl_interp *interp, int argc, lcl_value **argv,
       if (!new_content) {
         free(content);
         free(entry_info);
+
         for (size_t j = 0; j < entry_count; j++) {
           free(entries[j]);
         }
+
         free(entries);
         lcl_set_error(interp, "out of memory");
         return LCL_RC_ERR;
@@ -4467,6 +4484,7 @@ static int c_fs_ls(lcl_interp *interp, int argc, lcl_value **argv,
 
   // Create new pane
   Pane *new_pane = pane_new(new_buffer, host->char_width, host->line_height);
+
   if (!new_pane) {
     buffer_manager_close(host->buffer_manager, new_buffer);
     lcl_set_error(interp, "fs::ls: failed to create pane");
@@ -4930,8 +4948,7 @@ static int c_config_language(lcl_interp *interp, int argc, lcl_value **argv,
   }
 
   if (argc < 2) {
-    lcl_set_error(interp,
-                  "config::language requires name and library_path");
+    lcl_set_error(interp, "config::language requires name and library_path");
     return LCL_RC_ERR;
   }
 
@@ -5604,8 +5621,7 @@ static int c_transform_apply_ctx(lcl_interp *interp, int argc, lcl_value **argv,
   }
 
   if (start < 0 || end < 0 || buffer_id < 0) {
-    lcl_set_error(interp,
-                  "context must have start, end, and buffer fields");
+    lcl_set_error(interp, "context must have start, end, and buffer fields");
     return LCL_RC_ERR;
   }
 
@@ -5775,10 +5791,12 @@ static void register_weft_bindings(lcl_interp *interp) {
              lcl_c_proc_new("weft::annot::ephemeral", c_annot_ephemeral));
   lcl_ns_def(annot_ns, "orphans",
              lcl_c_proc_new("weft::annot::orphans", c_annot_orphans));
-  lcl_ns_def(annot_ns, "resolve-orphan",
-             lcl_c_proc_new("weft::annot::resolve-orphan", c_annot_resolve_orphan));
-  lcl_ns_def(annot_ns, "discard-orphan",
-             lcl_c_proc_new("weft::annot::discard-orphan", c_annot_discard_orphan));
+  lcl_ns_def(
+      annot_ns, "resolve-orphan",
+      lcl_c_proc_new("weft::annot::resolve-orphan", c_annot_resolve_orphan));
+  lcl_ns_def(
+      annot_ns, "discard-orphan",
+      lcl_c_proc_new("weft::annot::discard-orphan", c_annot_discard_orphan));
 
   // Create weft::interact namespace for interaction event context
   lcl_value *interact_ns = lcl_ns_new("interact");
@@ -5826,8 +5844,7 @@ static void register_weft_bindings(lcl_interp *interp) {
   lcl_value *buffer_ns = lcl_ns_new("buffer");
   lcl_ns_def(weft_ns, "buffer", buffer_ns);
 
-  lcl_ns_def(buffer_ns, "id",
-             lcl_c_proc_new("weft::buffer::id", c_buffer_id));
+  lcl_ns_def(buffer_ns, "id", lcl_c_proc_new("weft::buffer::id", c_buffer_id));
   lcl_ns_def(buffer_ns, "by-id",
              lcl_c_proc_new("weft::buffer::by-id", c_buffer_by_id));
   lcl_ns_def(buffer_ns, "list",
@@ -5900,8 +5917,7 @@ static void register_weft_bindings(lcl_interp *interp) {
   lcl_value *sel_ns = lcl_ns_new("sel");
   lcl_ns_def(weft_ns, "sel", sel_ns);
 
-  lcl_ns_def(sel_ns, "start",
-             lcl_c_proc_new("weft::sel::start", c_sel_start));
+  lcl_ns_def(sel_ns, "start", lcl_c_proc_new("weft::sel::start", c_sel_start));
   lcl_ns_def(sel_ns, "end", lcl_c_proc_new("weft::sel::end", c_sel_end));
   lcl_ns_def(sel_ns, "text", lcl_c_proc_new("weft::sel::text", c_sel_text));
   lcl_ns_def(sel_ns, "buffer",
@@ -5939,8 +5955,9 @@ static void register_weft_bindings(lcl_interp *interp) {
              lcl_c_proc_new("weft::config::viewlayer", c_config_viewlayer));
   lcl_ns_def(config_ns, "language",
              lcl_c_proc_new("weft::config::language", c_config_language));
-  lcl_ns_def(config_ns, "language-ext",
-             lcl_c_proc_new("weft::config::language-ext", c_config_language_ext));
+  lcl_ns_def(
+      config_ns, "language-ext",
+      lcl_c_proc_new("weft::config::language-ext", c_config_language_ext));
 
   // Create weft::ts namespace for tree-sitter operations
   lcl_value *ts_ns = lcl_ns_new("ts");
@@ -5959,8 +5976,9 @@ static void register_weft_bindings(lcl_interp *interp) {
              lcl_c_proc_new("weft::transform::apply", c_transform_apply));
   lcl_ns_def(transform_ns, "reject",
              lcl_c_proc_new("weft::transform::reject", c_transform_reject));
-  lcl_ns_def(transform_ns, "apply-ctx",
-             lcl_c_proc_new("weft::transform::apply-ctx", c_transform_apply_ctx));
+  lcl_ns_def(
+      transform_ns, "apply-ctx",
+      lcl_c_proc_new("weft::transform::apply-ctx", c_transform_apply_ctx));
   lcl_ns_def(transform_ns, "list",
              lcl_c_proc_new("weft::transform::list", c_transform_list));
   lcl_ns_def(transform_ns, "menu",
@@ -6146,33 +6164,38 @@ LclHost *lcl_host_new(void) {
   // WEFT_SUBMODULES_DIR is defined by CMake as an absolute path
 #ifdef WEFT_EMBED_TS_LCL
   ts_lang_registry_add_embedded(host->ts_registry, "lcl", tree_sitter_lcl, NULL,
-                                WEFT_SUBMODULES_DIR "/tree-sitter-lcl/queries/highlights.scm");
+                                WEFT_SUBMODULES_DIR
+                                "/tree-sitter-lcl/queries/highlights.scm");
   ts_lang_registry_map_ext(host->ts_registry, ".lcl", "lcl");
 #endif
 
 #ifdef WEFT_EMBED_TS_C
   ts_lang_registry_add_embedded(host->ts_registry, "c", tree_sitter_c, NULL,
-                                WEFT_SUBMODULES_DIR "/c/queries/highlights.scm");
+                                WEFT_SUBMODULES_DIR
+                                "/c/queries/highlights.scm");
   ts_lang_registry_map_ext(host->ts_registry, ".c", "c");
   ts_lang_registry_map_ext(host->ts_registry, ".h", "c");
 #endif
 
 #ifdef WEFT_EMBED_TS_JSON
-  ts_lang_registry_add_embedded(host->ts_registry, "json", tree_sitter_json, NULL,
-                                WEFT_SUBMODULES_DIR "/tree-sitter-json/queries/highlights.scm");
+  ts_lang_registry_add_embedded(
+      host->ts_registry, "json", tree_sitter_json, NULL,
+      WEFT_SUBMODULES_DIR "/tree-sitter-json/queries/highlights.scm");
   ts_lang_registry_map_ext(host->ts_registry, ".json", "json");
 #endif
 
 #ifdef WEFT_EMBED_TS_BASH
-  ts_lang_registry_add_embedded(host->ts_registry, "bash", tree_sitter_bash, NULL,
-                                WEFT_SUBMODULES_DIR "/tree-sitter-bash/queries/highlights.scm");
+  ts_lang_registry_add_embedded(
+      host->ts_registry, "bash", tree_sitter_bash, NULL,
+      WEFT_SUBMODULES_DIR "/tree-sitter-bash/queries/highlights.scm");
   ts_lang_registry_map_ext(host->ts_registry, ".sh", "bash");
   ts_lang_registry_map_ext(host->ts_registry, ".bash", "bash");
 #endif
 
 #ifdef WEFT_EMBED_TS_JAVASCRIPT
-  ts_lang_registry_add_embedded(host->ts_registry, "javascript", tree_sitter_javascript, NULL,
-                                WEFT_SUBMODULES_DIR "/tree-sitter-javascript/queries/highlights.scm");
+  ts_lang_registry_add_embedded(
+      host->ts_registry, "javascript", tree_sitter_javascript, NULL,
+      WEFT_SUBMODULES_DIR "/tree-sitter-javascript/queries/highlights.scm");
   ts_lang_registry_map_ext(host->ts_registry, ".js", "javascript");
   ts_lang_registry_map_ext(host->ts_registry, ".mjs", "javascript");
   ts_lang_registry_map_ext(host->ts_registry, ".jsx", "javascript");
@@ -7382,8 +7405,8 @@ bool lcl_host_apply_viewlayers(LclHost *host, Pane *pane) {
     case VIEWLAYER_TREE_SITTER:
       // Try registry first for all languages
       if (host->ts_registry) {
-        layer = tree_sitter_layer_from_registry(host->ts_registry, config->param,
-                                                config->priority);
+        layer = tree_sitter_layer_from_registry(
+            host->ts_registry, config->param, config->priority);
       }
       // Fall back to hardcoded lcl support if registry doesn't have it
       // (for backwards compatibility when WEFT_EMBED_TS_LCL is disabled)
@@ -7566,8 +7589,10 @@ void lcl_host_set_layer_persistent(LclHost *host, const char *layer) {
 
   // Grow array if needed
   if (host->persistent_layer_count >= host->persistent_layer_cap) {
-    size_t new_cap = host->persistent_layer_cap == 0 ? 8 : host->persistent_layer_cap * 2;
-    char **new_layers = realloc(host->persistent_layers, new_cap * sizeof(char *));
+    size_t new_cap =
+        host->persistent_layer_cap == 0 ? 8 : host->persistent_layer_cap * 2;
+    char **new_layers =
+        realloc(host->persistent_layers, new_cap * sizeof(char *));
     if (!new_layers) {
       return;
     }
@@ -7625,7 +7650,7 @@ bool lcl_host_is_layer_persistent(LclHost *host, const char *layer) {
 }
 
 const char *const *lcl_host_get_persistent_layers(LclHost *host,
-                                                   size_t *out_count) {
+                                                  size_t *out_count) {
   if (!host) {
     if (out_count) {
       *out_count = 0;

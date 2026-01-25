@@ -18,12 +18,12 @@
 // Robust position storage that can re-locate after document edits
 
 typedef struct {
-  size_t approx_pos;    // Approximate byte offset
-  char *before_ctx;     // Text before position (up to CONTEXT_WINDOW_SIZE bytes)
-  size_t before_len;    // Length of before context
-  char *after_ctx;      // Text after position (up to CONTEXT_WINDOW_SIZE bytes)
-  size_t after_len;     // Length of after context
-  AnchorBias bias;      // LEFT or RIGHT
+  size_t approx_pos; // Approximate byte offset
+  char *before_ctx;  // Text before position (up to CONTEXT_WINDOW_SIZE bytes)
+  size_t before_len; // Length of before context
+  char *after_ctx;   // Text after position (up to CONTEXT_WINDOW_SIZE bytes)
+  size_t after_len;  // Length of after context
+  AnchorBias bias;   // LEFT or RIGHT
 } ContextAnchor;
 
 // === Registry Entry ===
@@ -42,8 +42,8 @@ typedef struct DocRegistry {
   RegistryEntry *entries;
   size_t count;
   size_t capacity;
-  char *data_dir;         // ~/.local/share/weft (owned)
-  bool dirty;             // Needs to be saved
+  char *data_dir; // ~/.local/share/weft (owned)
+  bool dirty;     // Needs to be saved
 } DocRegistry;
 
 // === Persisted Annotation ===
@@ -52,27 +52,27 @@ typedef struct DocRegistry {
 typedef struct {
   ContextAnchor start;
   ContextAnchor end;
-  char *layer;            // Layer name (owned)
-  char **keys;            // Metadata keys (owned array of owned strings)
-  char **values;          // Metadata values (owned array of owned strings)
-  size_t meta_count;      // Number of key/value pairs
+  char *layer;       // Layer name (owned)
+  char **keys;       // Metadata keys (owned array of owned strings)
+  char **values;     // Metadata values (owned array of owned strings)
+  size_t meta_count; // Number of key/value pairs
 } PersistedAnnot;
 
 // === Re-anchoring Result ===
 // Status of re-anchoring an annotation after document changes
 
 typedef enum {
-  ANCHOR_OK,        // Exact context match found
-  ANCHOR_FUZZY,     // Context partially matched (position approximate)
-  ANCHOR_ORPHANED   // Could not locate context (needs user intervention)
+  ANCHOR_OK,      // Exact context match found
+  ANCHOR_FUZZY,   // Context partially matched (position approximate)
+  ANCHOR_ORPHANED // Could not locate context (needs user intervention)
 } AnchorStatus;
 
 typedef struct {
-  PersistedAnnot *annot;  // The original persisted annotation (not owned)
-  size_t new_start;       // Resolved start position
-  size_t new_end;         // Resolved end position
-  AnchorStatus status;    // How confident we are in the position
-  int confidence;         // 0-100 confidence score
+  PersistedAnnot *annot; // The original persisted annotation (not owned)
+  size_t new_start;      // Resolved start position
+  size_t new_end;        // Resolved end position
+  AnchorStatus status;   // How confident we are in the position
+  int confidence;        // 0-100 confidence score
 } ReanchorResult;
 
 // === UUID Generation ===

@@ -141,7 +141,8 @@ size_t editor_vcol_to_pos(const Editor *e, size_t line, int vcol);
 void editor_column_insert_char(Editor *e, const char *text, size_t len);
 void editor_column_delete_backward(Editor *e);
 void editor_column_delete_forward(Editor *e);
-char *editor_get_column_selection_text(const Editor *e); // Returns malloc'd string, caller frees
+char *editor_get_column_selection_text(
+    const Editor *e); // Returns malloc'd string, caller frees
 
 // Clipboard
 bool editor_copy(

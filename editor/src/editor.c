@@ -2162,7 +2162,8 @@ void editor_column_insert_char(Editor *e, const char *text, size_t len) {
   e->column_cursor_vcol = e->column_anchor_vcol;
 
   // Update regular cursor to match
-  e->cursor_pos = editor_vcol_to_pos(e, e->column_cursor_line, e->column_cursor_vcol);
+  e->cursor_pos =
+      editor_vcol_to_pos(e, e->column_cursor_line, e->column_cursor_vcol);
   editor_scroll_to_cursor(e);
 }
 
@@ -2179,7 +2180,8 @@ void editor_column_delete_backward(Editor *e) {
   // If selection has width, delete selection
   // Otherwise, delete one character before cursor column on each line
   bool has_width = (right_vcol > left_vcol);
-  int del_start_vcol = has_width ? left_vcol : (left_vcol > 0 ? left_vcol - 1 : 0);
+  int del_start_vcol =
+      has_width ? left_vcol : (left_vcol > 0 ? left_vcol - 1 : 0);
   int del_end_vcol = has_width ? right_vcol : left_vcol;
 
   if (del_start_vcol >= del_end_vcol && !has_width && left_vcol == 0) {
@@ -2221,7 +2223,8 @@ void editor_column_delete_backward(Editor *e) {
   // Update column cursor
   e->column_anchor_vcol = del_start_vcol;
   e->column_cursor_vcol = del_start_vcol;
-  e->cursor_pos = editor_vcol_to_pos(e, e->column_cursor_line, e->column_cursor_vcol);
+  e->cursor_pos =
+      editor_vcol_to_pos(e, e->column_cursor_line, e->column_cursor_vcol);
   editor_scroll_to_cursor(e);
 }
 
@@ -2232,7 +2235,8 @@ char *editor_get_column_selection_text(const Editor *e) {
 
   size_t start_line, end_line;
   int left_vcol, right_vcol;
-  editor_get_column_selection(e, &start_line, &end_line, &left_vcol, &right_vcol);
+  editor_get_column_selection(e, &start_line, &end_line, &left_vcol,
+                              &right_vcol);
 
   // If zero width, return NULL (no selection)
   if (left_vcol >= right_vcol) {
@@ -2355,6 +2359,7 @@ void editor_column_delete_forward(Editor *e) {
   // Column cursor stays at left_vcol
   e->column_anchor_vcol = left_vcol;
   e->column_cursor_vcol = left_vcol;
-  e->cursor_pos = editor_vcol_to_pos(e, e->column_cursor_line, e->column_cursor_vcol);
+  e->cursor_pos =
+      editor_vcol_to_pos(e, e->column_cursor_line, e->column_cursor_vcol);
   editor_scroll_to_cursor(e);
 }

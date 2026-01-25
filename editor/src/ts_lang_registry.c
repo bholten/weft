@@ -441,8 +441,7 @@ TSHighlighter *ts_lang_registry_get_highlighter(TSLangRegistry *reg,
   }
 
   // Create highlighter
-  config->highlighter =
-      ts_hl_new(config->language, config->name, query_source);
+  config->highlighter = ts_hl_new(config->language, config->name, query_source);
   free(query_source);
 
   if (!config->highlighter) {

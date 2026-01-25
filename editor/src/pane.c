@@ -438,8 +438,8 @@ void pane_render(Pane *p, Renderer *r, bool focused) {
   if (editor_in_column_mode(e)) {
     size_t col_start_line, col_end_line;
     int col_left_vcol, col_right_vcol;
-    editor_get_column_selection(e, &col_start_line, &col_end_line, &col_left_vcol,
-                                &col_right_vcol);
+    editor_get_column_selection(e, &col_start_line, &col_end_line,
+                                &col_left_vcol, &col_right_vcol);
 
     SDL_Color col_sel_color = {.r = 70, .g = 130, .b = 180, .a = 180};
 

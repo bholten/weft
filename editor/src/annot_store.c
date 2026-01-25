@@ -290,7 +290,6 @@ uint32_t annot_store_add(AnnotStore *s, size_t start, size_t end,
     s->record_cap = new_cap;
   }
 
-
   uint32_t start_anchor = create_anchor(s, start, ANCHOR_LEFT);
 
   if (start_anchor == 0) {

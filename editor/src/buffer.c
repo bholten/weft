@@ -405,15 +405,16 @@ size_t buffer_load_annotations(Buffer *buf, DocRegistry *reg,
 
   // Load persisted annotations
   size_t annot_count = 0;
-  PersistedAnnot *persisted = annot_persist_load(doc_id, data_dir, &annot_count);
+  PersistedAnnot *persisted =
+      annot_persist_load(doc_id, data_dir, &annot_count);
   if (!persisted || annot_count == 0) {
     return 0;
   }
 
   // Re-anchor annotations
   size_t result_count = 0;
-  ReanchorResult *results =
-      annot_persist_reanchor(persisted, annot_count, buf->document, &result_count);
+  ReanchorResult *results = annot_persist_reanchor(
+      persisted, annot_count, buf->document, &result_count);
   if (!results) {
     persisted_annot_array_free(persisted, annot_count);
     return 0;
@@ -493,10 +494,9 @@ uint32_t buffer_resolve_orphan(Buffer *buf, size_t index, size_t start,
   PersistedAnnot *orphan = &buf->orphaned_annots[index];
 
   // Add annotation to store
-  uint32_t id = annot_store_add(buf->annots, start, end, orphan->layer,
-                                (const char **)orphan->keys,
-                                (const char **)orphan->values,
-                                orphan->meta_count);
+  uint32_t id = annot_store_add(
+      buf->annots, start, end, orphan->layer, (const char **)orphan->keys,
+      (const char **)orphan->values, orphan->meta_count);
 
   if (id != 0) {
     // Successfully added, remove from orphan list

@@ -200,14 +200,14 @@ typedef struct LclHost {
 
   // Annotation editor state
   struct {
-    Buffer *target_buffer;    // Buffer whose annotations we're editing
-    uint32_t *original_ids;   // Array of original annotation IDs
-    size_t original_count;    // Count of original IDs
-    uint64_t doc_rev;         // Document revision at edit start
-    size_t query_start;       // Query start position
-    size_t query_end;         // Query end position (if range)
-    bool is_range;            // true = edit-range, false = edit-at
-    bool active;              // Whether an edit session is active
+    Buffer *target_buffer;  // Buffer whose annotations we're editing
+    uint32_t *original_ids; // Array of original annotation IDs
+    size_t original_count;  // Count of original IDs
+    uint64_t doc_rev;       // Document revision at edit start
+    size_t query_start;     // Query start position
+    size_t query_end;       // Query end position (if range)
+    bool is_range;          // true = edit-range, false = edit-at
+    bool active;            // Whether an edit session is active
   } annot_edit;
 } LclHost;
 
@@ -451,7 +451,7 @@ bool lcl_host_is_layer_persistent(LclHost *host, const char *layer);
 
 // Get the list of persistent layers (returns NULL if using defaults)
 const char *const *lcl_host_get_persistent_layers(LclHost *host,
-                                                   size_t *out_count);
+                                                  size_t *out_count);
 
 // Save document registry to disk
 bool lcl_host_save_registry(LclHost *host);

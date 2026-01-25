@@ -442,7 +442,8 @@ const char *tree_sitter_layer_get_language(const ViewLayer *layer) {
 // === Registry-based Layer Creation ===
 
 ViewLayer *tree_sitter_layer_from_registry(TSLangRegistry *reg,
-                                           const char *lang_name, int priority) {
+                                           const char *lang_name,
+                                           int priority) {
   if (!reg || !lang_name) {
     return NULL;
   }
@@ -498,8 +499,8 @@ ViewLayer *tree_sitter_layer_from_registry(TSLangRegistry *reg,
   }
 
   // Create the layer using the standard function
-  ViewLayer *layer =
-      tree_sitter_layer_new(lang_name, config->language, query_source, priority);
+  ViewLayer *layer = tree_sitter_layer_new(lang_name, config->language,
+                                           query_source, priority);
   free(query_source);
 
   return layer;
@@ -539,8 +540,7 @@ ViewLayer *tree_sitter_layer_new_lcl(int priority) {
       WEFT_SUBMODULES_DIR "/tree-sitter-lcl/queries/highlights.scm",
 #endif
       "../submodules/tree-sitter-lcl/queries/highlights.scm",
-      "../../submodules/tree-sitter-lcl/queries/highlights.scm",
-      NULL};
+      "../../submodules/tree-sitter-lcl/queries/highlights.scm", NULL};
 
   char *query_source = NULL;
   for (const char **p = paths; *p; p++) {
