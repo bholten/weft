@@ -67,6 +67,17 @@ static Pane *find_pane_for_buffer(LclHost *host, Buffer *buffer);
 static char *expand_path(const char *path);
 static bool get_effective_selection_context(LclHost *host, Editor **out_editor,
                                             Buffer **out_buffer);
+static Pane *lcl_host_show_in_pane(LclHost *host, Buffer *buf);
+static Buffer *lcl_host_create_output(LclHost *host, const char *name,
+                                      const char *content, size_t len);
+
+// Macro for common host context validation
+#define REQUIRE_HOST_CONTEXT(interp)                                           \
+  LclHost *host = lcl_interp_get_user_data(interp);                            \
+  if (!host || !host->buffer_manager || !host->layout_root_ptr) {              \
+    lcl_set_error(interp, "no host context");                                  \
+    return LCL_RC_ERR;                                                         \
+  }
 
 // === Internal: Weft Bindings ===
 
@@ -1045,21 +1056,8 @@ static int c_annot_edit_at(lcl_interp *interp, int argc, lcl_value **argv,
         *out = lcl_int_new((long)edit_buf->id);
         return LCL_RC_OK;
       } else {
-        // Hidden - re-summon it by creating a new pane
-        Pane *new_pane =
-            pane_new(edit_buf, host->char_width, host->line_height);
-        if (new_pane) {
-          lcl_host_apply_viewlayers(host, new_pane);
-          LayoutNode *root = *host->layout_root_ptr;
-          LayoutNode *new_split = layout_split_horizontal(root, new_pane);
-          if (new_split && !new_split->parent) {
-            *host->layout_root_ptr = new_split;
-          }
-          recompute_layout_bounds(host);
-          if (host->focused_pane_ptr) {
-            *host->focused_pane_ptr = new_pane;
-          }
-        }
+        // Hidden - re-summon it
+        lcl_host_show_in_pane(host, edit_buf);
         *out = lcl_int_new((long)edit_buf->id);
         return LCL_RC_OK;
       }
@@ -1231,21 +1229,8 @@ static int c_annot_edit_range(lcl_interp *interp, int argc, lcl_value **argv,
         *out = lcl_int_new((long)edit_buf->id);
         return LCL_RC_OK;
       } else {
-        // Hidden - re-summon it by creating a new pane
-        Pane *new_pane =
-            pane_new(edit_buf, host->char_width, host->line_height);
-        if (new_pane) {
-          lcl_host_apply_viewlayers(host, new_pane);
-          LayoutNode *root = *host->layout_root_ptr;
-          LayoutNode *new_split = layout_split_horizontal(root, new_pane);
-          if (new_split && !new_split->parent) {
-            *host->layout_root_ptr = new_split;
-          }
-          recompute_layout_bounds(host);
-          if (host->focused_pane_ptr) {
-            *host->focused_pane_ptr = new_pane;
-          }
-        }
+        // Hidden - re-summon it
+        lcl_host_show_in_pane(host, edit_buf);
         *out = lcl_int_new((long)edit_buf->id);
         return LCL_RC_OK;
       }
@@ -2662,30 +2647,11 @@ static int c_buffer_show(lcl_interp *interp, int argc, lcl_value **argv,
     return LCL_RC_OK;
   }
 
-  // Create new pane for the buffer
-  Pane *new_pane = pane_new(buf, host->char_width, host->line_height);
-  if (!new_pane) {
+  // Show buffer in new pane
+  Pane *pane = lcl_host_show_in_pane(host, buf);
+  if (!pane) {
     lcl_set_error(interp, "buffer::show: failed to create pane");
     return LCL_RC_ERR;
-  }
-
-  // Apply viewlayer configuration
-  lcl_host_apply_viewlayers(host, new_pane);
-
-  // Split current layout horizontally to show new pane
-  LayoutNode *root = *host->layout_root_ptr;
-  LayoutNode *new_split = layout_split_horizontal(root, new_pane);
-
-  if (new_split && !new_split->parent) {
-    *host->layout_root_ptr = new_split;
-  }
-
-  // Recompute layout bounds
-  recompute_layout_bounds(host);
-
-  // Focus the new pane
-  if (host->focused_pane_ptr) {
-    *host->focused_pane_ptr = new_pane;
   }
 
   *out = lcl_int_new((long)buf->id);
@@ -2885,20 +2851,8 @@ static int c_buffer_open(lcl_interp *interp, int argc, lcl_value **argv,
       return LCL_RC_OK;
     }
 
-    // Buffer exists but has no pane - create one
-    Pane *new_pane = pane_new(existing, host->char_width, host->line_height);
-    if (new_pane) {
-      lcl_host_apply_viewlayers(host, new_pane);
-      LayoutNode *root = *host->layout_root_ptr;
-      LayoutNode *new_split = layout_split_horizontal(root, new_pane);
-      if (new_split && !new_split->parent) {
-        *host->layout_root_ptr = new_split;
-      }
-      recompute_layout_bounds(host);
-      if (host->focused_pane_ptr) {
-        *host->focused_pane_ptr = new_pane;
-      }
-    }
+    // Buffer exists but has no pane - show it
+    lcl_host_show_in_pane(host, existing);
     free(path);
     *out = lcl_int_new((long)existing->id);
     return LCL_RC_OK;
@@ -2968,11 +2922,7 @@ static int c_buffer_open(lcl_interp *interp, int argc, lcl_value **argv,
 // weft::buffer::open-output name content -> create scratch buffer with content
 static int c_buffer_open_output(lcl_interp *interp, int argc, lcl_value **argv,
                                 lcl_value **out) {
-  LclHost *host = lcl_interp_get_user_data(interp);
-  if (!host || !host->buffer_manager || !host->layout_root_ptr) {
-    lcl_set_error(interp, "no buffer manager context");
-    return LCL_RC_ERR;
-  }
+  REQUIRE_HOST_CONTEXT(interp);
 
   if (argc < 2) {
     lcl_set_error(interp, "buffer::open-output requires name and content");
@@ -2987,57 +2937,16 @@ static int c_buffer_open_output(lcl_interp *interp, int argc, lcl_value **argv,
     return LCL_RC_ERR;
   }
 
-  // Create new buffer
-  Buffer *new_buffer = buffer_manager_create(host->buffer_manager);
-  if (!new_buffer) {
+  Buffer *buf = lcl_host_create_output(host, name, content, strlen(content));
+  if (!buf) {
     lcl_set_error(interp, "buffer::open-output: failed to create buffer");
     return LCL_RC_ERR;
   }
 
-  // Set content
-  size_t content_len = strlen(content);
-  if (content_len > 0) {
-    document_insert(new_buffer->document, 0, content, content_len);
-  }
-
-  // Set a pseudo file path for display
-  char *display_name = malloc(strlen(name) + 1);
-  if (display_name) {
-    strcpy(display_name, name);
-    new_buffer->file_path = display_name;
-  }
-
   // Scan for file:line patterns (plumber)
-  plumb_scan_buffer(new_buffer);
+  plumb_scan_buffer(buf);
 
-  // Create new pane using renderer metrics
-  Pane *new_pane = pane_new(new_buffer, host->char_width, host->line_height);
-  if (!new_pane) {
-    buffer_manager_close(host->buffer_manager, new_buffer);
-    lcl_set_error(interp, "buffer::open-output: failed to create pane");
-    return LCL_RC_ERR;
-  }
-
-  // Apply viewlayer configuration
-  lcl_host_apply_viewlayers(host, new_pane);
-
-  // Split to show new pane
-  LayoutNode *root = *host->layout_root_ptr;
-  LayoutNode *new_split = layout_split_horizontal(root, new_pane);
-
-  if (new_split && !new_split->parent) {
-    *host->layout_root_ptr = new_split;
-  }
-
-  // Recompute layout bounds
-  recompute_layout_bounds(host);
-
-  // Focus the new pane
-  if (host->focused_pane_ptr) {
-    *host->focused_pane_ptr = new_pane;
-  }
-
-  *out = lcl_list_new();
+  *out = lcl_int_new((long)buf->id);
   return LCL_RC_OK;
 }
 
@@ -3186,6 +3095,63 @@ static char *expand_path(const char *path) {
 
   // realpath failed (file doesn't exist yet?) - return expanded path
   return strdup(expanded);
+}
+
+// Helper: Show an existing buffer in a new split pane, focus it
+// Returns the new pane, or NULL on failure
+static Pane *lcl_host_show_in_pane(LclHost *host, Buffer *buf) {
+  if (!host || !buf || !host->layout_root_ptr) {
+    return NULL;
+  }
+
+  Pane *new_pane = pane_new(buf, host->char_width, host->line_height);
+  if (!new_pane) {
+    return NULL;
+  }
+
+  lcl_host_apply_viewlayers(host, new_pane);
+
+  LayoutNode *root = *host->layout_root_ptr;
+  LayoutNode *new_split = layout_split_horizontal(root, new_pane);
+  if (new_split && !new_split->parent) {
+    *host->layout_root_ptr = new_split;
+  }
+
+  recompute_layout_bounds(host);
+
+  if (host->focused_pane_ptr) {
+    *host->focused_pane_ptr = new_pane;
+  }
+
+  return new_pane;
+}
+
+// Helper: Create a scratch/output buffer with content, show in pane, focus it
+// Returns the buffer, or NULL on failure
+static Buffer *lcl_host_create_output(LclHost *host, const char *name,
+                                      const char *content, size_t len) {
+  if (!host || !host->buffer_manager || !name) {
+    return NULL;
+  }
+
+  Buffer *buf = buffer_manager_create(host->buffer_manager);
+  if (!buf) {
+    return NULL;
+  }
+
+  if (content && len > 0) {
+    document_insert(buf->document, 0, content, len);
+  }
+
+  buf->file_path = strdup(name);
+
+  Pane *pane = lcl_host_show_in_pane(host, buf);
+  if (!pane) {
+    buffer_manager_close(host->buffer_manager, buf);
+    return NULL;
+  }
+
+  return buf;
 }
 
 // Helper: Get the effective buffer for doc commands
@@ -3964,48 +3930,16 @@ static int c_inspect_at(lcl_interp *interp, int argc, lcl_value **argv,
     return LCL_RC_OK;
   }
 
-  // Create new buffer
-  Buffer *new_buffer = buffer_manager_create(host->buffer_manager);
-  if (!new_buffer) {
-    free(output);
-    lcl_set_error(interp, "inspect::at: failed to create buffer");
-    return LCL_RC_ERR;
-  }
-
-  // Set content
-  document_insert(new_buffer->document, 0, output, output_len);
-  free(output);
-
-  // Set display name
+  // Create output buffer with display name
   char display_name[64];
   snprintf(display_name, sizeof(display_name), "*inspect@%ld*", pos);
-  new_buffer->file_path = strdup(display_name);
 
-  // Create new pane
-  Pane *new_pane = pane_new(new_buffer, host->char_width, host->line_height);
-  if (!new_pane) {
-    buffer_manager_close(host->buffer_manager, new_buffer);
-    lcl_set_error(interp, "inspect::at: failed to create pane");
+  Buffer *buf = lcl_host_create_output(host, display_name, output, output_len);
+  free(output);
+
+  if (!buf) {
+    lcl_set_error(interp, "inspect::at: failed to create buffer");
     return LCL_RC_ERR;
-  }
-
-  // Apply viewlayer configuration
-  lcl_host_apply_viewlayers(host, new_pane);
-
-  // Split to show new pane
-  LayoutNode *root = *host->layout_root_ptr;
-  LayoutNode *new_split = layout_split_horizontal(root, new_pane);
-
-  if (new_split && !new_split->parent) {
-    *host->layout_root_ptr = new_split;
-  }
-
-  // Recompute layout bounds
-  recompute_layout_bounds(host);
-
-  // Focus the new pane
-  if (host->focused_pane_ptr) {
-    *host->focused_pane_ptr = new_pane;
   }
 
   *out = lcl_list_new();
@@ -4083,20 +4017,10 @@ static int c_buffer_open_at(lcl_interp *interp, int argc, lcl_value **argv,
       return LCL_RC_OK;
     }
 
-    // Buffer exists but has no pane - create one
-    Pane *new_pane = pane_new(existing, host->char_width, host->line_height);
-    if (new_pane) {
-      lcl_host_apply_viewlayers(host, new_pane);
-      LayoutNode *root = *host->layout_root_ptr;
-      LayoutNode *new_split = layout_split_horizontal(root, new_pane);
-      if (new_split && !new_split->parent) {
-        *host->layout_root_ptr = new_split;
-      }
-      recompute_layout_bounds(host);
-      if (host->focused_pane_ptr) {
-        *host->focused_pane_ptr = new_pane;
-      }
-      jump_to_line(pane_get_editor(new_pane), existing, line_num);
+    // Buffer exists but has no pane - show it and jump to line
+    Pane *pane = lcl_host_show_in_pane(host, existing);
+    if (pane) {
+      jump_to_line(pane_get_editor(pane), existing, line_num);
     }
     free(path);
     *out = lcl_int_new((long)existing->id);
@@ -4679,32 +4603,12 @@ static int c_fs_ls(lcl_interp *interp, int argc, lcl_value **argv,
   free(content);
   free(entry_info);
 
-  // Create new pane
-  Pane *new_pane = pane_new(new_buffer, host->char_width, host->line_height);
-
-  if (!new_pane) {
+  // Show buffer in new pane
+  Pane *pane = lcl_host_show_in_pane(host, new_buffer);
+  if (!pane) {
     buffer_manager_close(host->buffer_manager, new_buffer);
     lcl_set_error(interp, "fs::ls: failed to create pane");
     return LCL_RC_ERR;
-  }
-
-  // Apply viewlayer configuration
-  lcl_host_apply_viewlayers(host, new_pane);
-
-  // Split to show new pane
-  LayoutNode *root = *host->layout_root_ptr;
-  LayoutNode *new_split = layout_split_horizontal(root, new_pane);
-
-  if (new_split && !new_split->parent) {
-    *host->layout_root_ptr = new_split;
-  }
-
-  // Recompute layout bounds
-  recompute_layout_bounds(host);
-
-  // Focus the new pane
-  if (host->focused_pane_ptr) {
-    *host->focused_pane_ptr = new_pane;
   }
 
   *out = lcl_list_new();
@@ -5499,21 +5403,7 @@ static void show_patch_buffer(LclHost *host, Patch *patch, Buffer *target) {
     return;
   }
 
-  // Create a diff buffer
-  Buffer *diff_buf = buffer_manager_create(host->buffer_manager);
-  if (!diff_buf) {
-    free(diff);
-    return;
-  }
-
-  // Give the diff buffer a name so it appears in buffer list
-  diff_buf->file_path = strdup("*diff*");
-
-  // Set buffer content
-  document_insert(diff_buf->document, 0, diff, strlen(diff));
-  free(diff);
-
-  // Add header with actions
+  // Build header with actions
   char header[512];
   size_t additions, deletions, edit_count;
   patch_stats(patch, &additions, &deletions, &edit_count);
@@ -5525,33 +5415,25 @@ static void show_patch_buffer(LclHost *host, Patch *patch, Buffer *target) {
            patch->transform_name ? patch->transform_name : "unnamed",
            edit_count, additions, deletions);
 
-  document_insert(diff_buf->document, 0, header, strlen(header));
-
-  // Create a pane for the diff buffer
-  Pane *new_pane = pane_new(diff_buf, host->char_width, host->line_height);
-  if (!new_pane) {
-    buffer_manager_close(host->buffer_manager, diff_buf);
+  // Combine header and diff
+  size_t header_len = strlen(header);
+  size_t diff_len = strlen(diff);
+  char *content = malloc(header_len + diff_len + 1);
+  if (!content) {
+    free(diff);
     return;
   }
+  memcpy(content, header, header_len);
+  memcpy(content + header_len, diff, diff_len);
+  content[header_len + diff_len] = '\0';
+  free(diff);
 
-  // Apply viewlayer configuration
-  lcl_host_apply_viewlayers(host, new_pane);
+  // Create output buffer
+  Buffer *buf =
+      lcl_host_create_output(host, "*diff*", content, header_len + diff_len);
+  free(content);
 
-  // Split current layout horizontally to show new pane
-  LayoutNode *root = *host->layout_root_ptr;
-  LayoutNode *new_split = layout_split_horizontal(root, new_pane);
-
-  if (new_split && !new_split->parent) {
-    *host->layout_root_ptr = new_split;
-  }
-
-  // Recompute layout bounds
-  recompute_layout_bounds(host);
-
-  // Focus the new pane
-  if (host->focused_pane_ptr) {
-    *host->focused_pane_ptr = new_pane;
-  }
+  (void)buf; // Buffer created and shown, nothing more to do
 }
 
 // weft::transform::register name description script -> register an Lcl
