@@ -41,6 +41,21 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(WEFT_COMPILE_OPTIONS -Wall -Wextra)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# === AddressSanitizer (ASan) Support ===
+option(WEFT_ENABLE_ASAN "Enable AddressSanitizer for debug builds" OFF)
+
+if(WEFT_ENABLE_ASAN)
+  message(STATUS "AddressSanitizer enabled")
+  # ASan flags for both compiler and linker
+  set(ASAN_FLAGS -fsanitize=address -fno-omit-frame-pointer -g)
+  set(ASAN_LINK_FLAGS -fsanitize=address)
+
+  # Add to compile options
+  list(APPEND WEFT_COMPILE_OPTIONS ${ASAN_FLAGS})
+
+  # We'll add link flags to the target later
+endif()
+
 # === Embedded Tree-Sitter Parser Options ===
 # Master switch for all embedded parsers
 option(WEFT_EMBED_PARSERS "Embed tree-sitter parsers in binary" ON)
@@ -276,6 +291,12 @@ target_compile_definitions(weft PRIVATE
   ${WEFT_TS_PARSER_DEFINES}
   WEFT_SUBMODULES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../submodules"
 )
+target_compile_options(weft PRIVATE ${WEFT_COMPILE_OPTIONS})
+
+# Add ASan linker flags if enabled
+if(WEFT_ENABLE_ASAN)
+  target_link_options(weft PRIVATE ${ASAN_LINK_FLAGS})
+endif()
 
 # === Tests ===
 option(WEFT_BUILD_TESTS "Build test executables" ON)
@@ -289,6 +310,9 @@ if(WEFT_BUILD_TESTS)
     src/document.c
   )
   target_compile_options(test_document PRIVATE ${WEFT_COMPILE_OPTIONS})
+  if(WEFT_ENABLE_ASAN)
+    target_link_options(test_document PRIVATE ${ASAN_LINK_FLAGS})
+  endif()
   add_test(NAME document COMMAND test_document)
 
   # Test for annotation store module
@@ -297,6 +321,9 @@ if(WEFT_BUILD_TESTS)
     src/annot_store.c
   )
   target_compile_options(test_annot_store PRIVATE ${WEFT_COMPILE_OPTIONS})
+  if(WEFT_ENABLE_ASAN)
+    target_link_options(test_annot_store PRIVATE ${ASAN_LINK_FLAGS})
+  endif()
   add_test(NAME annot_store COMMAND test_annot_store)
 
   # Custom target to run all tests

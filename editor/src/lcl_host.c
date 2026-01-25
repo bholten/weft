@@ -2278,12 +2278,14 @@ static int c_buffer_id(lcl_interp *interp, int argc, lcl_value **argv,
   (void)argv;
 
   LclHost *host = lcl_interp_get_user_data(interp);
+
   if (!host) {
     lcl_set_error(interp, "no host context");
     return LCL_RC_ERR;
   }
 
   Buffer *buf = get_effective_doc_buffer(host);
+
   if (!buf) {
     lcl_set_error(interp, "no current buffer");
     return LCL_RC_ERR;
@@ -2506,18 +2508,21 @@ static int c_buffer_close(lcl_interp *interp, int argc, lcl_value **argv,
   }
 
   LclHost *host = lcl_interp_get_user_data(interp);
+
   if (!host || !host->buffer_manager || !host->layout_root_ptr) {
     lcl_set_error(interp, "no buffer manager context");
     return LCL_RC_ERR;
   }
 
   long id;
+
   if (lcl_value_to_int(argv[0], &id) != LCL_OK || id <= 0) {
     lcl_set_error(interp, "buffer::close: id must be a positive integer");
     return LCL_RC_ERR;
   }
 
   Buffer *buf = buffer_manager_find_by_id(host->buffer_manager, (uint32_t)id);
+
   if (!buf) {
     lcl_set_error(interp, "buffer::close: no buffer with that id");
     return LCL_RC_ERR;
@@ -2526,6 +2531,7 @@ static int c_buffer_close(lcl_interp *interp, int argc, lcl_value **argv,
   // Find pane containing this buffer and close it
   LayoutNode *root = *host->layout_root_ptr;
   Pane *pane = layout_find_pane_with_buffer(root, buf);
+
   if (!pane) {
     // Buffer exists but isn't displayed - nothing to close
     // Buffer survives for re-summoning via weft::buffer::show
@@ -2535,6 +2541,7 @@ static int c_buffer_close(lcl_interp *interp, int argc, lcl_value **argv,
 
   // Find next pane to focus
   Pane *next = layout_next_pane(root, pane);
+
   if (next == pane) {
     next = NULL;
   }
@@ -2668,21 +2675,37 @@ static int c_buffer_kill(lcl_interp *interp, int argc, lcl_value **argv,
   }
 
   LclHost *host = lcl_interp_get_user_data(interp);
+
   if (!host || !host->buffer_manager || !host->layout_root_ptr) {
     lcl_set_error(interp, "no buffer manager context");
     return LCL_RC_ERR;
   }
 
   long id;
+
   if (lcl_value_to_int(argv[0], &id) != LCL_OK || id <= 0) {
     lcl_set_error(interp, "buffer::kill: id must be a positive integer");
     return LCL_RC_ERR;
   }
 
   Buffer *buf = buffer_manager_find_by_id(host->buffer_manager, (uint32_t)id);
+
   if (!buf) {
     lcl_set_error(interp, "buffer::kill: no buffer with that id");
     return LCL_RC_ERR;
+  }
+
+  // Check if this is the last pane BEFORE modifying any state
+  LayoutNode *root = *host->layout_root_ptr;
+  Pane *pane = layout_find_pane_with_buffer(root, buf);
+
+  if (pane) {
+    Pane *next = layout_next_pane(root, pane);
+    if (next == pane) {
+      // This is the only pane - cannot kill the last buffer
+      lcl_set_error(interp, "buffer::kill: cannot kill last buffer");
+      return LCL_RC_ERR;
+    }
   }
 
   // Clear associated state before closing
@@ -2690,10 +2713,12 @@ static int c_buffer_kill(lcl_interp *interp, int argc, lcl_value **argv,
   if (host->annot_edit.target_buffer == buf) {
     annot_edit_clear(host);
   }
+
   // If this is the *annot-edit* buffer itself, clear annotation edit state
   if (buf->file_path && strcmp(buf->file_path, "*annot-edit*") == 0) {
     annot_edit_clear(host);
   }
+
   // If this buffer is the patch target, clear pending patch
   if (host->patch_target_buffer == buf) {
     if (host->pending_patch) {
@@ -2702,6 +2727,7 @@ static int c_buffer_kill(lcl_interp *interp, int argc, lcl_value **argv,
     }
     host->patch_target_buffer = NULL;
   }
+
   // If this is the *diff* buffer, clear pending patch
   if (buf->file_path && strcmp(buf->file_path, "*diff*") == 0) {
     if (host->pending_patch) {
@@ -2710,10 +2736,12 @@ static int c_buffer_kill(lcl_interp *interp, int argc, lcl_value **argv,
     }
     host->patch_target_buffer = NULL;
   }
+
   // If this buffer is the REPL attached buffer, detach
   if (host->repl_attached_buffer == buf) {
     host->repl_attached_buffer = NULL;
   }
+
   // If this buffer is the current buffer, clear it
   if (host->current_buffer == buf) {
     host->current_buffer = NULL;
@@ -2721,8 +2749,9 @@ static int c_buffer_kill(lcl_interp *interp, int argc, lcl_value **argv,
   }
 
   // Find pane containing this buffer and close it (if any)
-  LayoutNode *root = *host->layout_root_ptr;
-  Pane *pane = layout_find_pane_with_buffer(root, buf);
+  // Note: We already checked above that this isn't the last pane
+  root = *host->layout_root_ptr;
+  pane = layout_find_pane_with_buffer(root, buf);
 
   if (pane) {
     // Find next pane to focus
@@ -2731,17 +2760,12 @@ static int c_buffer_kill(lcl_interp *interp, int argc, lcl_value **argv,
       next = NULL;
     }
 
-    // Close the pane
+    // Close the pane (we already verified this won't fail)
     LayoutNode *new_root = layout_close_pane(root, pane);
-
     if (new_root) {
       *host->layout_root_ptr = new_root;
       *host->focused_pane_ptr = next ? next : layout_first_pane(new_root);
       recompute_layout_bounds(host);
-    } else {
-      // Last pane - don't destroy the buffer
-      lcl_set_error(interp, "buffer::kill: cannot kill last buffer");
-      return LCL_RC_ERR;
     }
   }
 
@@ -4443,14 +4467,17 @@ static int c_fs_ls(lcl_interp *interp, int argc, lcl_value **argv,
       for (size_t i = 0; i < entry_count; i++) {
         free(entries[i]);
       }
+
       free(entries);
       closedir(dir);
       lcl_set_error(interp, "out of memory");
       return LCL_RC_ERR;
     }
+
     memcpy(entries[entry_count], ent, sizeof(struct dirent));
     entry_count++;
   }
+
   closedir(dir);
 
   // Sort entries
@@ -4465,10 +4492,12 @@ static int c_fs_ls(lcl_interp *interp, int argc, lcl_value **argv,
     for (size_t i = 0; i < entry_count; i++) {
       free(entries[i]);
     }
+
     free(entries);
     lcl_set_error(interp, "out of memory");
     return LCL_RC_ERR;
   }
+
   size_t content_len = 0;
 
   // Track annotation info: start, end, full_path, is_dir for each entry
@@ -4515,6 +4544,7 @@ static int c_fs_ls(lcl_interp *interp, int argc, lcl_value **argv,
     while (content_len + line_len + 1 > content_cap) {
       content_cap *= 2;
       char *new_content = realloc(content, content_cap);
+
       if (!new_content) {
         free(content);
         free(entry_info);
@@ -4548,12 +4578,14 @@ static int c_fs_ls(lcl_interp *interp, int argc, lcl_value **argv,
 
     content[content_len++] = '\n';
   }
+
   content[content_len] = '\0';
 
   // Free entries array (we have the info we need)
   for (size_t i = 0; i < entry_count; i++) {
     free(entries[i]);
   }
+
   free(entries);
 
   // Create new buffer
@@ -4576,19 +4608,25 @@ static int c_fs_ls(lcl_interp *interp, int argc, lcl_value **argv,
   new_buffer->file_path = strdup(display_name);
 
   // Add annotations for each entry
+  // Include buffer close in handler so ls buffer closes when entry is clicked
+  uint32_t ls_buffer_id = new_buffer->id;
+
   for (size_t i = 0; i < entry_count; i++) {
     // Create handler script (must call handled to stop further dispatch)
+    // Close this ls buffer first, then open the target
     char handler[PATH_MAX + 128];
     if (entry_info[i].is_dir) {
-      // Directory: ls it
-      snprintf(handler, sizeof(handler),
-               "weft::fs::ls \"%s\"\nweft::interact::handled",
-               entry_info[i].full_path);
+      // Directory: close this buffer, ls the new dir
+      snprintf(
+          handler, sizeof(handler),
+          "weft::buffer::close %u\nweft::fs::ls \"%s\"\nweft::interact::handled",
+          ls_buffer_id, entry_info[i].full_path);
     } else {
-      // File: open it
-      snprintf(handler, sizeof(handler),
-               "weft::buffer::open \"%s\"\nweft::interact::handled",
-               entry_info[i].full_path);
+      // File: close this buffer, open file
+      snprintf(
+          handler, sizeof(handler),
+          "weft::buffer::close %u\nweft::buffer::open \"%s\"\nweft::interact::handled",
+          ls_buffer_id, entry_info[i].full_path);
     }
 
     // Add annotation with action handler
@@ -4605,6 +4643,7 @@ static int c_fs_ls(lcl_interp *interp, int argc, lcl_value **argv,
 
   // Show buffer in new pane
   Pane *pane = lcl_host_show_in_pane(host, new_buffer);
+
   if (!pane) {
     buffer_manager_close(host->buffer_manager, new_buffer);
     lcl_set_error(interp, "fs::ls: failed to create pane");
