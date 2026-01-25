@@ -16,11 +16,104 @@ proc find {s sub} { String::find $s $sub }
 ;; === String Conveniences ===
 ;; Higher-level operations built on the primitives.
 
-;; Split text into lines
-proc lines {s} { String::split $s "\n" }
+;; Split text into lines - works on strings or context dicts (buffer/sel)
+;; On strings: returns list of line strings
+;; On contexts: returns list of span dicts {text "..." start N end N buffer ID}
+proc lines {input} {
+  if [string? $input] {
+    ;; Plain string - return list of strings
+    String::split $input "\n"
+  } else {
+    if [dict? $input] {
+      ;; Context dict - return spans with positions
+      let text [get $input "text"]
+      let base_start [get $input "start"]
+      let buf_id [get $input "buffer"]
+      var result ()
+      var pos 0
+      var line_start 0
+      let text_len [len $text]
 
-;; Split text into words (whitespace-separated)
-proc words {s} { String::split [String::trim $s] " " }
+      while [<= $pos $text_len] {
+        let at_end [== $pos $text_len]
+        let ch [if $at_end { "" } { String::index $text $pos }]
+
+        if [or $at_end [== $ch "\n"]] {
+          let line_text [String::range $text $line_start $pos]
+          let span #{
+            text $line_text
+            start [+ $base_start $line_start]
+            end [+ $base_start $pos]
+            buffer $buf_id
+          }
+          set! result [List::push $result $span]
+          set! line_start [+ $pos 1]
+        }
+        set! pos [+ $pos 1]
+      }
+      $result
+    } else {
+      ;; Unknown type - try as string
+      String::split $input "\n"
+    }
+  }
+}
+
+;; Split text into words - works on strings or context dicts (buffer/sel)
+;; On strings: returns list of word strings
+;; On contexts: returns list of span dicts {text "..." start N end N buffer ID}
+proc words {input} {
+  if [string? $input] {
+    ;; Plain string - return list of strings (split on whitespace)
+    let trimmed [String::trim $input]
+    if [== $trimmed ""] { return () }
+    String::split $trimmed " "
+  } else {
+    if [dict? $input] {
+      ;; Context dict - return spans with positions
+      let text [get $input "text"]
+      let base_start [get $input "start"]
+      let buf_id [get $input "buffer"]
+      let word_chars "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+      var result ()
+      var pos 0
+      let text_len [len $text]
+
+      while [< $pos $text_len] {
+        let ch [String::index $text $pos]
+
+        ;; Skip non-word characters
+        if [< [String::find $word_chars $ch] 0] {
+          set! pos [+ $pos 1]
+          continue
+        }
+
+        ;; Found start of word - find end
+        let word_start $pos
+        while [< $pos $text_len] {
+          let c [String::index $text $pos]
+          if [< [String::find $word_chars $c] 0] { break }
+          set! pos [+ $pos 1]
+        }
+
+        let word_text [String::range $text $word_start $pos]
+        let span #{
+          text $word_text
+          start [+ $base_start $word_start]
+          end [+ $base_start $pos]
+          buffer $buf_id
+        }
+        set! result [List::push $result $span]
+      }
+      $result
+    } else {
+      ;; Unknown type - try as string
+      let trimmed [String::trim $input]
+      if [== $trimmed ""] { return () }
+      String::split $trimmed " "
+    }
+  }
+}
 
 ;; Check if text contains a substring
 proc contains? {s sub} { != [String::find $s $sub] -1 }
@@ -156,11 +249,34 @@ proc filter-reject {pattern lst} {
 ;; When called with a plain string, they return the transformed string.
 
 ;; Check if a value is a transform context (dict with start, end, buffer, text)
+;; This is also the structure for spans returned by words/lines
 proc transform-ctx? {val} {
   if [not [dict? $val]] { return 0 }
   if [not [has? $val "start"]] { return 0 }
   if [not [has? $val "text"]] { return 0 }
   1
+}
+
+;; Alias: check if value is a span (same structure as transform context)
+proc span? {val} { transform-ctx? $val }
+
+;; Add annotation to a span - convenience for working with words/lines results
+;; Usage: annot-span $span "layer" "key1" "val1" "key2" "val2" ...
+;; Supports 0, 2, 4, or 6 key-value arguments
+proc annot-span {span layer *args} {
+    if [not [span? $span]] {
+        error "annot-span: first argument must be a span"
+    }
+
+    let start [get $span "start"]
+    let end [get $span "end"]
+    let argc [len $args]
+
+    if [== $argc 0] {
+        weft::annot::add $start $end $layer
+    } else {
+        weft::annot::add $start $end $layer @$args
+    }
 }
 
 ;; Get selection as a transform context
@@ -169,10 +285,10 @@ proc sel {} { weft::sel::info }
 
 ;; Get entire buffer as a transform context
 proc buffer {} {
-  let len [weft::doc::length]
-  let text [weft::doc::text 0 $len]
-  let id [weft::buffer::id]
-  #{start 0 end $len buffer $id text $text}
+    let l [weft::doc::length]
+    let text [weft::doc::text 0 $l]
+    let id [weft::buffer::id]
+    #{start 0 end $l buffer $id text $text}
 }
 
 ;; Apply a string function to input, showing diff if input is a context
@@ -223,11 +339,18 @@ proc reverse-lines {input} {
 ;; === Acme-style Execution ===
 
 ;; Execute a single command in Acme style
-;; Handles: weft:: commands, [expr], load, file paths, shell commands
+;; Handles: [expr], weft:: commands, load, file paths, shell commands
 ;; Returns 1 if executed, 0 if empty/skipped
 proc acme-exec {text} {
   let trimmed [trim $text]
   if [== $trimmed ""] { return 0 }
+
+  ;; Check for Lcl expression [...] - execute as Lcl
+  ;; This is first because [...] is the explicit "this is Lcl" syntax
+  if [starts-with? $trimmed "\["] {
+    eval $trimmed
+    return 1
+  }
 
   ;; Check for weft:: command (execute as Lcl)
   if [starts-with? $trimmed "weft::"] {
@@ -241,28 +364,22 @@ proc acme-exec {text} {
     return 1
   }
 
-  ;; Check for Lcl expression [...]
-  if [== [String::index $trimmed 0] "\["] {
-    eval $trimmed
-    return 1
-  }
-
   ;; Check for absolute file path (starts with /)
-  if [== [String::index $trimmed 0] "/"] {
+  if [starts-with? $trimmed "/"] {
     weft::buffer::open $trimmed
     return 1
   }
 
-  ;; Execute as shell command
+  ;; Everything else: execute as shell command
   let result [weft::shell::exec $trimmed]
   let stdout [List::index $result 3]
   let stderr [List::index $result 5]
 
   if [> [len $stdout] 0] {
-    weft::buffer::open-output [String::join [list "+" $trimmed] ""] $stdout
+    weft::buffer::open-output [String::join ("+" $trimmed) ""] $stdout
   } else {
     if [> [len $stderr] 0] {
-      weft::buffer::open-output [String::join [list "!" $trimmed] ""] $stderr
+      weft::buffer::open-output [String::join ("!" $trimmed) ""] $stderr
     }
   }
   return 1
@@ -271,8 +388,9 @@ proc acme-exec {text} {
 ;; Execute multiple lines in Acme style
 ;; Splits text by newlines and executes each non-empty line
 proc acme-exec-lines {text} {
-  let text_lines [lines $text]
-  foreach line $text_lines {
-    acme-exec $line
-  }
+    let text_lines [lines $text]
+  
+    foreach line $text_lines {
+        acme-exec $line
+    }
 }

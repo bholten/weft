@@ -11,11 +11,6 @@
 ;; Latin/Romance words feel more formal, intellectual, abstract.
 ;; Greek words feel scholarly, technical, philosophical.
 ;;
-;; For novelists: word origin affects the "feel" of prose.
-;;   "Help!" (Germanic) vs "Assist!" (Latin) - same meaning, different texture
-;;   "Gut feeling" (Germanic) vs "Intuition" (Latin)
-;;   "Kingly" (Germanic) vs "Royal" (Latin) vs "Regal" (Latin)
-;;
 ;; ============================================================================
 
 ;; === Color Definitions ===
@@ -25,77 +20,44 @@ let color_latin    "#7B9EC4"
 let color_greek    "#A87BC4"
 
 ;; === Word Lists ===
-;; Note: Cannot use comments inside (...) list literals - they break parsing
 
-;; Germanic words - Core function words, common verbs, body parts, family, nature, basic concepts
 let germanic_words (
     the a an this that these those it he she we they i you my your his her
     our their its who what which where when why how
     in on at to for from by with of up down out over under through into
     and but or nor so yet if then than as
     be is am are was were been being
-    have has had having
-    do does did done doing
-    say says said saying
-    go goes went gone going
-    get gets got getting
-    make makes made making
-    know knows knew known knowing
-    think thinks thought thinking
-    take takes took taken taking
-    see sees saw seen seeing
-    come comes came coming
-    want wants wanted wanting
-    look looks looked looking
-    give gives gave given giving
-    find finds found finding
-    tell tells told telling
-    feel feels felt feeling
-    leave leaves left leaving
-    put puts putting
-    mean means meant meaning
-    keep keeps kept keeping
-    let lets letting
-    begin begins began begun beginning
-    seem seems seemed seeming
-    help helps helped helping
-    show shows showed shown showing
-    hear hears heard hearing
-    play plays played playing
-    run runs ran running
-    live lives lived living
-    hold holds held holding
-    bring brings brought bringing
-    write writes wrote written writing
-    sit sits sat sitting
-    stand stands stood standing
-    lose loses lost losing
-    meet meets met meeting
-    learn learns learned learning
-    lead leads led leading
-    understand understands understood understanding
-    watch watches watched watching
-    follow follows followed following
-    stop stops stopped stopping
-    speak speaks spoke spoken speaking
-    read reads reading
-    grow grows grew grown growing
-    open opens opened opening
-    walk walks walked walking
-    win wins won winning
-    die dies died dying
-    build builds built building
-    fall falls fell fallen falling
-    cut cuts cutting
-    kill kills killed killing
-    send sends sent sending
-    fight fights fought fighting
-    eat eats ate eaten eating
-    drink drinks drank drunk drinking
-    sleep sleeps slept sleeping
-    love loves loved loving
-    hate hates hated hating
-    fear fears feared fearing
+    have has had having do does did done doing
+    say says said saying go goes went gone going
+    get gets got getting make makes made making
+    know knows knew known knowing think thinks thought thinking
+    take takes took taken taking see sees saw seen seeing
+    come comes came coming want wants wanted wanting
+    look looks looked looking give gives gave given giving
+    find finds found finding tell tells told telling
+    feel feels felt feeling leave leaves left leaving
+    put puts putting mean means meant meaning
+    keep keeps kept keeping let lets letting
+    begin begins began begun beginning seem seems seemed seeming
+    help helps helped helping show shows showed shown showing
+    hear hears heard hearing play plays played playing
+    run runs ran running live lives lived living
+    hold holds held holding bring brings brought bringing
+    write writes wrote written writing sit sits sat sitting
+    stand stands stood standing lose loses lost losing
+    meet meets met meeting learn learns learned learning
+    lead leads led leading understand understands understood understanding
+    watch watches watched watching follow follows followed following
+    stop stops stopped stopping speak speaks spoke spoken speaking
+    read reads reading grow grows grew grown growing
+    open opens opened opening walk walks walked walking
+    win wins won winning die dies died dying
+    build builds built building fall falls fell fallen falling
+    cut cuts cutting kill kills killed killing
+    send sends sent sending fight fights fought fighting
+    eat eats ate eaten eating drink drinks drank drunk drinking
+    sleep sleeps slept sleeping love loves loved loving
+    hate hates hated hating fear fears feared fearing
     hope hopes hoped hoping
     body head eye eyes ear ears nose mouth lip lips tooth teeth tongue
     throat neck shoulder arm hand finger thumb foot feet toe knee leg
@@ -104,18 +66,15 @@ let germanic_words (
     man woman friend folk
     sun moon star earth land water sea hill field wood tree leaf
     stone rock fire light dark day night morning evening
-    rain snow ice wind storm cloud
-    bird fish wolf fox bear deer dog cat
+    rain snow ice wind storm cloud bird fish wolf fox bear deer dog cat
     thing something nothing anything everything
     time life death world way word thought mind soul truth
     good bad great small little big long short high low
     old young new hot cold hard soft deep wide
-    fast slow strong weak free
-    heaven hell god ghost
+    fast slow strong weak free heaven hell god ghost
     house home room door bed knife sword hammer
 )
 
-;; Latin words - -tion/-sion words, -ment words, -ance/-ence words, -ity words, common adjectives and verbs
 let latin_words (
     action nation question position condition situation
     attention mention intention education information
@@ -125,270 +84,103 @@ let latin_words (
     solution revolution resolution institution
     constitution contribution destruction instruction
     production introduction protection direction
-    collection selection reflection election
-    fiction fraction attraction
+    collection selection reflection election fiction fraction attraction
     government movement moment argument
     agreement treatment statement management development
-    department environment equipment
-    improvement achievement arrangement
+    department environment equipment improvement achievement arrangement
     judgment punishment establishment
     importance difference experience influence
-    presence absence evidence
-    distance instance substance assistance
-    performance appearance circumstance
-    balance chance
+    presence absence evidence distance instance substance assistance
+    performance appearance circumstance balance chance
     ability possibility responsibility opportunity
-    community quality reality authority
-    security activity society identity
+    community quality reality authority security activity society identity
     university city
-    possible impossible probable certain
-    important different similar necessary
-    natural official special general
-    personal original final total
-    public private civil
-    human perfect complete
-    simple difficult
-    major minor
-    proper common usual
-    immediate separate
-    able capable
-    accept receive perceive
-    admit commit submit permit
-    announce appear arrive
-    assist resist exist
-    assume consume
-    attend intend extend
-    cause pause
-    compare prepare
-    compose propose suppose
-    conclude include exclude
-    conduct produce reduce introduce
-    consider desire require
-    contain obtain maintain
-    continue
-    correct direct elect select
-    create decide provide
-    declare define
-    demand depend
-    describe design
-    destroy
-    determine
-    develop discuss
-    disturb
-    divide
-    educate
-    employ enjoy
-    enter
-    escape
-    examine
-    expect respect
-    explain
-    express impress
-    force
-    form inform reform perform
-    ignore
-    imagine
-    improve approve prove
-    increase
-    indicate
-    insist
-    inspire
-    invite
-    involve
-    judge
-    observe preserve serve
-    occur
-    offer
-    oppose
-    order
-    organize
-    pass
-    pay
-    place
-    point
-    possess
-    practice
-    prefer
-    present prevent
-    promise
-    protect
-    publish
-    purchase
-    raise
-    range
-    realize
-    recognize
-    record
-    refer
-    reflect
-    refuse
-    relate
-    remain
-    remember
-    remove
-    repeat
-    replace
-    report
-    represent
-    research
-    respond
-    result
-    return
-    reveal
-    review
-    save
-    search
-    sense
-    sign
-    suggest
-    supply
-    support
-    touch
-    travel
-    treat
-    use
-    vary
-    visit
-    face voice
-    nature culture
-    state
-    case
-    act fact
-    part
-    line
-    course source
-    surface
-    service
-    office
-    science
-    age
-    image
-    page stage
-    language
-    damage
-    message
-    passage
-    marriage
-    courage
-    village
-    average
+    possible impossible probable certain important different similar necessary
+    natural official special general personal original final total
+    public private civil human perfect complete simple difficult
+    major minor proper common usual immediate separate able capable
+    accept receive perceive admit commit submit permit
+    announce appear arrive assist resist exist assume consume
+    attend intend extend cause pause compare prepare
+    compose propose suppose conclude include exclude
+    conduct produce reduce introduce consider desire require
+    contain obtain maintain continue correct direct elect select
+    create decide provide declare define demand depend
+    describe design destroy determine develop discuss disturb divide
+    educate employ enjoy enter escape examine expect respect explain
+    express impress force form inform reform perform
+    ignore imagine improve approve prove increase indicate insist
+    inspire invite involve judge observe preserve serve occur offer
+    oppose order organize pass pay place point possess practice prefer
+    present prevent promise protect publish purchase raise range
+    realize recognize record refer reflect refuse relate remain
+    remember remove repeat replace report represent research respond
+    result return reveal review save search sense sign suggest
+    supply support touch travel treat use vary visit
+    face voice nature culture state case act fact part line
+    course source surface service office science age image
+    page stage language damage message passage marriage courage village average
 )
 
-;; Greek words - Philosophy, science, medicine, common Greek-origin words
 let greek_words (
-    philosophy psychology theology
-    theory thesis hypothesis
-    logic ethics physics
-    analysis diagnosis
-    idea ideal
-    method system problem
-    democracy
-    phenomenon
-    paradigm paradox
-    biology geology geography
-    technology
-    mathematics
-    chemistry
-    anatomy
-    therapy
-    atom
-    graph
-    cycle
-    phone telephone
-    program
-    automatic
-    character
-    school
-    church
-    angel demon
-    icon symbol
-    music
-    theater
-    athlete
-    photograph
-    energy
-    crisis
-    basis
-    emphasis
+    philosophy psychology theology theory thesis hypothesis
+    logic ethics physics analysis diagnosis idea ideal
+    method system problem democracy phenomenon paradigm paradox
+    biology geology geography technology mathematics chemistry anatomy
+    therapy atom graph cycle phone telephone program automatic
+    character school church angel demon icon symbol music theater
+    athlete photograph energy crisis basis emphasis
 )
 
-;; === Helper Functions ===
+;; === Helper: Check if word is in list (case-insensitive) ===
 
-let word_chars "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-
-proc is_word_char {ch} {
-    return [>= [String::find $word_chars $ch] 0]
-}
-
-;; Check if word is in a list (case-insensitive)
 proc word_in_list {word lst} {
     let lower_word [String::lower $word]
     foreach w $lst {
-        if [== $lower_word $w] {
-            return 1
-        }
+        if [== $lower_word $w] { return 1 }
     }
     return 0
 }
 
-proc add_ety_style {start end color origin} {
-    weft::annot::add $start $end "etymology" "style:fg" $color "ety:origin" $origin
-}
-
 ;; === Main Logic ===
+
+;; Add a ViewLayer for the "etymology" annotation layer so it renders
+;; Priority 50 puts it above plumb (5) but below search (10) and style (100)
+weft::viewlayer::add "annot" "etymology" 50
 
 ;; Clear previous etymology annotations
 weft::annot::clear-layer "etymology"
 
-let doc_len [weft::doc::length]
-var pos 0
+;; Get all words as spans and annotate by etymology
+var word_count 0
+foreach w [words [buffer]] {
+    let txt [get $w "text"]
 
-while [< $pos $doc_len] {
-    let ch [weft::doc::text $pos 1]
-
-    ;; Skip non-word characters
-    if [not [is_word_char $ch]] {
-        set! pos [+ $pos 1]
+    if [word_in_list $txt $germanic_words] {
+        if [== $word_count 0] {
+            puts "DEBUG: first span = $w"
+            puts "DEBUG: calling annot-span with layer=etymology, fg=$color_germanic"
+        }
+        set! word_count [+ $word_count 1]
+        annot-span $w "etymology" "style:fg" $color_germanic "ety:origin" "Germanic"
         continue
     }
 
-    ;; Check if at start of a word
-    var at_start 1
-    if [> $pos 0] {
-        let prev [weft::doc::text [- $pos 1] 1]
-        if [is_word_char $prev] {
-            set! at_start 0
-        }
-    }
-
-    if [$at_start] {
-        ;; Find word boundaries
-        let word_start $pos
-        var word_end [+ $pos 1]
-        while [< $word_end $doc_len] {
-            let c [weft::doc::text $word_end 1]
-            if [not [is_word_char $c]] { break }
-            set! word_end [+ $word_end 1]
-        }
-
-        let word_len [- $word_end $word_start]
-        let word [weft::doc::text $word_start $word_len]
-
-        ;; Only process words 2+ characters
-        if [>= $word_len 2] {
-            ;; Check etymology
-            if [word_in_list $word $germanic_words] {
-                add_ety_style $word_start $word_end $color_germanic "Germanic"
-            } elseif [word_in_list $word $latin_words] {
-                add_ety_style $word_start $word_end $color_latin "Latin"
-            } elseif [word_in_list $word $greek_words] {
-                add_ety_style $word_start $word_end $color_greek "Greek"
-            }
-        }
-
-        set! pos $word_end
+    if [word_in_list $txt $latin_words] {
+        set! word_count [+ $word_count 1]
+        annot-span $w "etymology" "style:fg" $color_latin "ety:origin" "Latin"
         continue
     }
 
-    set! pos [+ $pos 1]
+    if [word_in_list $txt $greek_words] {
+        set! word_count [+ $word_count 1]
+        annot-span $w "etymology" "style:fg" $color_greek "ety:origin" "Greek"
+        continue
+    }
 }
+
+puts "DEBUG: total annotations attempted = $word_count"
+
+;; Verify annotations exist by querying them
+let annots_at_0 [weft::annot::in-range 0 100 "etymology"]
+puts "DEBUG: etymology annotations in first 100 bytes = $annots_at_0"

@@ -242,6 +242,7 @@ static int c_annot_add(lcl_interp *interp, int argc, lcl_value **argv,
                        lcl_value **out) {
   LclHost *host = lcl_interp_get_user_data(interp);
   Buffer *buffer = get_effective_doc_buffer(host);
+
   if (!buffer) {
     lcl_set_error(interp, "no buffer set");
     return LCL_RC_ERR;
@@ -252,24 +253,28 @@ static int c_annot_add(lcl_interp *interp, int argc, lcl_value **argv,
     return LCL_RC_ERR;
   }
 
-  long start, end;
+  long start;
+  long  end;
+
   if (lcl_value_to_int(argv[0], &start) != LCL_OK || start < 0) {
     lcl_set_error(interp, "annot::add: invalid start position");
     return LCL_RC_ERR;
   }
+
   if (lcl_value_to_int(argv[1], &end) != LCL_OK || end < 0) {
     lcl_set_error(interp, "annot::add: invalid end position");
     return LCL_RC_ERR;
   }
 
   const char *layer = lcl_value_to_string(argv[2]);
+
   if (!layer) {
     lcl_set_error(interp, "annot::add: layer must be a string");
     return LCL_RC_ERR;
   }
 
-  // Parse key-value pairs (remaining arguments)
   size_t user_meta_count = 0;
+
   if (argc > 3) {
     if ((argc - 3) % 2 != 0) {
       lcl_set_error(interp, "annot::add: key-value pairs must be even");
@@ -278,7 +283,6 @@ static int c_annot_add(lcl_interp *interp, int argc, lcl_value **argv,
     user_meta_count = (size_t)(argc - 3) / 2;
   }
 
-  // Add space for provenance if we have a current script path
   size_t prov_count = host->current_script_path ? 1 : 0;
   size_t meta_count = user_meta_count + prov_count;
 
@@ -288,6 +292,7 @@ static int c_annot_add(lcl_interp *interp, int argc, lcl_value **argv,
   if (meta_count > 0) {
     keys = malloc(meta_count * sizeof(const char *));
     values = malloc(meta_count * sizeof(const char *));
+
     if (!keys || !values) {
       free(keys);
       free(values);
@@ -295,10 +300,10 @@ static int c_annot_add(lcl_interp *interp, int argc, lcl_value **argv,
       return LCL_RC_ERR;
     }
 
-    // Copy user-provided metadata
     for (size_t i = 0; i < user_meta_count; i++) {
       keys[i] = lcl_value_to_string(argv[3 + i * 2]);
       values[i] = lcl_value_to_string(argv[3 + i * 2 + 1]);
+
       if (!keys[i] || !values[i]) {
         free(keys);
         free(values);
@@ -321,6 +326,7 @@ static int c_annot_add(lcl_interp *interp, int argc, lcl_value **argv,
   free(values);
 
   *out = lcl_int_new((long)id);
+
   return LCL_RC_OK;
 }
 
@@ -1480,6 +1486,7 @@ static int c_annot_apply_edit(lcl_interp *interp, int argc, lcl_value **argv,
 
       // Get original span (we use original positions, not edited ones)
       size_t orig_start, orig_end;
+      
       annot_store_get_span(store, b->id, &orig_start, &orig_end);
 
       // Count non-prov metadata in original
@@ -4131,6 +4138,71 @@ static int c_pane_prev(lcl_interp *interp, int argc, lcl_value **argv,
   return LCL_RC_OK;
 }
 
+// weft::viewlayer::add type param ?priority? -> add a ViewLayer to current pane
+// type: "annot" (annotation store layer)
+// param: layer name for annot type
+// priority: render order (higher = on top), default 50
+static int c_viewlayer_add(lcl_interp *interp, int argc, lcl_value **argv,
+                           lcl_value **out) {
+  LclHost *host = lcl_interp_get_user_data(interp);
+  if (!host) {
+    lcl_set_error(interp, "no host context");
+    return LCL_RC_ERR;
+  }
+
+  if (argc < 2) {
+    lcl_set_error(interp, "viewlayer::add requires type and param");
+    return LCL_RC_ERR;
+  }
+
+  const char *type_str = lcl_value_to_string(argv[0]);
+  const char *param = lcl_value_to_string(argv[1]);
+
+  if (!type_str || !param) {
+    lcl_set_error(interp, "viewlayer::add: type and param must be strings");
+    return LCL_RC_ERR;
+  }
+
+  int priority = 50;
+  if (argc >= 3) {
+    long prio;
+    if (lcl_value_to_int(argv[2], &prio) == LCL_OK) {
+      priority = (int)prio;
+    }
+  }
+
+  // Get the focused pane
+  if (!host->focused_pane_ptr || !*host->focused_pane_ptr) {
+    lcl_set_error(interp, "viewlayer::add: no focused pane");
+    return LCL_RC_ERR;
+  }
+
+  Pane *pane = *host->focused_pane_ptr;
+  if (!pane->layer_stack) {
+    lcl_set_error(interp, "viewlayer::add: pane has no layer stack");
+    return LCL_RC_ERR;
+  }
+
+  ViewLayer *layer = NULL;
+
+  if (strcmp(type_str, "annot") == 0) {
+    layer = annot_layer_new(param, priority);
+  } else {
+    lcl_set_error(interp, "viewlayer::add: unsupported type (use 'annot')");
+    return LCL_RC_ERR;
+  }
+
+  if (!layer) {
+    lcl_set_error(interp, "viewlayer::add: failed to create layer");
+    return LCL_RC_ERR;
+  }
+
+  layer_stack_add(pane->layer_stack, layer);
+
+  *out = lcl_int_new(1);
+  return LCL_RC_OK;
+}
+
 // === Internal: Filesystem Bindings ===
 
 // Helper: Compare directory entries for sorting (directories first, then alpha)
@@ -5785,6 +5857,13 @@ static void register_weft_bindings(lcl_interp *interp) {
              lcl_c_proc_new("weft::pane::close", c_pane_close));
   lcl_ns_def(pane_ns, "next", lcl_c_proc_new("weft::pane::next", c_pane_next));
   lcl_ns_def(pane_ns, "prev", lcl_c_proc_new("weft::pane::prev", c_pane_prev));
+
+  // Create weft::viewlayer namespace for dynamic layer management
+  lcl_value *viewlayer_ns = lcl_ns_new("viewlayer");
+  lcl_ns_def(weft_ns, "viewlayer", viewlayer_ns);
+
+  lcl_ns_def(viewlayer_ns, "add",
+             lcl_c_proc_new("weft::viewlayer::add", c_viewlayer_add));
 
   // Create weft::fs namespace for filesystem operations
   lcl_value *fs_ns = lcl_ns_new("fs");

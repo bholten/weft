@@ -1,19 +1,32 @@
 Etymology Demo - Word Origin Highlighting
 ==========================================
 
->>> SELECT the next line, then press Ctrl+Enter (or middle-click) <<<
->>> This simple test should turn the first 10 characters red <<<
-load "/home/brennan/dev/weft/layers/test_simple.lcl"
-
->>> SELECT the next line, then press Ctrl+Enter to apply etymology <<<
-load "/home/brennan/dev/weft/layers/etymology.lcl"
-
-This sample demonstrates how word origins affect the "feel" of prose.
+This demo shows how word origins affect the "feel" of prose.
 Germanic words (amber) feel direct and visceral.
 Latin words (blue) feel formal and intellectual.
 Greek words (purple) feel scholarly and technical.
 
-Try pressing Ctrl+I on any word to inspect its etymology annotation!
+HOW TO USE THIS DEMO
+--------------------
+
+1. First, open this file in Weft
+
+2. To apply etymology highlighting:
+   - SELECT the ENTIRE bracketed command below (including the brackets!)
+   - Press Ctrl+Enter (or middle-click)
+
+   [load "/home/brennan/dev/weft/layers/etymology.lcl"]
+
+   Note: The brackets [...] tell Weft this is Lcl code to execute.
+   Without brackets, text is treated as a shell command.
+   Adjust the path if running Weft from a different location.
+
+3. Once applied, you'll see words colored by their origin:
+   - Amber: Germanic words (direct, earthy)
+   - Blue: Latin words (formal, intellectual)
+   - Purple: Greek words (scholarly, technical)
+
+4. Try pressing Ctrl+I on any colored word to inspect its etymology!
 
 
 PASSAGE 1: Germanic Style (direct, visceral, earthy)

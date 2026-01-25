@@ -29,6 +29,7 @@ static Anchor *find_anchor(AnnotStore *s, uint32_t id) {
       return &s->anchors[i];
     }
   }
+
   return NULL;
 }
 
@@ -276,38 +277,40 @@ uint32_t annot_store_add(AnnotStore *s, size_t start, size_t end,
     return 0;
   }
 
-  // Grow records array if needed
   if (s->record_count >= s->record_cap) {
     size_t new_cap = s->record_cap * 2;
     AnnotRecord *new_records =
         realloc(s->records, new_cap * sizeof(AnnotRecord));
+
     if (!new_records) {
       return 0;
     }
+
     s->records = new_records;
     s->record_cap = new_cap;
   }
 
-  // Create anchors
-  // Start anchor: LEFT bias (stays put when text inserted at start)
+
   uint32_t start_anchor = create_anchor(s, start, ANCHOR_LEFT);
+
   if (start_anchor == 0) {
     return 0;
   }
 
-  // End anchor: RIGHT bias (moves when text inserted at end)
   uint32_t end_anchor = create_anchor(s, end, ANCHOR_RIGHT);
+
   if (end_anchor == 0) {
     remove_anchor(s, start_anchor);
     return 0;
   }
 
-  // Allocate metadata arrays
   char **new_keys = NULL;
   char **new_values = NULL;
+
   if (meta_count > 0) {
     new_keys = calloc(meta_count, sizeof(char *));
     new_values = calloc(meta_count, sizeof(char *));
+
     if (!new_keys || !new_values) {
       free(new_keys);
       free(new_values);
@@ -320,12 +323,15 @@ uint32_t annot_store_add(AnnotStore *s, size_t start, size_t end,
     for (size_t i = 0; i < meta_count; i++) {
       if (keys && keys[i]) {
         new_keys[i] = strdup_safe(keys[i]);
+
         if (!new_keys[i]) {
           goto cleanup_meta;
         }
       }
+
       if (values && values[i]) {
         new_values[i] = strdup_safe(values[i]);
+
         if (!new_values[i]) {
           goto cleanup_meta;
         }

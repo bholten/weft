@@ -198,17 +198,27 @@ InteractResult interaction_dispatch(LclHost *lcl, Editor *editor,
   }
 
   // Check for REPL insertion: middle-click with selection on attached buffer
+  // BUT: if the text starts with '[', it's a command to execute, not insert
   if (ie->type == INTERACT_MIDDLE_CLICK && ie->has_selection &&
       ie->selected_text) {
     Buffer *attached = lcl_host_get_repl_attached_buffer(lcl);
     if (attached == buffer) {
-      // This buffer is the REPL's attachment target
-      // Insert the selection into the REPL
-      Buffer *repl_buf = find_repl_buffer(lcl);
-      if (repl_buf && insert_into_repl(lcl, repl_buf, ie->selected_text)) {
-        ie->handled = true;
-        return INTERACT_HANDLED;
+      // Skip REPL insertion if text looks like a command to execute
+      // Text starting with '[' is Lcl code that should be run, not inserted
+      const char *text = ie->selected_text;
+      while (*text && (*text == ' ' || *text == '\t' || *text == '\n')) {
+        text++; // Skip leading whitespace
       }
+      if (*text != '[') {
+        // This buffer is the REPL's attachment target
+        // Insert the selection into the REPL
+        Buffer *repl_buf = find_repl_buffer(lcl);
+        if (repl_buf && insert_into_repl(lcl, repl_buf, ie->selected_text)) {
+          ie->handled = true;
+          return INTERACT_HANDLED;
+        }
+      }
+      // If text starts with '[', fall through to global handlers (acme)
     }
   }
 
