@@ -153,6 +153,7 @@ weft::annot::clear-layer "etymology"
 
 ;; Get all words as spans and annotate by etymology
 var word_count 0
+
 foreach w [words [buffer]] {
     let txt [get $w "text"]
 

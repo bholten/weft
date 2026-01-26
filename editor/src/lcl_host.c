@@ -5392,6 +5392,7 @@ static int c_config_keybind(lcl_interp *interp, int argc, lcl_value **argv,
 static int c_ts_highlight(lcl_interp *interp, int argc, lcl_value **argv,
                           lcl_value **out) {
   LclHost *host = lcl_interp_get_user_data(interp);
+
   if (!host || !host->current_buffer) {
     lcl_set_error(interp, "no buffer set");
     return LCL_RC_ERR;
@@ -5399,17 +5400,20 @@ static int c_ts_highlight(lcl_interp *interp, int argc, lcl_value **argv,
 
   // Get highlights.scm path - use argument or default
   const char *highlights_path = NULL;
+
   if (argc > 0) {
     highlights_path = lcl_value_to_string(argv[0]);
   }
 
   // Default to the tree-sitter-lcl queries path
   char default_path[PATH_MAX];
+
   if (!highlights_path && host->config_dir) {
     // First try config dir
     snprintf(default_path, sizeof(default_path),
              "%s/queries/lcl/highlights.scm", host->config_dir);
     FILE *f = fopen(default_path, "r");
+
     if (f) {
       fclose(f);
       highlights_path = default_path;
@@ -5424,6 +5428,7 @@ static int c_ts_highlight(lcl_interp *interp, int argc, lcl_value **argv,
         "../../submodules/tree-sitter-lcl/queries/highlights.scm",
         "/home/brennan/dev/weft/submodules/tree-sitter-lcl/queries/highlights.scm",
         NULL};
+
     for (const char **p = paths; *p; p++) {
       FILE *f = fopen(*p, "r");
       if (f) {
@@ -5441,6 +5446,7 @@ static int c_ts_highlight(lcl_interp *interp, int argc, lcl_value **argv,
 
   // Get or create highlighter
   TSHighlighter *hl = ts_hl_get_lcl(highlights_path);
+
   if (!hl) {
     lcl_set_error(interp, "ts::highlight: failed to create highlighter");
     return LCL_RC_ERR;
@@ -5448,8 +5454,8 @@ static int c_ts_highlight(lcl_interp *interp, int argc, lcl_value **argv,
 
   // Apply highlighting to the buffer
   ts_hl_apply_to_buffer(hl, host->current_buffer, highlights_path);
-
   *out = lcl_list_new();
+
   return LCL_RC_OK;
 }
 
@@ -5464,6 +5470,7 @@ static void show_patch_buffer(LclHost *host, Patch *patch, Buffer *target) {
 
   // Generate diff text
   char *diff = patch_to_diff(patch, target->document, 3);
+
   if (!diff) {
     return;
   }
@@ -5486,10 +5493,12 @@ static void show_patch_buffer(LclHost *host, Patch *patch, Buffer *target) {
   size_t header_len = strlen(header);
   size_t diff_len = strlen(diff);
   char *content = malloc(header_len + diff_len + 1);
+
   if (!content) {
     free(diff);
     return;
   }
+
   memcpy(content, header, header_len);
   memcpy(content + header_len, diff, diff_len);
   content[header_len + diff_len] = '\0';
@@ -5514,6 +5523,7 @@ static int c_transform_register(lcl_interp *interp, int argc, lcl_value **argv,
   }
 
   LclHost *host = lcl_interp_get_user_data(interp);
+
   if (!host) {
     lcl_set_error(interp, "no host context");
     return LCL_RC_ERR;
@@ -5623,12 +5633,14 @@ static int c_transform_run(lcl_interp *interp, int argc, lcl_value **argv,
   }
 
   LclHost *host = lcl_interp_get_user_data(interp);
+
   if (!host || !host->current_buffer || !host->current_editor) {
     lcl_set_error(interp, "no buffer/editor context");
     return LCL_RC_ERR;
   }
 
   const char *name = lcl_value_to_string(argv[0]);
+
   if (!name) {
     lcl_set_error(interp, "transform name must be a string");
     return LCL_RC_ERR;
@@ -5652,6 +5664,7 @@ static int c_transform_run(lcl_interp *interp, int argc, lcl_value **argv,
   // Get selection range from target editor
   size_t start;
   size_t end;
+
   if (editor_has_selection(target_editor)) {
     editor_get_selection(target_editor, &start, &end);
   } else {
@@ -5662,6 +5675,7 @@ static int c_transform_run(lcl_interp *interp, int argc, lcl_value **argv,
 
   // Collect additional args (if any)
   const char **args = NULL;
+
   if (argc > 1) {
     args = calloc(argc, sizeof(char *));
     if (args) {
@@ -5690,6 +5704,7 @@ static int c_transform_run(lcl_interp *interp, int argc, lcl_value **argv,
   if (host->pending_patch) {
     patch_free(host->pending_patch);
   }
+
   host->pending_patch = patch;
   host->patch_target_buffer = target_buffer;
 
@@ -5707,6 +5722,7 @@ static int c_transform_apply(lcl_interp *interp, int argc, lcl_value **argv,
   (void)argv;
 
   LclHost *host = lcl_interp_get_user_data(interp);
+
   if (!host) {
     lcl_set_error(interp, "no host context");
     return LCL_RC_ERR;
@@ -5723,6 +5739,7 @@ static int c_transform_apply(lcl_interp *interp, int argc, lcl_value **argv,
 
   // Clear selection in the target buffer's editor (old selection is now stale)
   Pane *target_pane = find_pane_for_buffer(host, target);
+
   if (target_pane && target_pane->view) {
     editor_clear_selection(target_pane->view);
   }
@@ -5751,6 +5768,7 @@ static int c_transform_reject(lcl_interp *interp, int argc, lcl_value **argv,
   (void)argv;
 
   LclHost *host = lcl_interp_get_user_data(interp);
+
   if (!host) {
     lcl_set_error(interp, "no host context");
     return LCL_RC_ERR;
@@ -5785,6 +5803,7 @@ static int c_transform_apply_ctx(lcl_interp *interp, int argc, lcl_value **argv,
   }
 
   LclHost *host = lcl_interp_get_user_data(interp);
+
   if (!host || !host->buffer_manager) {
     lcl_set_error(interp, "no host context");
     return LCL_RC_ERR;
@@ -5792,6 +5811,7 @@ static int c_transform_apply_ctx(lcl_interp *interp, int argc, lcl_value **argv,
 
   // Parse context dict
   lcl_value *ctx = argv[0];
+
   if (lcl_value_type_of(ctx) != LCL_DICT) {
     lcl_set_error(interp, "context must be a dict");
     return LCL_RC_ERR;
@@ -5802,17 +5822,20 @@ static int c_transform_apply_ctx(lcl_interp *interp, int argc, lcl_value **argv,
   long end = -1;
   long buffer_id = -1;
   const char *old_text = NULL;
-
   lcl_value *val = NULL;
+
   if (lcl_dict_get(ctx, "start", &val) == LCL_OK) {
     lcl_value_to_int(val, &start);
   }
+
   if (lcl_dict_get(ctx, "end", &val) == LCL_OK) {
     lcl_value_to_int(val, &end);
   }
+
   if (lcl_dict_get(ctx, "buffer", &val) == LCL_OK) {
     lcl_value_to_int(val, &buffer_id);
   }
+
   if (lcl_dict_get(ctx, "text", &val) == LCL_OK) {
     old_text = lcl_value_to_string(val);
   }
@@ -5824,6 +5847,7 @@ static int c_transform_apply_ctx(lcl_interp *interp, int argc, lcl_value **argv,
 
   // Get the new text
   const char *new_text = lcl_value_to_string(argv[1]);
+
   if (!new_text) {
     lcl_set_error(interp, "new-text must be a string");
     return LCL_RC_ERR;
@@ -5832,6 +5856,7 @@ static int c_transform_apply_ctx(lcl_interp *interp, int argc, lcl_value **argv,
   // Find the target buffer
   Buffer *target_buffer =
       buffer_manager_find_by_id(host->buffer_manager, (uint32_t)buffer_id);
+
   if (!target_buffer) {
     lcl_set_error(interp, "buffer not found");
     return LCL_RC_ERR;
@@ -5845,6 +5870,7 @@ static int c_transform_apply_ctx(lcl_interp *interp, int argc, lcl_value **argv,
 
   // Create a patch
   Patch *patch = patch_new("transform");
+
   if (!patch) {
     lcl_set_error(interp, "failed to create patch");
     return LCL_RC_ERR;
@@ -5859,6 +5885,7 @@ static int c_transform_apply_ctx(lcl_interp *interp, int argc, lcl_value **argv,
   if (host->pending_patch) {
     patch_free(host->pending_patch);
   }
+
   host->pending_patch = patch;
   host->patch_target_buffer = target_buffer;
 
@@ -5879,8 +5906,8 @@ static int c_transform_list(lcl_interp *interp, int argc, lcl_value **argv,
   // Get list of transforms
   const char *names[64];
   size_t count = transform_list(names, 64);
-
   lcl_value *result = lcl_list_new();
+
   for (size_t i = 0; i < count; i++) {
     lcl_list_push(&result, lcl_string_new(names[i]));
   }
@@ -5896,6 +5923,7 @@ static int c_transform_menu(lcl_interp *interp, int argc, lcl_value **argv,
   (void)argv;
 
   LclHost *host = lcl_interp_get_user_data(interp);
+
   if (!host || !host->current_buffer || !host->current_editor) {
     lcl_set_error(interp, "no buffer/editor context");
     return LCL_RC_ERR;
@@ -5943,7 +5971,6 @@ static void register_weft_bindings(lcl_interp *interp) {
   // Create weft namespace
   lcl_value *weft_ns = lcl_ns_new("weft");
   lcl_define_take(interp, "weft", weft_ns);
-
   lcl_ns_def(weft_ns, "version",
              lcl_c_proc_new("weft::version", c_weft_version));
 
@@ -6928,6 +6955,7 @@ void lcl_host_register_handler(LclHost *host, const char *name,
     size_t new_cap = host->handler_cap * 2;
     RegisteredHandler *new_handlers =
         realloc(host->handlers, new_cap * sizeof(RegisteredHandler));
+
     if (!new_handlers) {
       return;
     }
@@ -7100,8 +7128,10 @@ static void recompute_layout_bounds(LclHost *host) {
   if (!host || !host->layout_root_ptr || !*host->layout_root_ptr) {
     return;
   }
+
   SDL_Rect window_rect = {
       .x = 0, .y = 0, .w = host->window_width, .h = host->window_height};
+
   layout_compute_bounds(*host->layout_root_ptr, window_rect);
 }
 
@@ -7119,9 +7149,11 @@ void lcl_host_register_filetype(LclHost *host, const char *extension,
     size_t new_cap = host->filetype_cap * 2;
     FileTypeAssoc *new_arr =
         realloc(host->filetypes, new_cap * sizeof(FileTypeAssoc));
+
     if (!new_arr) {
       return;
     }
+
     host->filetypes = new_arr;
     host->filetype_cap = new_cap;
   }
@@ -7149,6 +7181,7 @@ void lcl_host_apply_filetypes(LclHost *host, Buffer *buffer) {
 
   // Find the file extension
   const char *ext = strrchr(buffer->file_path, '.');
+
   if (!ext) {
     return;
   }
@@ -7160,6 +7193,7 @@ void lcl_host_apply_filetypes(LclHost *host, Buffer *buffer) {
   // Look for matching file type associations
   for (size_t i = 0; i < host->filetype_count; i++) {
     FileTypeAssoc *assoc = &host->filetypes[i];
+
     if (strcmp(ext, assoc->extension) == 0) {
       // Register the layer for this buffer
       lcl_host_register_layer(host, assoc->layer_name, assoc->script_path);
@@ -7169,6 +7203,7 @@ void lcl_host_apply_filetypes(LclHost *host, Buffer *buffer) {
 
       // Run the layer immediately
       const char *error_msg = NULL;
+
       if (!lcl_host_run_layer_file(host, assoc->layer_name, assoc->script_path,
                                    &error_msg)) {
         fprintf(stderr, "Error running layer %s: %s\n", assoc->layer_name,
@@ -7187,18 +7222,21 @@ void lcl_host_apply_indent(LclHost *host, Editor *editor) {
   }
 
   Buffer *buffer = editor_get_buffer(editor);
+
   if (!buffer || !buffer->file_path) {
     return;
   }
 
   // Find the file extension
   const char *ext = strrchr(buffer->file_path, '.');
+
   if (!ext) {
     return;
   }
 
   // Look up indent settings for this extension
   const IndentSettings *settings = lcl_host_get_indent(host, ext);
+
   if (settings) {
     editor_set_indent(editor, settings->tab_size, settings->use_tabs);
   }
@@ -7212,13 +7250,16 @@ bool lcl_host_load_config(LclHost *host) {
   // Build path to init.lcl
   size_t len = strlen(host->config_dir) + strlen("/init.lcl") + 1;
   char *init_path = malloc(len);
+
   if (!init_path) {
     return false;
   }
+
   snprintf(init_path, len, "%s/init.lcl", host->config_dir);
 
   // Check if file exists
   struct stat st;
+
   if (stat(init_path, &st) != 0) {
     // File doesn't exist - not an error
     free(init_path);
@@ -7243,6 +7284,7 @@ const char *lcl_host_get_config_dir(LclHost *host) {
   if (!host) {
     return NULL;
   }
+
   return host->config_dir;
 }
 
@@ -7266,9 +7308,11 @@ void lcl_host_register_indent(LclHost *host, const char *extension,
     size_t new_cap = host->indent_cap * 2;
     IndentSettings *new_arr =
         realloc(host->indent_settings, new_cap * sizeof(IndentSettings));
+
     if (!new_arr) {
       return;
     }
+
     host->indent_settings = new_arr;
     host->indent_cap = new_cap;
   }
@@ -7276,12 +7320,13 @@ void lcl_host_register_indent(LclHost *host, const char *extension,
   // Add the new settings
   IndentSettings *settings = &host->indent_settings[host->indent_count];
   settings->extension = strdup(extension);
+
   if (!settings->extension) {
     return;
   }
+
   settings->tab_size = tab_size;
   settings->use_tabs = use_tabs;
-
   host->indent_count++;
 }
 
@@ -7322,9 +7367,11 @@ void lcl_host_register_wrap(LclHost *host, const char *extension, bool enabled,
     size_t new_cap = host->wrap_cap * 2;
     WrapSettings *new_arr =
         realloc(host->wrap_settings, new_cap * sizeof(WrapSettings));
+
     if (!new_arr) {
       return;
     }
+
     host->wrap_settings = new_arr;
     host->wrap_cap = new_cap;
   }
@@ -7332,12 +7379,13 @@ void lcl_host_register_wrap(LclHost *host, const char *extension, bool enabled,
   // Add the new settings
   WrapSettings *settings = &host->wrap_settings[host->wrap_count];
   settings->extension = strdup(extension);
+
   if (!settings->extension) {
     return;
   }
+
   settings->enabled = enabled;
   settings->wrap_width = wrap_width;
-
   host->wrap_count++;
 }
 
@@ -7361,18 +7409,21 @@ void lcl_host_apply_wrap(LclHost *host, Editor *editor) {
   }
 
   Buffer *buffer = editor_get_buffer(editor);
+
   if (!buffer || !buffer->file_path) {
     return;
   }
 
   // Find the file extension
   const char *ext = strrchr(buffer->file_path, '.');
+
   if (!ext) {
     return;
   }
 
   // Look up wrap settings for this extension
   const WrapSettings *settings = lcl_host_get_wrap(host, ext);
+
   if (settings) {
     editor_set_wrap(editor, settings->enabled, settings->wrap_width);
   }
@@ -7395,6 +7446,7 @@ void lcl_host_set_font(LclHost *host, const char *path, int size) {
   if (path) {
     host->font_config.path = strdup(path);
   }
+
   host->font_config.size = size > 0 ? size : 14; // Default to 14 if invalid
   host->font_config_set = true;
 }
@@ -7403,6 +7455,7 @@ const FontConfig *lcl_host_get_font(LclHost *host) {
   if (!host) {
     return NULL;
   }
+
   return &host->font_config;
 }
 
@@ -7410,6 +7463,7 @@ bool lcl_host_has_font_config(LclHost *host) {
   if (!host) {
     return false;
   }
+
   return host->font_config_set;
 }
 
@@ -7417,6 +7471,7 @@ TSLangRegistry *lcl_host_get_ts_registry(LclHost *host) {
   if (!host) {
     return NULL;
   }
+
   return host->ts_registry;
 }
 
@@ -7444,9 +7499,11 @@ void lcl_host_register_keybind(LclHost *host, int keycode, int modifiers,
     size_t new_cap = host->keybind_cap * 2;
     RegisteredKeybind *new_arr =
         realloc(host->keybindings, new_cap * sizeof(RegisteredKeybind));
+
     if (!new_arr) {
       return;
     }
+
     host->keybindings = new_arr;
     host->keybind_cap = new_cap;
   }
@@ -7456,11 +7513,12 @@ void lcl_host_register_keybind(LclHost *host, int keycode, int modifiers,
   kb->keycode = keycode;
   kb->modifiers = modifiers;
   kb->script = strdup(script);
+
   if (!kb->script) {
     return;
   }
-  kb->enabled = true;
 
+  kb->enabled = true;
   host->keybind_count++;
 }
 
@@ -7476,9 +7534,11 @@ bool lcl_host_dispatch_keybind(LclHost *host, int keycode, int modifiers) {
       // Execute the script
       const char *error_msg = NULL;
       bool success = lcl_host_eval(host, kb->script, &error_msg);
+
       if (!success && error_msg) {
         fprintf(stderr, "Keybinding script error: %s\n", error_msg);
       }
+
       return true; // Keybinding matched (regardless of success)
     }
   }
@@ -7500,9 +7560,11 @@ void lcl_host_register_viewlayer(LclHost *host, const char *extension,
     size_t new_cap = host->viewlayer_cap * 2;
     ViewLayerConfig *new_arr =
         realloc(host->viewlayer_configs, new_cap * sizeof(ViewLayerConfig));
+
     if (!new_arr) {
       return;
     }
+
     host->viewlayer_configs = new_arr;
     host->viewlayer_cap = new_cap;
   }
@@ -7510,13 +7572,14 @@ void lcl_host_register_viewlayer(LclHost *host, const char *extension,
   // Add the new config (we allow multiple layers per extension)
   ViewLayerConfig *config = &host->viewlayer_configs[host->viewlayer_count];
   config->extension = strdup(extension);
+
   if (!config->extension) {
     return;
   }
+
   config->type = type;
   config->param = param ? strdup(param) : NULL;
   config->priority = priority;
-
   host->viewlayer_count++;
 }
 
@@ -7532,6 +7595,7 @@ const ViewLayerConfig *lcl_host_get_viewlayers(LclHost *host,
 
   // Count matching configs
   size_t count = 0;
+
   for (size_t i = 0; i < host->viewlayer_count; i++) {
     if (strcmp(host->viewlayer_configs[i].extension, extension) == 0) {
       count++;
@@ -7539,6 +7603,7 @@ const ViewLayerConfig *lcl_host_get_viewlayers(LclHost *host,
   }
 
   *out_count = count;
+
   if (count == 0) {
     return NULL;
   }
@@ -7559,6 +7624,7 @@ bool lcl_host_apply_viewlayers(LclHost *host, Pane *pane) {
   }
 
   Buffer *buffer = editor_get_buffer(pane->view);
+
   if (!buffer) {
     return false;
   }
@@ -7576,6 +7642,7 @@ bool lcl_host_apply_viewlayers(LclHost *host, Pane *pane) {
 
   // Get viewlayer configs for this extension
   size_t config_count = 0;
+
   if (ext) {
     lcl_host_get_viewlayers(host, ext, &config_count);
   }
@@ -7583,6 +7650,7 @@ bool lcl_host_apply_viewlayers(LclHost *host, Pane *pane) {
   // Always add a "style" annotation layer at high priority for user styling
   // This allows user annotations to override tree-sitter highlighting
   ViewLayer *style_layer = annot_layer_new("style", 100);
+
   if (style_layer) {
     layer_stack_add(pane->layer_stack, style_layer);
   }
@@ -7594,8 +7662,10 @@ bool lcl_host_apply_viewlayers(LclHost *host, Pane *pane) {
 
   // Apply each matching config
   bool applied_any = false;
+
   for (size_t i = 0; i < host->viewlayer_count; i++) {
     const ViewLayerConfig *config = &host->viewlayer_configs[i];
+
     if (!ext || strcmp(config->extension, ext) != 0) {
       continue;
     }
@@ -7614,6 +7684,7 @@ bool lcl_host_apply_viewlayers(LclHost *host, Pane *pane) {
       if (!layer && strcmp(config->param, "lcl") == 0) {
         layer = tree_sitter_layer_new_lcl(config->priority);
       }
+
       if (!layer) {
         fprintf(stderr, "viewlayer: tree-sitter language '%s' not available\n",
                 config->param);
@@ -7670,9 +7741,11 @@ bool lcl_host_get_transform_prompt(LclHost *host, const char **message,
   if (message) {
     *message = host->transform_prompt.prompt_message;
   }
+
   if (default_value) {
     *default_value = host->transform_prompt.default_value;
   }
+
   return true;
 }
 
@@ -7794,14 +7867,17 @@ void lcl_host_set_layer_persistent(LclHost *host, const char *layer) {
         host->persistent_layer_cap == 0 ? 8 : host->persistent_layer_cap * 2;
     char **new_layers =
         realloc(host->persistent_layers, new_cap * sizeof(char *));
+
     if (!new_layers) {
       return;
     }
+
     host->persistent_layers = new_layers;
     host->persistent_layer_cap = new_cap;
   }
 
   host->persistent_layers[host->persistent_layer_count] = strdup(layer);
+
   if (host->persistent_layers[host->persistent_layer_count]) {
     host->persistent_layer_count++;
   }

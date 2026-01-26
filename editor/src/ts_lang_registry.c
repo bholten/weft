@@ -72,6 +72,7 @@ static char *build_default_query_path(const char *library_path) {
 #endif
 
   size_t dir_len;
+
   if (last_sep) {
     dir_len = last_sep - library_path;
   } else {
@@ -82,6 +83,7 @@ static char *build_default_query_path(const char *library_path) {
   const char *suffix = "/queries/highlights.scm";
   size_t path_len = dir_len + strlen(suffix) + 1;
   char *path = malloc(path_len);
+
   if (!path) {
     return NULL;
   }
@@ -147,12 +149,14 @@ void ts_lang_registry_free(TSLangRegistry *reg) {
   for (size_t i = 0; i < reg->language_count; i++) {
     lang_config_free(&reg->languages[i]);
   }
+
   free(reg->languages);
 
   for (size_t i = 0; i < reg->mapping_count; i++) {
     free(reg->mappings[i].extension);
     free(reg->mappings[i].language_name);
   }
+
   free(reg->mappings);
 
   free(reg);
@@ -382,9 +386,11 @@ static bool load_language(TSLangConfig *config) {
     config->load_failed = true;
     return false;
   }
+
   free(func_name);
 
   config->language = func();
+
   if (!config->language) {
     fprintf(stderr, "ts_lang_registry: %s() returned NULL\n", config->name);
     config->load_failed = true;
@@ -465,6 +471,7 @@ const char **ts_lang_registry_list(TSLangRegistry *reg, size_t *count) {
   }
 
   const char **names = malloc(reg->language_count * sizeof(char *));
+
   if (!names) {
     return NULL;
   }

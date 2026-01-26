@@ -20,10 +20,8 @@ weft::config::keybind "ctrl+t" { weft::transform::menu }
 weft::config::keybind "ctrl+b" { weft::buffer::menu }
 weft::config::keybind "ctrl+n" { weft::buffer::new }
 
-  ;; Annotation editor
-weft::config::keybind "ctrl+e" {
-    weft::annot::edit-at
-}
+  ;; Annotation editor                                                                                                
+weft::config::keybind "ctrl+e" { weft::annot::edit-at }
 
 weft::config::keybind "ctrl+shift+e" {
     let _sel [weft::interact::selection]
@@ -68,6 +66,7 @@ weft::config::indent ".json" 2 0
 ;; === Dynamic Tree-Sitter Languages ===
 ;; Register dynamically loaded tree-sitter parsers
 ;; weft::config::language name library_path ?query_path?
+weft::config::language "scala" "/home/brennan/dev/weft/submodules/tree-sitter-scala/libtree-sitter-scala.so"
 
 ;; Map extensions to languages
 ;; weft::config::language-ext extension language_name
@@ -81,6 +80,7 @@ weft::config::viewlayer ".h" "tree-sitter" "c" 2
 weft::config::viewlayer ".json" "tree-sitter" "json" 2
 weft::config::viewlayer ".sh" "tree-sitter" "bash" 2
 weft::config::viewlayer ".js" "tree-sitter" "javascript" 2
+weft::config::viewlayer ".scala" "tree-sitter" "scala" 2
 
 ;; === Wrap Settings ===
 ;; Use: weft::config::wrap extension enabled wrap-width
@@ -116,6 +116,23 @@ weft::config::handler "acme" "middle-click" {
 
     ;; Execute each line (handles both single and multi-line)
     acme-exec-lines $_text
+
+    weft::interact::handled
+}
+
+weft::config::handler "pipe-selection" "right-click" {
+    let _sel [weft::interact::selection]
+    var _text ""
+
+    if [> [len $_sel] 0] {
+        set! _text [List::index $_sel 2]
+    } else {
+        set! _text [weft::interact::word-at-pos]
+    }
+
+    if [== $_text ""] { return }
+
+    weft::shell::pipe-selection $_text
 
     weft::interact::handled
 }

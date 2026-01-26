@@ -43,3 +43,6 @@
 [submodule "submodules/c"]
 	path = submodules/c
 	url = git@github.com:tree-sitter/tree-sitter-c.git
+[submodule "submodules/tree-sitter-scala"]
+	path = submodules/tree-sitter-scala
+	url = git@github.com:tree-sitter/tree-sitter-scala.git
