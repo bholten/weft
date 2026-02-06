@@ -1,512 +1,101 @@
 # Weft
 
-A structural text editor with semantic annotations.
+Weft is an Acme-like programmable textual workspace: "structural text
+with metadata". 
 
-## What is Weft?
+Not just a code editor: target uses include linguistics, fiction
+analysis, programming, and collaborative text work.
 
-Weft is an Acme-inspired text editor that treats text as more than raw characters. Every span of text can carry metadata—styling, linguistic analysis, provenance tracking, or custom semantic tags. These annotations survive editing: insert text before a highlighted word, and the highlight stays with the word.
+Weft is a nearly-pure-[Lcl](https://github.com/bholten/lcl)
+application on the [lk](https://github.com/bholten/lk) UI toolkit.
 
-### Use Cases
+One interpreter is the image (Lisp/CLIM lineage): namespaces are
+packages, every evaluation carries an explicit context and leaves an
+execution record, and the whole surface -- commands, transforms,
+producers, queries, plumbing rules, config -- is Lcl you can read,
+run, and redefine live.
 
-- **Programming**: Syntax highlighting, linting, go-to-definition as annotation layers
-- **Linguistics**: Part-of-speech tagging, etymology tracking (Germanic vs. Latinate origins), phoneme analysis
-- **Creative Writing**: Narrative structure markup, character voice tracking, revision history
-- **Research**: Citation provenance, confidence scores, collaborative human/LLM text building
+## Principles
+
+- **Text is ground truth.**  Annotations attach to it, never replace
+  it; they are re-anchored through edits, undo, and reload.
+- **Text is the menu.**  Output is clickable text: `weft::commands`,
+  `weft::buffers`, `ls`, compiler and grep output -- right-click a
+  location and it opens; middle-click a word and it runs.
+- **Preview, then decide.**  Edits produced by programs (transforms,
+  `weft::q::replace`) arrive as reviewable plans with a diff; apply or
+  reject.
+- **Core owns meaning; hosts own effects.**  The one host interface is
+  a capability registry, so the same core runs windowed, headless
+  under test, and (planned) in a browser.
+
+## Status
+
+**SUPER WORK-IN-PROGRESS** -- but usable daily.
 
 ## Building
 
-### Prerequisites
-
-- CMake 3.14+
-- C11 compiler (GCC or Clang)
-- Development headers for: FreeType, HarfBuzz
-
-On Debian/Ubuntu:
 ```bash
-sudo apt install build-essential cmake libfreetype-dev libharfbuzz-dev
+git clone --recurse-submodules <this repo>
+cmake -B build && cmake --build build -j     # sibling ../lk and ../lcl are auto-detected
+./build/weft [files...]                       # windowed
+./build/weft --headless test/p0-gates.lcl     # any gate suite, from any cwd
 ```
 
-### Build
+## The surface
 
-```bash
-cd editor/build
-cmake ..
-make
-```
+| Key | Does |
+|---|---|
+| ctrl+s | save |
+| ctrl+e / ctrl+d | split horizontally / vertically |
+| ctrl+w · ctrl+n · ctrl+b | close pane (buffers survive) · next pane · cycle buffer |
+| ctrl+shift+b · ctrl+1 | show a buffer by name (`qol` finds `docs/qol.md`) · collapse to this pane |
+| ctrl+shift+w · ctrl+shift+e | kill the buffer (`weft::close NAME force` discards) · flip the split's axis |
+| ctrl+enter | EXECUTE the selection or line |
+| ctrl+r · ctrl+t | the Lcl REPL `*lcl*` · a `*shell*` buffer with its own cwd |
+| ctrl+o | open or create a file (bar prefilled with the buffer's cwd) |
+| ctrl+i · ctrl+shift+i | inspect at the cursor · edit the annotations there as text |
+| ctrl+f / ctrl+h / ctrl+g | find / replace / goto line |
+| middle-click | EXECUTE the word or selection |
+| right-click | LOOK: plumb rules act (file:line opens, urls open…); bare words search |
+| shift+right-click | LOOK, opening the result in a new pane beside the source |
 
-SDL3, SDL3_ttf, and tree-sitter are fetched automatically during the build.
+## Programming it
 
-### Run
+Everything below is an Lcl form you can run with ctrl+enter, in
+`*lcl*` or in any buffer.
 
-```bash
-./weft                    # Start with demo content showing styled annotations
-./weft path/to/file.txt   # Open a file
-```
+```lcl
+;; A query is a plan: source, stages, one terminal.
+-> [weft::q::doc] {weft::q::matches {TODO-[0-9]+}} {weft::q::preview 5}
+-> [weft::q::doc] {weft::q::lines} {weft::q::select [lambda {r} {...}]} {weft::q::show}
+-> [weft::q::doc] {weft::q::matches {colour}} {weft::q::replace [lambda {r} { "color" }]}   ;; pends a diff
 
-## Current Features
+;; Live annotation rules are producers: styled, revision-driven.
+-> [weft::q::doc] {weft::q::matches {FIXME}} {weft::q::annotate fixme #{fg (255 160 80)}}
 
-### Editor
-- Full cursor navigation (arrows, Home/End, Page Up/Down, Ctrl+arrows for word movement)
-- Selection (Shift+movement, click-drag, Shift+click)
-- Clipboard (Ctrl+C/X/V)
-- Undo/Redo (Ctrl+Z, Ctrl+Shift+Z)
-- Multiple panes with tiled layout
-- Search (Ctrl+F) and Replace (Ctrl+H)
-- Go to line (Ctrl+G)
-- Tab handling with configurable tab size and spaces/tabs preference
+;; Transforms: preview, then apply.
+weft::transform::register! #{name shout description "upper-case the selection"
+    fn [lambda {ctx} { weft::transform::replace [String::upper [get $ctx text]] }]}
+weft::transform::run shout        ;; ctrl+u is bound to `run upper` by default
 
-### Acme-like Interaction
-- **Middle-click execution**: Click on text to execute it
-  - File paths (`/path/to/file`) open in a new pane
-  - `file.c:42` patterns open file at specific line
-  - Shell commands execute and show output in a scratch buffer
-  - `weft::*` commands execute as Lcl scripts
-- **Ctrl+Enter**: Execute selected text or current line (keyboard middle-click)
-- **Annotation handlers**: Annotations can define custom click behavior via `action:on_middle_click`
-
-### Annotation System
-- **Anchor-based spans**: Annotations reference positions that automatically adjust when text is inserted or deleted
-- **Metadata**: Key/value pairs with namespaced keys (e.g., `style:fg`, `lint:severity`)
-- **Layers**: Group annotations by purpose (style, lint, action, etc.)
-
-### Styled Rendering
-Annotations in the `style` layer control text appearance:
-
-| Key | Values | Effect |
-|-----|--------|--------|
-| `style:fg` | Color name or `#RRGGBB` | Text color |
-| `style:bg` | Color name or `#RRGGBB` | Background highlight |
-| `style:underline` | `"true"` | Underline decoration |
-
-Named colors: red, green, blue, yellow, cyan, magenta, white, black, orange, purple, pink, gray
-
-### Configuration
-
-Weft loads configuration from `~/.config/weft/init.lcl` at startup. This file can configure:
-
-**File type associations** (syntax highlighting):
-```tcl
-weft::config::filetype ".c" "style" "/path/to/syntax_c.lcl"
-weft::config::filetype ".py" "style" "/path/to/syntax_python.lcl"
-```
-
-**Indent settings** (tab size and tabs vs spaces):
-```tcl
-;; C files: 4-character tabs, use actual tabs
-weft::config::indent ".c" 4 1
-
-;; Python: 4 spaces, use spaces (not tabs)
-weft::config::indent ".py" 4 0
-
-;; JavaScript: 2 spaces
-weft::config::indent ".js" 2 0
-```
-
-**Custom handlers**:
-```tcl
-weft::config::handler "my-handler" "middle-click" {
-    puts "Custom handler triggered!"
-    weft::interact::handled
-}
-```
-
-**Keybindings**:
-```tcl
-;; Override Ctrl+W to close pane via script
-weft::config::keybind "ctrl+w" { weft::pane::close }
-
-;; Pane navigation
-weft::config::keybind "ctrl+tab" { weft::pane::next }
-weft::config::keybind "ctrl+shift+tab" { weft::pane::prev }
-
-;; Function key shortcuts
-weft::config::keybind "f5" {
-    let result [weft::shell::exec "make"]
-    weft::buffer::open-output "*build*" [List::get $result 1]
-}
-```
-
-Keybinding key-string format: `modifier+modifier+key` where modifiers are `ctrl`, `shift`, `alt` and keys can be `a`-`z`, `0`-`9`, `f1`-`f12`, or named keys like `return`, `escape`, `tab`, `space`, etc.
-
-### Lcl Scripting
-
-Weft embeds [Lcl](submodules/lcl), a Tcl-like language with lexical scoping, for scriptable annotation layers and interaction handlers.
-
-**Document bindings:**
-- `weft::doc::length`, `line-count`, `text`, `line-start`, `line-end`
-
-**Annotation bindings:**
-- `weft::annot::add`, `remove`, `at`, `in-range`, `get`, `clear-layer`
-
-**Interaction bindings:**
-- `weft::interact::event-type`, `position`, `selection`, `word-at-pos`, `modifiers`, `handled`
-
-**Editor bindings:**
-- `weft::editor::insert`, `delete`, `cursor`, `cursor-set`
-
-**Buffer bindings:**
-- `weft::buffer::open path` - Open file in new pane
-- `weft::buffer::open-at path line` - Open file and jump to line
-- `weft::buffer::open-output name content` - Create scratch buffer
-
-**REPL bindings:**
-- `weft::repl::open` - Open the Lcl REPL
-- `weft::repl::attach` - Attach REPL to current buffer
-- `weft::repl::detach` - Detach from buffer
-- `weft::repl::target` - Get attached buffer info
-- `weft::repl::target-selection` - Get selection from attached buffer
-- `weft::repl::target-cursor` - Get cursor position in attached buffer
-- `weft::repl::goto pos` - Move cursor in attached buffer
-
-**Transform bindings:**
-- `weft::transform::run name start end` - Run transform, show diff preview
-- `weft::transform::apply` - Apply pending patch
-- `weft::transform::reject` - Reject pending patch
-- `weft::transform::list` - List available transforms
-
-**Shell bindings:**
-- `weft::shell::exec cmd` - Execute shell command, returns `{status stdout stderr}`
-
-**Filesystem bindings:**
-- `weft::fs::ls ?path?` - List directory contents with clickable entries
-
-**Plumber bindings:**
-- `weft::plumb::scan` - Scan buffer for file:line patterns, add clickable annotations
-
-**Inspector bindings:**
-- `weft::inspect::at pos` - Show annotations and decorations at position
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                      Weft Editor                        │
-├─────────────────────────────────────────────────────────┤
-│  Layout          │  Pane           │  Pane              │
-│  (tiled splits)  │  (editor view)  │  (editor view)     │
-├──────────────────┴─────────────────┴────────────────────┤
-│                      Editor                             │
-│  (cursor, selection, edit ops, undo/redo, indent)       │
-├─────────────────────────────────────────────────────────┤
-│  Buffer                                                 │
-│  ┌─────────────────┐  ┌─────────────────────────────┐   │
-│  │    Document     │  │      AnnotStore             │   │
-│  │  (gap buffer)   │  │  ┌─────────┐ ┌───────────┐  │   │
-│  │                 │  │  │ Anchors │ │ Records   │  │   │
-│  └─────────────────┘  │  └─────────┘ └───────────┘  │   │
-│                       └─────────────────────────────────┤
-├─────────────────────────────────────────────────────────┤
-│  LclHost (Lcl Interpreter)                              │
-│  ┌───────────┐ ┌───────────┐ ┌──────────┐ ┌──────────┐  │
-│  │ weft::doc │ │weft::annot│ │weft::shell│ │ Config   │  │
-│  └───────────┘ └───────────┘ └──────────┘ └──────────┘  │
-├─────────────────────────────────────────────────────────┤
-│  Interaction Dispatcher                                 │
-│  (middle-click → annotation handlers → global handlers) │
-├─────────────────────────────────────────────────────────┤
-│  Platform + Renderer (SDL3)                             │
-└─────────────────────────────────────────────────────────┘
-```
-
-### How Annotations Survive Edits
-
-Each annotation span is defined by two **anchors**—positions with a bias:
-
-- **Left-biased anchor**: Stays put when text is inserted at its position
-- **Right-biased anchor**: Moves forward when text is inserted at its position
-
-When you insert or delete text, all anchors are transformed:
-- Insert: Anchors after the insert point shift forward
-- Delete: Anchors in the deleted range collapse; anchors after shift backward
-
-This means if you have "Hello" styled in red and insert "Dear " before it, "Hello" remains red—the annotation automatically adjusts to the new position.
-
-## Keyboard Shortcuts
-
-| Shortcut | Action |
-|----------|--------|
-| Ctrl+C/X/V | Copy/Cut/Paste |
-| Ctrl+Z | Undo |
-| Ctrl+Shift+Z | Redo |
-| Ctrl+A | Select all |
-| Ctrl+F | Find |
-| Ctrl+H | Find and Replace |
-| Ctrl+G | Go to line |
-| Ctrl+W | Close current pane |
-| Ctrl+Tab | Cycle focus between panes |
-| Ctrl+` | Open Lcl REPL |
-| Ctrl+I | Inspect annotations at cursor |
-| Ctrl+Enter | Execute selection or line |
-| Tab | Insert tab or spaces (per file type settings) |
-| Escape | Close search/dialogs |
-
-## Lcl REPL
-
-Press **Ctrl+`** to open the Lcl scripting console. This is an interactive environment for:
-
-- Testing Lcl expressions
-- Querying document state (`weft::doc::*`)
-- Experimenting with annotation commands
-- Debugging layer scripts
-
-The REPL features **tree-sitter syntax highlighting** for Lcl code. Keywords, strings, comments, variables, and brackets are all colored appropriately.
-
-Type an expression and press **Ctrl+Enter** to evaluate. Results appear inline:
-
-```
-[+ 1 2]
-;; => 3
-
-[weft::version]
-;; => Weft 0.1.0
-
-[weft::doc::line-count]
-;; => 42
-```
-
-Errors are shown in red:
-```
-[undefined-command]
-;; ERROR: unknown command: undefined-command
-```
-
-### REPL Buffer Attachment
-
-The REPL can **attach** to another buffer, turning it into a powerful lens for exploring and manipulating that buffer's contents. When attached:
-
-- `weft::doc::*` commands operate on the **attached buffer**, not the REPL
-- `weft::annot::*` commands operate on the **attached buffer**
-- Middle-click on selected text in the attached buffer **inserts it into the REPL** (quoted)
-
-**Attachment commands:**
-
-| Command | Description |
-|---------|-------------|
-| `weft::repl::attach` | Attach REPL to the current buffer (run from target buffer) |
-| `weft::repl::detach` | Detach from buffer |
-| `weft::repl::target` | Show info about attached buffer |
-| `weft::repl::target-selection` | Get selection from attached buffer as `{start end "text"}` |
-| `weft::repl::target-cursor` | Get cursor position in attached buffer |
-| `weft::repl::goto <pos>` | Move cursor in attached buffer |
-
-### REPL Tutorial: Exploring a Buffer
-
-Here's a quick workflow demonstrating REPL attachment:
-
-**1. Open a file and attach the REPL:**
-```
-;; Focus on the file you want to explore, then run:
+;; Attach the REPL to a buffer: evals then carry it (and its live
+;; selection) as ctx.
 weft::repl::attach
-;; => myfile.c
 ```
 
-**2. Query the document from the REPL:**
+Config lives in `~/.config/weft/init.lcl` and sees the full vocabulary:
+
+```lcl
+weft::config::filetype! ".md" #{wrap word}
+weft::config::filetype! ".c"  #{lang c}                 ;; tree-sitter highlighting
+weft::config::bind! "ctrl+u" {weft::transform::run "upper"}  ;; chords are a host profile: config/bindings-native.lcl
+weft::plumb::rule! #{name ticket pattern {TICKET-[0-9]+} filetypes (".md")
+    style #{fg (255 200 100)} action [lambda {value ctx} { ... }]}
+weft::ts::style! "keyword" #{fg (198 120 221)}         ;; the palette is data
 ```
-;; Now doc commands work on myfile.c, not the REPL:
-weft::doc::length
-;; => 4523
-
-weft::doc::line-count
-;; => 156
-
-;; Get text from the attached buffer:
-weft::doc::text 0 50
-;; => "#include <stdio.h>\n\nint main(int argc..."
-```
-
-**3. Navigate via the REPL:**
-```
-;; Jump to a specific position:
-weft::repl::goto 100
-
-;; Get current cursor position:
-weft::repl::target-cursor
-;; => 100
-```
-
-**4. Work with selections:**
-```
-;; Select some text in the target buffer, then:
-weft::repl::target-selection
-;; => {45 67 "selected text here"}
-
-;; Or middle-click on selected text to insert it into the REPL!
-```
-
-**5. Add annotations from the REPL:**
-```
-;; Highlight a range in the attached buffer:
-weft::annot::add 100 120 "highlight" style:bg yellow
-
-;; Query annotations:
-weft::annot::at 110
-;; => {42}
-```
-
-**6. Detach when done:**
-```
-weft::repl::detach
-;; => detached from myfile.c
-```
-
-This workflow is especially powerful for:
-- **Debugging**: Inspect document structure and annotations interactively
-- **Batch operations**: Add annotations across multiple positions
-- **Learning**: Understand how Weft's document model works
-
-## Annotation Inspector
-
-Press **Ctrl+I** to inspect all annotations at the cursor position. This opens a new buffer showing:
-
-- Position information (byte offset, line, column)
-- **Persistent annotations** from the AnnotStore (with ID, layer, span, metadata)
-- **Ephemeral decorations** from ViewLayers (like tree-sitter highlighting)
-- The annotated/decorated text (preview)
-
-Example output:
-```
-;; Inspection at position 1234
-;; Line 45, Column 12
-;;
-;; Found 2 annotation(s):
-;;
-─────────────────────────────────────────
-Annotation #7
-  Layer: style
-  Span:  [1230, 1250) (20 bytes)
-  Text:  "function_name"
-  Source: ~/.config/weft/syntax_c.lcl
-  Metadata:
-    style:fg = "#88CC88"
-    style:underline = "true"
-
-─────────────────────────────────────────
-Annotation #12
-  Layer: action
-  Span:  [1230, 1250) (20 bytes)
-  Text:  "function_name"
-  Source: ~/.config/weft/syntax_c.lcl
-  Metadata:
-    action:on_middle_click = "weft::buffer::open-at \"/path/to/file.c\" 100"
-
-;;
-;; Found 1 layer decoration(s):
-;;
-─────────────────────────────────────────
-Decoration (ephemeral)
-  Layer: tree-sitter
-  Span:  [1230, 1250) (20 bytes)
-  Text:  "function_name"
-  Style:
-    fg = #88CC88
-```
-
-The **Source** field shows which script created each annotation (provenance tracking). Decorations are computed on-the-fly by view layers and don't persist.
-
-You can also use `weft::inspect::at <position>` from the REPL or in scripts. When the REPL is attached to a buffer, the inspector operates on that buffer.
-
-## Transforms
-
-Transforms are structured text operations that produce a **patch** (a diff) which you can preview before applying. This provides a safe, reviewable way to make bulk changes.
-
-### Built-in Transforms
-
-| Transform | Description |
-|-----------|-------------|
-| `upper` | Convert text to UPPERCASE |
-| `lower` | Convert text to lowercase |
-| `sort-lines` | Sort lines alphabetically |
-| `reverse-lines` | Reverse line order |
-
-### Using Transforms
-
-**From the REPL:**
-```tcl
-;; Select some text, then run a transform on the selection:
-let sel [weft::repl::target-selection]
-weft::transform::run "upper" [List::get $sel 0] [List::get $sel 1]
-```
-
-**Transform commands:**
-
-| Command | Description |
-|---------|-------------|
-| `weft::transform::run name start end` | Run transform, opens diff preview |
-| `weft::transform::apply` | Apply the pending patch |
-| `weft::transform::reject` | Reject the pending patch |
-| `weft::transform::list` | List available transforms |
-
-**Diff preview:**
-
-When you run a transform, a diff buffer opens showing the proposed changes:
-```diff
---- original
-+++ modified
-@@ -1,3 +1,3 @@
--hello world
-+HELLO WORLD
-```
-
-Review the diff, then use middle-click on `[Apply]` or `[Reject]` in the diff buffer (or run `weft::transform::apply`/`weft::transform::reject` from the REPL).
-
-## Tree-sitter Syntax Highlighting
-
-Weft integrates [tree-sitter](https://tree-sitter.github.io/) for fast, accurate AST-based syntax highlighting. Tree-sitter provides:
-
-- **Incremental parsing**: Only re-parses changed portions of the document
-- **AST-based highlighting**: Colors are based on actual syntax structure, not regex patterns
-- **Extensible**: Add new languages by providing a tree-sitter grammar and highlight queries
-
-### Using Tree-sitter
-
-The `weft::ts::highlight` command applies tree-sitter highlighting to the current buffer:
-
-```tcl
-;; In a layer script (e.g., syntax_lcl_ts.lcl)
-weft::ts::highlight "/path/to/queries/highlights.scm"
-```
-
-Currently supported languages:
-- **Lcl** (`.lcl` files) - Uses the tree-sitter-lcl parser
-
-### Adding New Languages
-
-To add tree-sitter support for a new language:
-1. Obtain or create a tree-sitter grammar for the language
-2. Create a `highlights.scm` query file mapping syntax nodes to highlight groups
-3. Create a layer script that calls `weft::ts::highlight` with the query path
-4. Register the layer in `~/.config/weft/init.lcl`
-
-## Roadmap
-
-- [x] Core editor (cursor, selection, clipboard, undo)
-- [x] Document storage (gap buffer with line index)
-- [x] Annotation store with anchor-based spans
-- [x] Styled rendering from annotations
-- [x] Tiled pane layout
-- [x] Lcl scripting with document/annotation bindings
-- [x] Layer execution (scripts create annotations)
-- [x] Search/replace
-- [x] Interaction dispatcher (middle-click execution)
-- [x] Shell command execution
-- [x] Configuration file (~/.config/weft/init.lcl)
-- [x] File type associations for syntax highlighting
-- [x] Indent settings per file type
-- [x] Plumber (file:line pattern detection)
-- [x] Lcl REPL for interactive scripting
-- [x] Annotation inspector (Ctrl+I)
-- [x] Tree-sitter integration for AST-based syntax highlighting
-- [x] REPL buffer attachment (lens into other buffers)
-- [x] Transform system with diff preview
-- [x] Enhanced inspector with layer decorations
-- [ ] More syntax highlighting layers
-- [ ] Auto-trigger layers on document change (with dirty tracking)
-- [ ] Fuel-limited sandboxing for untrusted layers
 
 ## License
 
-TBD
-
-## Contributing
-
-This is an early-stage personal project. Feel free to open issues for discussion.
+MIT.  Roboto Mono is distributed under the SIL Open Font License
+(`assets/fonts/Roboto_Mono/OFL.txt`).

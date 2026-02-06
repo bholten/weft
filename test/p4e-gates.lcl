@@ -1,0 +1,526 @@
+;; P4-E acceptance gates, stage Q1: the range-query algebra.
+;;   weft --headless test/p4e-gates.lcl
+;; Plans are data; terminals interpret; records carry provenance
+;; (buffer + revision + absolute offsets).  matches yields full-match
+;; ranges only until lcl R0 (Regex::search offsets) -- capture access
+;; refuses with that pointer.
+
+proc gate {name ok} {
+    if [not $ok] { error "GATE FAILED: $name" }
+    puts "ok: $name"
+}
+
+require "weft/host/test.lcl"
+
+weft::ws::init! [weft::testhost::editor-hooks]
+
+;; Fixture: 4 lines (one empty), 3 TODO matches at known offsets.
+let _qtext "alpha TODO-1 beta\nTODO-22 gamma\n\ndelta TODO-333\n"
+let _qb [weft::ws::buffer-create! "q-fixture" "" $_qtext]
+
+;; ---- plans are data ----
+
+let _p0 [weft::q::doc $_qb]
+gate "a source is a query value" \
+    [and [dict? $_p0] [== query [get $_p0 kind]]]
+
+let _p1 [weft::q::take [weft::q::lines $_p0] 2]
+gate "operators append stages without mutating the input" \
+    [and [== 2 [len [get $_p1 stages]]] [== 0 [len [get $_p0 stages]]]]
+gate "describe is the compact one-liner" \
+    [>= [String::find [weft::q::describe $_p1] "lines | take 2"] 0]
+gate "explain lists stages without running" \
+    [>= [String::find [weft::q::explain $_p1] "nothing has run"] 0]
+
+;; ---- segmentation with provenance ----
+
+gate "lines count (trailing newline yields no phantom)" \
+    [== 4 [weft::q::count [weft::q::lines $_p0]]]
+
+let _lr [weft::q::_records [weft::q::lines $_p0] 10]
+let _l0 [get [get $_lr records] 0]
+let _l2 [get [get $_lr records] 2]
+gate "line records carry absolute offsets" \
+    [and [== 0 [get $_l0 start]] [== 17 [get $_l0 end]]]
+gate "interior empty lines are real records" \
+    [and [== 32 [get $_l2 start]] [== 32 [get $_l2 end]]]
+gate "records are revision-stamped" \
+    [== [get $_lr revision] [Lk::doc_revision [weft::ws::buffer-doc $_qb]]]
+
+if $weft_have_regex {
+    ;; NB braced pattern.
+    let _pm [weft::q::matches $_p0 {TODO-[0-9]+}]
+    gate "matches count" [== 3 [weft::q::count $_pm]]
+
+    let _mr [get [weft::q::_records $_pm 10] records]
+    gate "match records carry absolute full-match ranges" \
+        [and [== 6 [get [get $_mr 0] start]] \
+             [and [== 12 [get [get $_mr 0] end]] \
+                  [== 39 [get [get $_mr 2] start]]]]
+
+    ;; Segmenters nest: matches WITHIN lines = same absolute ranges.
+    let _nested [weft::q::matches [weft::q::lines $_p0] {TODO-[0-9]+}]
+    let _nr [get [weft::q::_records $_nested 10] records]
+    gate "nested segmentation preserves absolute offsets" \
+        [and [== 3 [len $_nr]] \
+             [and [== 6 [get [get $_nr 0] start]] \
+                  [== 39 [get [get $_nr 2] start]]]]
+
+    ;; Capture ranges (R0): groups ride records as absolute offsets.
+    let _cm [get [weft::q::_records [weft::q::matches $_p0 \
+        {(TODO)-([0-9]+)}] 10] records]
+    let _c1 [weft::q::cap [get $_cm 0] 1]
+    let _c2 [weft::q::cap [get $_cm 0] 2]
+    gate "capture ranges are absolute offset pairs" \
+        [and [and [== 6 [get $_c1 start]] [== 10 [get $_c1 end]]] \
+             [and [== 11 [get $_c2 start]] [== 12 [get $_c2 end]]]]
+    gate "cap-text slices from the record" \
+        [and [== "TODO" [weft::q::cap-text [get $_cm 0] 1]] \
+             [== "1" [weft::q::cap-text [get $_cm 0] 2]]]
+
+    ;; Unmatched groups keep the sentinel; cap-text degrades to "".
+    let _um [get [weft::q::_records [weft::q::matches \
+        [weft::q::range $_qb 0 17] {alpha( zzz)?}] 5] records]
+    gate "unmatched groups are sentinels, not errors" \
+        [and [== -1 [get [weft::q::cap [get $_um 0] 1] start]] \
+             [== "" [weft::q::cap-text [get $_um 0] 1]]]
+
+    var _cap_rc 0
+    var _cap_r ""
+    var _cap_e ""
+    set! _cap_rc [catch { \
+        weft::q::cap [get [get $_lr records] 0] 1 } _cap_r _cap_e]
+    gate "cap refuses non-match records" [not [== 0 $_cap_rc]]
+} else {
+    puts "deferred: matches gates (host built without regex)"
+}
+
+gate "fields segment a range with offsets" \
+    [== 3 [weft::q::count [weft::q::fields \
+        [weft::q::range $_qb 0 17]]]]
+
+let _fr [get [weft::q::_records [weft::q::fields \
+    [weft::q::range $_qb 0 17]] 10] records]
+gate "field offsets are absolute" \
+    [and [== 6 [get [get $_fr 1] start]] [== 12 [get [get $_fr 1] end]]]
+
+gate "split on a separator" \
+    [== 2 [weft::q::count [weft::q::split $_p0 "\n\n"]]]
+
+;; ---- sequence operators ----
+
+gate "select filters on record text" \
+    [== 1 [weft::q::count [weft::q::select [weft::q::lines $_p0] \
+        [lambda {r} { return [>= [String::find [get $r text] "gamma"] 0] }]]]]
+gate "reject is select's complement" \
+    [== 3 [weft::q::count [weft::q::reject [weft::q::lines $_p0] \
+        [lambda {r} { return [>= [String::find [get $r text] "gamma"] 0] }]]]]
+gate "take bounds the stream" \
+    [== 2 [weft::q::count [weft::q::take [weft::q::lines $_p0] 2]]]
+gate "drop skips the head" \
+    [== 2 [weft::q::count [weft::q::drop [weft::q::lines $_p0] 2]]]
+
+let _mv [get [weft::q::_records [weft::q::map [weft::q::lines $_p0] \
+    [lambda {r} { return [String::length [get $r text]] }]] 1] records]
+gate "map keeps provenance and adds a value" \
+    [and [== 17 [get [get $_mv 0] value]] [== 0 [get [get $_mv 0] start]]]
+
+let _dv [get [weft::q::_records [weft::q::derive [weft::q::lines $_p0] \
+    width [lambda {r} { return [String::length [get $r text]] }]] 1] records]
+gate "derive adds a named provenance-keeping field" \
+    [== 17 [get [get $_dv 0] width]]
+
+;; ---- terminals ----
+
+let _pv [weft::q::preview [weft::q::lines $_p0] 2]
+gate "preview is bounded and marks truncation" \
+    [and [>= [String::find $_pv "2 of 2+"] 0] \
+         [>= [String::find $_pv "alpha TODO-1 beta"] 0]]
+
+let _pv4 [weft::q::preview [weft::q::lines $_p0]]
+gate "an exhaustive preview reports the exact total" \
+    [>= [String::find $_pv4 "4 of 4"] 0]
+
+;; ---- annotation source ----
+
+let _qstore [weft::ws::buffer-store $_qb]
+Lk::annot_layer_register $_qstore "marks"
+Lk::annot_layer_register $_qstore "other"
+Lk::annot_add $_qstore 6 12 "marks" #{why "first"}
+Lk::annot_add $_qstore 18 25 "marks" #{why "second"}
+Lk::annot_add $_qstore 0 5 "other" #{}
+
+gate "annots source scopes by layer" \
+    [and [== 2 [weft::q::count [weft::q::annots $_qb "marks"]]] \
+         [== 3 [weft::q::count [weft::q::annots $_qb ""]]]]
+
+let _ar [get [weft::q::_records [weft::q::annots $_qb "marks"] 10] records]
+gate "annot records carry layer, meta, and span" \
+    [and [== "first" [get [get [get $_ar 0] meta] why]] \
+         [and [== 6 [get [get $_ar 0] start]] \
+              [== marks [get [get $_ar 0] layer]]]]
+
+;; ---- ctx-default sources + thread-first ----
+
+let _ev [weft::image::eval-in! user \
+    {weft::q::count [weft::q::lines [weft::q::doc]]} #{buffer $_qb}]
+gate "ctx-default doc resolves the executing buffer" \
+    [and [get $_ev ok] [== 4 [get $_ev value]]]
+
+let _tf [-> [weft::q::doc $_qb] {weft::q::lines} {weft::q::take 2} \
+    {weft::q::count}]
+gate "thread-first composes the pipeline" [== 2 $_tf]
+
+let _qa [weft::image::eval-in! user \
+    {q::count [q::lines [q::doc]]} #{buffer $_qb}]
+gate "the q:: alias serves the vocabulary" \
+    [and [get $_qa ok] [== 4 [get $_qa value]]]
+
+;; ---- the selection source rides the operand primitive ----
+
+;; An attached REPL (or a bind!) hands start/end in ctx ...
+let _qs [weft::image::eval-in! user \
+    {weft::q::count [weft::q::lines [weft::q::selection]]} \
+    #{buffer $_qb start 0 end [Lk::doc_line_end [weft::ws::buffer-doc $_qb] 1]}]
+gate "q::selection over ctx start/end" \
+    [and [get $_qs ok] [== 2 [get $_qs value]]]
+
+;; ... and EXECUTE WITH hands an explicit operand, which may point at
+;; a DIFFERENT buffer than the one running the query.
+let _qb_other [weft::ws::buffer-create! "q-other" "" "x1\nx2\nx3\n"]
+let _qo [weft::image::eval-in! user \
+    {weft::q::count [weft::q::lines [weft::q::selection]]} \
+    #{buffer $_qb operand [weft::cmd::operand-from-range $_qb_other 0 9]}]
+gate "q::selection follows an explicit operand into another buffer" \
+    [and [get $_qo ok] [== 3 [get $_qo value]]]
+
+let _qn [weft::image::eval-in! user {weft::q::selection} #{buffer $_qb}]
+gate "q::selection without a selection is a structured error" \
+    [and [not [get $_qn ok]] \
+         [>= [String::find [String::from [get $_qn error]] "no selection"] 0]]
+
+;; ---- errors ----
+
+var _gone_rc 0
+var _gone_r ""
+var _gone_e ""
+let _pgone [weft::q::lines [weft::q::doc $_qb]]
+let _qb2 [weft::ws::buffer-create! "q-tmp" "" "x"]
+let _pg2 [weft::q::lines [weft::q::doc $_qb2]]
+weft::ws::buffer-close! $_qb2 0
+set! _gone_rc [catch { weft::q::count $_pg2 } _gone_r _gone_e]
+gate "a plan over a closed buffer refuses to run" [not [== 0 $_gone_rc]]
+
+var _nq_rc 0
+var _nq_r ""
+var _nq_e ""
+set! _nq_rc [catch { weft::q::lines "not a plan" } _nq_r _nq_e]
+gate "operators refuse non-plans with guidance" [not [== 0 $_nq_rc]]
+
+;; ---- stage Q2: the annotation sink ----
+
+if $weft_have_regex {
+    weft::config::put! data_dir "/data"
+
+    ;; A pathed buffer so persistence classification is testable.
+    weft::testhost::fs-put! "/q/doc.txt" "alpha TODO-1 beta\nTODO-22 gamma\n"
+
+    let _ab [weft::ws::buffer-open! "/q/doc.txt" #{}]
+    let _astore [weft::ws::buffer-store $_ab]
+
+    ;; NB braced pattern.
+    let _rule [weft::q::matches [weft::q::doc $_ab] {TODO-[0-9]+}]
+
+    weft::q::annotate $_rule "todo" #{bg (90 60 20)}
+    weft::producer::tick! $_ab
+
+    let _t1 [Lk::annot_by_layer $_astore "todo"]
+    gate "annotate builds the layer from the plan" [== 2 [len $_t1]]
+
+    let _tsp [Lk::annot_span $_astore [get $_t1 0]]
+    gate "rule annotations sit on match ranges" \
+        [and [== 6 [get $_tsp 0]] [== 12 [get $_tsp 1]]]
+    gate "rule annotations carry provenance meta" \
+        [>= [String::find [Lk::annot_meta $_astore [get $_t1 0] q] \
+            "matches"] 0]
+    gate "rule layers style for projection" \
+        [> [len [Dict::keys [weft::q::style-of "todo"]]] 0]
+    gate "the rule settles until something changes" \
+        [== 0 [weft::producer::tick! $_ab]]
+
+    ;; Drop/rebuild tracks edits: a prefix insertion shifts matches.
+    Lk::doc_insert [weft::ws::buffer-doc $_ab] 0 "zero "
+    weft::producer::tick! $_ab
+
+    let _t2 [Lk::annot_by_layer $_astore "todo"]
+    let _tsp2 [Lk::annot_span $_astore [get $_t2 0]]
+    gate "edits rebuild the layer at new offsets" \
+        [and [== 2 [len $_t2]] [== 11 [get $_tsp2 0]]]
+
+    ;; Replacing the rule on the same layer rescans WITHOUT an edit
+    ;; (generation token, P4 stage A machinery).
+    weft::q::annotate [weft::q::matches [weft::q::doc $_ab] \
+        {TODO-2[0-9]}] "todo"
+    gate "rule replacement re-annotates live" \
+        [and [> [weft::producer::tick! $_ab] 0] \
+             [== 1 [len [Lk::annot_by_layer $_astore "todo"]]]]
+
+    ;; The layer is producer-owned now: persistence classifies it
+    ;; derived.  Only the authored layer survives a save.
+    Lk::annot_layer_register $_astore "mynotes"
+    Lk::annot_add $_astore 0 4 "mynotes" #{}
+    gate "rule layers never persist (derived by ownership)" \
+        [== 1 [weft::persist::annots-save! $_ab]]
+
+    ;; Claiming another producer's layer is refused.
+    var _cl_rc 0
+    var _cl_r ""
+    var _cl_e ""
+    set! _cl_rc [catch { weft::q::annotate $_rule "search" } _cl_r _cl_e]
+    gate "annotate refuses producer-owned layers" [not [== 0 $_cl_rc]]
+
+    weft::q::unannotate "todo"
+    gate "unannotate clears and retires the layer" \
+        [== 0 [len [Lk::annot_by_layer $_astore "todo"]]]
+} else {
+    puts "deferred: annotation-sink gates (host built without regex)"
+}
+
+;; ---- stage Q3: the edit sink ----
+
+if $weft_have_regex {
+    let _qdoc [weft::ws::buffer-doc $_qb]
+    let _orig [Lk::doc_text $_qdoc]
+
+    ;; NB braced pattern; the replacement derives from a capture.
+    let _rp [weft::q::replace \
+        [weft::q::matches [weft::q::doc $_qb] {TODO-([0-9]+)}] \
+        [lambda {r} { return "DONE-[weft::q::cap-text $r 1]" }]]
+
+    gate "replace pends a transform plan" \
+        [and [== plan [get $_rp kind]] [weft::transform::pending?]]
+
+    let _plan [weft::transform::pending-plan]
+    gate "the plan carries the query as provenance" \
+        [>= [String::find [get $_plan transform] "matches"] 0]
+    gate "the plan is revision-stamped from the snapshot" \
+        [== [get $_plan base_rev] [Lk::doc_revision $_qdoc]]
+    gate "edits sit on record ranges" \
+        [and [== 3 [len [get $_plan edits]]] \
+             [== 6 [get [get [get $_plan edits] 0] start]]]
+    gate "pending a plan never mutates the document" \
+        [== $_orig [Lk::doc_text $_qdoc]]
+
+    ;; Apply: the shipped transform machinery, one transaction.
+    weft::transform::apply
+    gate "apply rewrites every match through its capture" \
+        [and [>= [String::find [Lk::doc_text $_qdoc] "DONE-22"] 0] \
+             [< [String::find [Lk::doc_text $_qdoc] "TODO-"] 0]]
+
+    Lk::history_undo [weft::ws::buffer-hist $_qb] $_qdoc
+    gate "the whole plan is one undo step" \
+        [== $_orig [Lk::doc_text $_qdoc]]
+
+    ;; Typed numbers (lcl c6b44be): a replacement fn that COMPUTES its
+    ;; result hands back an int; edit text is rendered at the seam so
+    ;; diff and apply see text.
+    let _rn [weft::q::replace \
+        [weft::q::matches [weft::q::doc $_qb] {TODO-([0-9]+)}] \
+        [lambda {r} { return [+ 1 [int [weft::q::cap-text $r 1]]] }]]
+    gate "a numeric-valued replacement fn pends text edits" \
+        [and [== plan [get $_rn kind]] \
+             [string? [get [get [get [weft::transform::pending-plan] edits] 0] text]]]
+    gate "its diff renders" \
+        [>= [String::find [weft::transform::diff-text] "+ 23"] 0]
+    weft::transform::apply
+    gate "and applies" \
+        [and [>= [String::find [Lk::doc_text $_qdoc] "23"] 0] \
+             [< [String::find [Lk::doc_text $_qdoc] "TODO-"] 0]]
+    Lk::history_undo [weft::ws::buffer-hist $_qb] $_qdoc
+
+    ;; ... and a numeric map value previews as a rendered row.
+    let _npv [weft::q::preview [weft::q::map [weft::q::lines [weft::q::doc $_qb]] \
+        [lambda {r} { return [String::length [get $r text]] }]] 1]
+    gate "numeric map values preview as text" \
+        [>= [String::find $_npv "1 of"] 0]
+
+    ;; Staleness refusal: the document moves under a pending plan.
+    weft::q::replace [weft::q::matches [weft::q::doc $_qb] {TODO-([0-9]+)}] \
+        [lambda {r} { return "X" }]
+    Lk::doc_insert $_qdoc 0 "moved "
+
+    let _stale [weft::transform::apply]
+    gate "a stale plan refuses to apply" \
+        [and [weft::error::error? $_stale] \
+             [== cancelled [weft::error::code $_stale]]]
+
+    ;; Identity replacement collapses to no_change.
+    let _noop [weft::q::replace \
+        [weft::q::matches [weft::q::doc $_qb] {TODO-([0-9]+)}] \
+        [lambda {r} { return [get $r text] }]]
+    gate "identity replacements pend nothing" \
+        [and [== no_change [get $_noop kind]] \
+             [not [weft::transform::pending?]]]
+
+    ;; Overlapping records (annotations can overlap) refuse cleanly.
+    Lk::annot_layer_register [weft::ws::buffer-store $_qb] "olap"
+    Lk::annot_add [weft::ws::buffer-store $_qb] 2 10 "olap" #{}
+    Lk::annot_add [weft::ws::buffer-store $_qb] 5 14 "olap" #{}
+
+    let _olap [weft::q::replace [weft::q::annots $_qb "olap"] \
+        [lambda {r} { return "z" }]]
+    gate "overlapping edits refuse with a structured error" \
+        [== error [get $_olap kind]]
+
+    ;; A throwing fn surfaces as a tagged error, not a crash.
+    let _boom [weft::q::replace \
+        [weft::q::matches [weft::q::doc $_qb] {TODO-([0-9]+)}] \
+        [lambda {r} { error "boom" }]]
+    gate "a throwing replacement fn is a tagged error" \
+        [== error [get $_boom kind]]
+} else {
+    puts "deferred: edit-sink gates (host built without regex)"
+}
+
+;; ---- stage Q4: read-only policy + projections ----
+
+;; The policy travels workspace -> hooks -> every view, present and
+;; future.
+let _rb [weft::ws::buffer-create! "ro-probe" "" "text"]
+let _rv [weft::ws::view-create! $_rb]
+gate "buffers default editable" [weft::ws::buffer-editable? $_rb]
+
+weft::ws::buffer-set-editable! $_rb 0
+gate "the policy reaches live views" \
+    [== 0 [weft::testhost::editor-editable [weft::ws::view-editor $_rv]]]
+
+let _rv2 [weft::ws::view-create! $_rb]
+gate "new views inherit the policy" \
+    [== 0 [weft::testhost::editor-editable [weft::ws::view-editor $_rv2]]]
+
+if $weft_have_regex {
+    let _sb [weft::ws::buffer-create! "showsrc" "" "one TODO-1\ntwo TODO-22\n"]
+    let _sq [weft::q::matches [weft::q::doc $_sb] {TODO-[0-9]+}]
+
+    weft::testhost::presented-reset!
+
+    let _shown [weft::q::show $_sq 10]
+    gate "show returns a surfaceable result" [== show [get $_shown kind]]
+
+    let _qbuf [get $_shown buffer]
+    gate "the projection is *query*, read-only by policy" \
+        [and [== "*query*" [get [weft::ws::buffer $_qbuf] name]] \
+             [not [weft::ws::buffer-editable? $_qbuf]]]
+
+    let _qtext [Lk::doc_text [weft::ws::buffer-doc $_qbuf]]
+    gate "the header carries the query and the counts" \
+        [and [>= [String::find $_qtext "matches TODO"] 0] \
+             [>= [String::find $_qtext "2 of 2"] 0]]
+    gate "rows carry provenance ranges" \
+        [>= [String::find $_qtext "\[4, 10) match: TODO-1"] 0]
+
+    gate "rows carry jump presentations to the source" \
+        [and [== 2 [len [Lk::annot_by_layer \
+                [weft::ws::buffer-store $_qbuf] "qjump"]]] \
+             [== $_sb [get [get [get [weft::testhost::presented] 0] \
+                value] buffer]]]
+
+    ;; Re-running a show REPLACES the projection -- same buffer, new
+    ;; rows, no leftover jump links.
+    weft::q::show [weft::q::take $_sq 1] 10
+    gate "re-running a show replaces the projection" \
+        [and [== $_qbuf [weft::ws::buffer-for-name "*query*"]] \
+             [and [>= [String::find [Lk::doc_text \
+                    [weft::ws::buffer-doc $_qbuf]] "1 of 1"] 0] \
+                  [== 1 [len [Lk::annot_by_layer \
+                    [weft::ws::buffer-store $_qbuf] "qjump"]]]]]
+
+    ;; A jump surfaces the source in the acting pane at the range.
+    ;; (This suite never built a pane tree until now.)
+    let _jpane [weft::ws::tree-init! [weft::ws::view-create! $_qbuf]]
+
+    weft::q::jump! #{buffer $_sb start 4 end 10} \
+        [weft::ctx::make #{pane $_jpane}]
+    gate "a jump shows the source at the record" \
+        [and [== $_sb [weft::ws::view-buffer [weft::ws::pane-view $_jpane]]] \
+             [== 4 [get [weft::ws::view-snapshot \
+                [weft::ws::pane-view $_jpane]] cursor]]]
+
+    gate "a jump to a vanished buffer is a structured error" \
+        [weft::error::error? [weft::q::jump! \
+            #{buffer buf-nope start 0 end 1} \
+            [weft::ctx::make #{pane $_jpane}]]]
+
+    ;; materialize: independent, editable, fresh every time.
+    let _m1 [weft::q::materialize $_sq]
+    let _m2 [weft::q::materialize $_sq]
+    gate "materialize snapshots the record texts" \
+        [== "TODO-1\nTODO-22\n" [Lk::doc_text \
+            [weft::ws::buffer-doc [get $_m1 buffer]]]]
+    gate "materialized snapshots are editable and independent" \
+        [and [weft::ws::buffer-editable? [get $_m1 buffer]] \
+             [not [== [get $_m1 buffer] [get $_m2 buffer]]]]
+} else {
+    puts "deferred: projection gates (host built without regex)"
+}
+
+;; ---- stage Q5: convergence ----
+;; The scan engines converge on the algebra where that deletes code:
+;; plumb's scanner and search's Lcl fallback are gone (plumb rides
+;; [matches] with its precompiled rule regex -- p2's plumb gates
+;; cover the behavior end to end); specialized engines stay
+;; specialized and appear as SOURCES.
+
+if $weft_have_regex {
+    ;; matches accepts a precompiled handle (plumb's compile-once
+    ;; contract flows straight through).
+    let _cre [Regex::compile {T(ODO)-[0-9]+}]
+    let _cq [weft::q::matches [weft::q::doc $_qb] $_cre]
+
+    gate "matches accepts a precompiled regex" \
+        [== 3 [weft::q::count $_cq]]
+    gate "compiled-handle captures still carry ranges" \
+        [== "ODO" [weft::q::cap-text \
+            [get [get [weft::q::_records $_cq 1] records] 0] 1]]
+    gate "compiled patterns describe opaquely" \
+        [>= [String::find [weft::q::describe $_cq] "<compiled>"] 0]
+
+    ;; The search layer is a range source like any other.
+    weft::producer::attach! $_qb search
+    weft::search::query! $_qb "TODO"
+    weft::producer::tick! $_qb
+    gate "search results appear as a range source" \
+        [== 3 [weft::q::count [weft::q::annots $_qb "search"]]]
+}
+
+if $weft_have_ts {
+    ;; Tree-sitter is a range source through the annots convergence:
+    ;; the ts layer's records carry capture metadata, so syntax is
+    ;; queryable with zero dedicated plumbing.
+    ;; NB braced text: $a must not interpolate.
+    let _tsb [weft::ws::buffer-create! "conv.lcl" "conv.lcl" \
+        {proc foo {a} {return $a}
+;; note
+}]
+
+    weft::producer::attach! $_tsb ts
+    weft::producer::tick! $_tsb
+
+    let _tsq [weft::q::annots $_tsb "ts"]
+    gate "tree-sitter appears as a range source" \
+        [> [weft::q::count $_tsq] 3]
+
+    let _kw [weft::q::select $_tsq [lambda {r} {
+        return [== keyword [get [get $r meta] capture]]
+    }]]
+    let _kwr [get [weft::q::_records $_kw 5] records]
+    gate "syntax records select by capture" \
+        [and [> [len $_kwr] 0] \
+             [and [== 0 [get [get $_kwr 0] start]] \
+                  [== "proc" [get [get $_kwr 0] text]]]]
+} else {
+    puts "deferred: ts-source gates (host built without WEFT_LCL_TS)"
+}
+
+puts ""
+puts "P4-E STAGE Q1+Q2+Q3+Q4+Q5 GATES PASSED"

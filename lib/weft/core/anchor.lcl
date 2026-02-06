@@ -1,0 +1,197 @@
+;;; weft::anchor -- context anchors: positions that survive the
+;;; document changing underneath them (plan section 8, P5).
+;;;
+;;; A persisted position is never just a byte offset: the file may be
+;;; edited by other tools between sessions.  capture records the
+;;; position plus up to 32 bytes of surrounding text; resolve finds
+;;; that context in the CURRENT text and reports how sure it is:
+;;;
+;;;   #{pos N status ok|fuzzy|orphaned confidence 0-100}
+;;;
+;;; Resolution ladder (first hit wins; among multiple occurrences the
+;;; one closest to the recorded position is chosen):
+;;;   before+after adjacent  -> ok      (100 unique / 85 ambiguous)
+;;;   half-contexts adjacent -> fuzzy 65
+;;;   before alone           -> fuzzy 55
+;;;   after alone            -> fuzzy 45
+;;;   nothing                -> orphaned 0
+;;;
+;;; The ladder is the legacy C-weft shape (32-byte windows, 0-100
+;;; confidence) rebuilt in Lcl -- plan section 8 says lift to C only on
+;;; measured need; this runs once per buffer open.
+namespace weft::anchor {
+
+    ;;; Context window size in bytes, each side.
+    var window 32
+
+    proc _clamp {v lo hi} {
+        if [< $v $lo] { return $lo }
+        if [> $v $hi] { return $hi }
+
+        return $v
+    }
+
+    ;;; Record position `pos` in `text` with up to `window` bytes of
+    ;;; surrounding context.
+    ;;;
+    ;;; Returns #{approx P before B after A}.  The offset alone is
+    ;;; never trusted at resolve time; the context windows are what
+    ;;; re-anchor it.  An out-of-range `pos` is clamped.
+    ;;;
+    ;;; Examples:
+    ;;; >> let a [weft::anchor::capture "alpha beta gamma" 6]
+    ;;; >> get $a before
+    ;;; "alpha "
+    ;;; >> get $a after
+    ;;; "beta gamma"
+    proc capture {text pos} {
+        let n [String::length $text]
+        let p [weft::anchor::_clamp $pos 0 $n]
+
+        var b0 [- $p $window]
+
+        if [< $b0 0] { set! b0 0 }
+
+        var a1 [+ $p $window]
+
+        if [> $a1 $n] { set! a1 $n }
+
+        return #{approx $p
+            before [String::range $text $b0 $p]
+            after [String::range $text $p $a1]}
+    }
+
+    ;; All occurrence start offsets of a literal needle (non-empty).
+    ;; Shrinking-tail scan like weft::search::matches -- load-time
+    ;; only; a from-offset String::find retires this (lcl #76).
+    proc _occurrences {text needle} {
+        var out ()
+        var base 0
+        var rest $text
+        let nl [String::length $needle]
+        var going 1
+
+        while $going {
+            let hit [String::find $rest $needle]
+
+            if [< $hit 0] {
+                set! going 0
+            } else {
+                set! out [List::push $out [+ $base $hit]]
+
+                let cut [+ $hit 1]
+                set! base [+ $base $cut]
+                set! rest [String::range $rest $cut
+                    [String::length $rest]]
+            }
+        }
+
+        return $out
+    }
+
+    ;; The occurrence closest to `want`, or -1.
+    proc _closest {occs want} {
+        var best -1
+        var bestd -1
+
+        foreach o $occs {
+            var d [- $o $want]
+
+            if [< $d 0] { set! d [- 0 $d] }
+
+            if [or [< $bestd 0] [< $d $bestd]] {
+                set! best $o
+                set! bestd $d
+            }
+        }
+
+        return $best
+    }
+
+    ;; Try needle; on a hit return #{pos <occ+off> status .. confidence
+    ;; ..} where `unique_conf` applies to a single occurrence and 85%
+    ;; of it to an ambiguous one.  Returns #{} on no hit or empty
+    ;; needle.
+    proc _try {text needle off want status conf} {
+        if [empty? $needle] { return #{} }
+
+        let occs [weft::anchor::_occurrences $text $needle]
+
+        if [== 0 [len $occs]] { return #{} }
+
+        var c $conf
+
+        if [> [len $occs] 1] {
+            set! c [/ [* $c 85] 100]
+        }
+
+        return #{pos [+ [weft::anchor::_closest $occs $want] $off]
+            status $status confidence $c}
+    }
+
+    ;;; Find a captured anchor in the CURRENT text.
+    ;;;
+    ;;; Returns #{pos N status S confidence C}: `ok` when the full
+    ;;; context matches adjacently, `fuzzy` on partial context,
+    ;;; `orphaned` when nothing matches -- the ladder above gives the
+    ;;; confidence for each rung.
+    ;;;
+    ;;; Examples:
+    ;;; >> let t "alpha beta gamma"
+    ;;; >> let a [weft::anchor::capture $t 6]
+    ;;; >> get [weft::anchor::resolve $t $a] status
+    ;;; "ok"
+    ;;; >>
+    ;;; >> get [weft::anchor::resolve "NEW alpha beta gamma" $a] pos
+    ;;; 10
+    ;;; >>
+    ;;; >> get [weft::anchor::resolve "totally unrelated text" $a] status
+    ;;; "orphaned"
+    proc resolve {text anchor} {
+        let n [String::length $text]
+        let approx [get $anchor approx]
+        let before [get $anchor before]
+        let after [get $anchor after]
+        let bl [String::length $before]
+
+        ;; No context at all (captured in an empty document): the
+        ;; clamped offset is the best available guess.
+        if [and [empty? $before] [empty? $after]] {
+            return #{pos [weft::anchor::_clamp $approx 0 $n]
+                status fuzzy confidence 40}
+        }
+
+        ;; The needle's expected start is the position minus the
+        ;; before-window.
+        let want [- $approx $bl]
+
+        var r [weft::anchor::_try $text "$before$after" $bl $want ok 100]
+
+        if [not [empty? $r]] { return $r }
+
+        ;; Half windows on each side, if both are long enough to mean
+        ;; anything.
+        let ah [String::length $after]
+
+        if [and [>= $bl 8] [>= $ah 8]] {
+            let bh [/ $bl 2]
+            let half "[String::range $before $bh $bl][String::range $after 0 [/ $ah 2]]"
+
+            set! r [weft::anchor::_try $text $half [- $bl $bh]
+                [+ $want $bh] fuzzy 65]
+
+            if [not [empty? $r]] { return $r }
+        }
+
+        set! r [weft::anchor::_try $text $before $bl $want fuzzy 55]
+
+        if [not [empty? $r]] { return $r }
+
+        set! r [weft::anchor::_try $text $after 0 $approx fuzzy 45]
+
+        if [not [empty? $r]] { return $r }
+
+        return #{pos [weft::anchor::_clamp $approx 0 $n]
+            status orphaned confidence 0}
+    }
+}

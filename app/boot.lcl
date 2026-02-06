@@ -1,0 +1,125 @@
+;;; boot.lcl -- weft's bootstrap sequence (plan section 3).
+;;;
+;;; The host binary has already: registered lcl core + the package
+;;; matrix + Lk::, published the weft_* host facts as globals, and
+;;; loaded the lk DSL prelude.  This file sequences the rest and
+;;; nothing else:
+;;;
+;;;   core modules -> host capability bindings -> registries/defaults
+;;;   -> system config -> user config -> workspace -> run
+;;;
+;;; Bare module paths resolve against the require roots the host
+;;; registered (the weft lib dir) -- launch-CWD-proof by contract.
+
+require "weft/core/error.lcl"
+
+;; lcl's Doc library -- docstrings on live symbols (weft::describe,
+;; weft::apropos).  It lives in lcl's lib/, a second require root
+;; the host registers; a host without it degrades those two commands
+;; to `unsupported` rather than failing boot.
+var weft_have_doc 0
+var _doc_r ""
+var _doc_e ""
+if [== 0 [catch { require "doc/src/Doc.lcl" } _doc_r _doc_e]] {
+    set! weft_have_doc 1
+}
+require "weft/core/task.lcl"
+require "weft/core/tasks.lcl"
+require "weft/core/cap.lcl"
+require "weft/core/keymap.lcl"
+require "weft/core/config.lcl"
+require "weft/core/envelope.lcl"
+require "weft/core/wire.lcl"
+require "weft/core/anchor.lcl"
+require "weft/core/persist.lcl"
+require "weft/core/session.lcl"
+require "weft/core/ctx.lcl"
+require "weft/core/workspace.lcl"
+require "weft/core/image.lcl"
+require "weft/core/transform.lcl"
+require "weft/core/cmd.lcl"
+require "weft/core/sink.lcl"
+require "weft/core/recog.lcl"
+require "weft/core/exec.lcl"
+require "weft/core/filter.lcl"
+require "weft/core/api.lcl"
+require "weft/core/repl.lcl"
+require "weft/core/annot-edit.lcl"
+require "weft/core/inspect.lcl"
+require "weft/core/producer.lcl"
+require "weft/core/plumb.lcl"
+require "weft/core/search.lcl"
+require "weft/core/ts.lcl"
+require "weft/core/query.lcl"
+
+;; The shell's intents (what a chord can fire) are pure data, loaded
+;; here so a headless image resolves the keybinding profile exactly
+;; as the windowed one does (weft::keys, test/keys-gates.lcl).
+require "weft/ui/intents.lcl"
+weft::shell::intents!
+
+;; Terse alias: q::lines etc.  Import shares cells, so var state
+;; tracks -- but re-`proc`ing a weft::q operator from the REPL leaves
+;; the alias on the OLD definition (plan section 14 wrinkle; the lcl
+;; redefinition-writes-through-cell decision is Brennan's).  Until
+;; then: after live-patching weft::q, re-point the alias's changed
+;; name: `Ns::set $q <name> ${weft::q::<name>}` (from the REPL, an
+;; unqualified `namespace q {}` would declare user::q -- lcl nests
+;; unqualified builders compositionally).
+namespace q {
+    import weft::q
+}
+
+;; Plumbing needs the regex package; a host without it simply has no
+;; plumb producer (LOOK degrades to word-search).
+if $weft_have_regex {
+    weft::producer::define! [weft::plumb::producer-def]
+    weft::plumb::default-rules!
+}
+
+;; Search highlighting matches literal bytes -- no capability needed.
+weft::producer::define! [weft::search::producer-def]
+
+;; Syntax highlighting needs the host's ts package (embedded
+;; grammars); without it filetypes simply have no language.
+if $weft_have_ts {
+    weft::producer::define! [weft::ts::producer-def]
+}
+
+;; Host capability bindings for this host kind (posix today; web and
+;; test hosts register different bindings against the same registry).
+load "$weft_lib_dir/weft/host/$weft_host_kind.lcl"
+
+;; ---- System defaults, then user config (full vocabulary is loaded,
+;; so config may use any weft:: API) ----
+weft::keymap::source! native
+load "$weft_config_dir/default.lcl"
+
+;; A broken or incompatible user config must never prevent startup:
+;; warn and continue.  (Legacy C-weft init.lcl files use a retired API;
+;; they land here until a migration story exists.)
+let _user_cfg_t [weft::cap::invoke "fs.exists?" #{path $weft_user_config} #{}]
+if [== [weft::task::state $_user_cfg_t] succeeded] {
+    if [weft::task::result $_user_cfg_t] {
+        var _cfg_r ""
+        var _cfg_e ""
+        weft::keymap::source! user
+        if [not [== 0 [catch { load $weft_user_config } _cfg_r _cfg_e]]] {
+            puts "weft: warning: user config $weft_user_config failed: $_cfg_e"
+        }
+    }
+}
+
+;; Anything bound from here on (REPL, *scratch*, a gate script) is
+;; live: it shadows the config files and the listing says so.
+weft::keymap::source! live
+
+;; ---- Run ----
+if $weft_headless {
+    if [not [empty? $weft_script]] {
+        load $weft_script
+    }
+} else {
+    load "$weft_lib_dir/weft/ui/shell.lcl"
+    wsh_run $weft_files
+}

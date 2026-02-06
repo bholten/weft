@@ -1,0 +1,207 @@
+;;; weft::producer -- revision-driven derived state (plan section 7).
+;;;
+;;; A producer definition is data plus an update closure:
+;;;
+;;;   #{name plumb layers (plumb) update <fn ctx -> "">
+;;;     start <fn ctx> stop <fn ctx>           ;; optional
+;;;     generation <fn -> token>}              ;; optional (P4)
+;;;
+;;; Producers attach per buffer.  tick! runs update only when the
+;;; buffer's document revision OR the producer's own generation token
+;;; has changed since the last run (both compare for change, never
+;;; order).  Generation is how non-document inputs -- plumb rules, a
+;;; search query -- re-render live without waiting for an edit: the
+;;; producer bumps a counter when its configuration changes and reports
+;;; it through the generation closure.  update receives an explicit
+;;; ctx: #{buffer <id> doc <h> store <h> revision <tok>}.
+;;;
+;;; Producer errors are inspectable application state, never a crashed
+;;; frame: a raising update parks the producer in status
+;;; #{state error error <weft-error>}; the next revision change retries.
+
+namespace weft::producer {
+
+    var defs #{}
+    var attached #{}   ;; buffer-id -> (name -> #{scan_rev <tok> status #{}})
+
+    proc define! {def} {
+        ;; `layers` must be a real list: lcl no longer reparses text
+        ;; as a list, so a Tcl-style `layers {mine}` would otherwise
+        ;; register one layer per CHARACTER.  Refuse it structurally.
+        if [not [and [dict? $def] [has? $def name] [has? $def layers]]] {
+            return [weft::error::make invalid-args \
+                "producer::define!: expected #{name .. layers (..) update ..}"]
+        }
+
+        if [not [list? [get $def layers]]] {
+            return [weft::error::make invalid-args \
+                "producer::define! '[get $def name]': layers must be a list -- (a b), not {a b}"]
+        }
+
+        set! defs [put $defs [get $def name] $def]
+
+        return [get $def name]
+    }
+
+    proc names {} {
+        return [List::sort [Dict::keys $defs]]
+    }
+
+    ;; Every layer any defined producer owns -- the DERIVED layers.
+    ;; Persistence uses this as the schema classification (plan
+    ;; section 8): derived state is rebuilt by its producer, so only
+    ;; layers outside this set are authored and persist.
+    proc owned-layers {} {
+        var out #{}
+
+        foreach name [Dict::keys $defs] {
+            foreach layer [get [get $defs $name] layers] {
+                set! out [put $out $layer 1]
+            }
+        }
+
+        return $out
+    }
+
+    proc describe {name} {
+        if [not [has? $defs $name]] { return #{} }
+
+        return [get $defs $name]
+    }
+
+    proc _ctx {buffer_id} {
+        return #{buffer $buffer_id
+            doc [weft::ws::buffer-doc $buffer_id]
+            store [weft::ws::buffer-store $buffer_id]
+            revision [Lk::doc_revision [weft::ws::buffer-doc $buffer_id]]}
+    }
+
+    proc attached? {buffer_id name} {
+        if [not [has? $attached $buffer_id]] { return 0 }
+
+        return [has? [get $attached $buffer_id] $name]
+    }
+
+    ;; Attach (idempotent): register the producer's layers on the
+    ;; buffer's store, run start, prime for a first-tick scan.
+    proc attach! {buffer_id name} {
+        if [weft::producer::attached? $buffer_id $name] { return 0 }
+
+        let def [get $defs $name]
+
+        foreach layer [get $def layers] {
+            Lk::annot_layer_register [weft::ws::buffer-store $buffer_id] \
+                $layer
+        }
+
+        if [has? $def start] {
+            apply [get $def start] [weft::producer::_ctx $buffer_id]
+        }
+
+        var per #{}
+
+        if [has? $attached $buffer_id] {
+            set! per [get $attached $buffer_id]
+        }
+
+        set! per [put $per $name
+            #{scan_rev "" scan_gen "" status #{state ok}}]
+        set! attached [put $attached $buffer_id $per]
+
+        return 1
+    }
+
+    ;; The producer's current generation token ("" when it has none).
+    proc _gen {def} {
+        if [has? $def generation] {
+            return [apply [get $def generation]]
+        }
+
+        return ""
+    }
+
+    ;; Buffer teardown: every attached producer stops and releases
+    ;; (workspace buffer-close! calls this, like tasks cancel).
+    proc detach-all! {buffer_id} {
+        if [not [has? $attached $buffer_id]] { return 0 }
+
+        var n 0
+
+        foreach name [Dict::keys [get $attached $buffer_id]] {
+            weft::producer::detach! $buffer_id $name
+            set! n [+ $n 1]
+        }
+
+        return $n
+    }
+
+    proc detach! {buffer_id name} {
+        if [not [weft::producer::attached? $buffer_id $name]] { return 0 }
+
+        let def [get $defs $name]
+
+        if [has? $def stop] {
+            apply [get $def stop] [weft::producer::_ctx $buffer_id]
+        }
+
+        let store [weft::ws::buffer-store $buffer_id]
+
+        foreach layer [get $def layers] {
+            foreach id [Lk::annot_by_layer $store $layer] {
+                Lk::annot_remove $store $id
+            }
+        }
+
+        set! attached [put $attached $buffer_id
+            [del [get $attached $buffer_id] $name]]
+
+        return 1
+    }
+
+    proc status {buffer_id name} {
+        if [not [weft::producer::attached? $buffer_id $name]] { return #{} }
+
+        return [get [get [get $attached $buffer_id] $name] status]
+    }
+
+    proc _record! {buffer_id name rev gen st} {
+        set! attached [put $attached $buffer_id
+            [put [get $attached $buffer_id] $name
+                #{scan_rev $rev scan_gen $gen status $st}]]
+        return ""
+    }
+
+    ;; Run every producer attached to the buffer whose document
+    ;; revision or generation has changed since its last scan.
+    proc tick! {buffer_id} {
+        if [not [has? $attached $buffer_id]] { return 0 }
+
+        var n 0
+
+        foreach name [Dict::keys [get $attached $buffer_id]] {
+            let per [get [get $attached $buffer_id] $name]
+            let ctx [weft::producer::_ctx $buffer_id]
+            let rev [get $ctx revision]
+            let gen [weft::producer::_gen [get $defs $name]]
+
+            if [or [not [== $rev [get $per scan_rev]]]
+                   [not [== $gen [get $per scan_gen]]]] {
+                var r ""
+                var e ""
+                       
+                if [== 0 [catch { \
+                        apply [get [get $defs $name] update] $ctx } r e]] {
+                    weft::producer::_record! $buffer_id $name $rev $gen \
+                        #{state ok}
+                } else {
+                    weft::producer::_record! $buffer_id $name $rev $gen \
+                        #{state error error [weft::error::from-caught $e]}
+                }
+
+                set! n [+ $n 1]
+            }
+        }
+
+        return $n
+    }
+}

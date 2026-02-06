@@ -1,0 +1,132 @@
+;;; weft::session -- the workspace shape at rest (plan section 11,
+;;; P5-D).
+;;;
+;;; A session is the split tree as data: splits carry axis + ratio
+;;; (workspace-owned, section 6), panes carry what they showed --
+;;; a path for file buffers, a bare name for scratch ones -- plus the
+;;; view's editor snapshot and the focus flag:
+;;;
+;;;   #{tree #{kind "split" axis h ratio 0.62
+;;;            a #{kind "pane" path "/x.c" view #{cursor 120}
+;;;               focused 1}
+;;;            b #{kind "pane" name "*scratch*" view #{cursor 0}}}}
+;;;
+;;; Buffer CONTENT never persists here: file panes reopen their path
+;;; (annotations re-attach through the P5-B flow), scratch panes come
+;;; back empty under the same name.  Restore realizes the tree into a
+;;; fresh single-pane workspace by splitting outward from the root --
+;;; the same commands a user would run, so ids stay runtime-only and
+;;; nothing in the file references them.
+
+namespace weft::session {
+
+    proc _path {} {
+        return "[weft::persist::data-dir]/session"
+    }
+
+    proc _node-snapshot {node_id} {
+        let n [weft::ws::node $node_id]
+
+        if [== [get $n kind] split] {
+            return #{kind "split" axis [get $n axis] ratio [get $n ratio]
+                a [weft::session::_node-snapshot [get $n a]]
+                b [weft::session::_node-snapshot [get $n b]]}
+        }
+
+        let vid [get $n view]
+        let b [weft::ws::buffer [weft::ws::view-buffer $vid]]
+        var focused 0
+
+        if [== $node_id [weft::ws::focused-pane]] {
+            set! focused 1
+        }
+
+        return #{kind "pane" path [get $b path] name [get $b name]
+            view [weft::ws::view-snapshot $vid] focused $focused}
+    }
+
+    proc snapshot {} {
+        return #{tree [weft::session::_node-snapshot [weft::ws::tree-root]]}
+    }
+
+    proc save! {} {
+        return [weft::persist::write-value! [weft::session::_path]
+            session [weft::session::snapshot]]
+    }
+
+    ;; The buffer a restored pane should show.  Missing files come
+    ;; back as empty buffers bound to their path (buffer-open!'s
+    ;; contract); unreadable ones degrade to a scratch buffer under
+    ;; the recorded name -- restore never fails a pane.
+    proc _ensure-buffer {pn ctx} {
+        let path [get $pn path]
+
+        if [not [empty? $path]] {
+            let b [weft::ws::buffer-open! $path $ctx]
+
+            if [not [weft::error::error? $b]] { return $b }
+        }
+
+        let name [get $pn name]
+        let existing [weft::ws::buffer-for-name $name]
+
+        if [not [empty? $existing]] { return $existing }
+
+        return [weft::ws::buffer-create! $name "" ""]
+    }
+
+    ;; Realize `node` into the existing pane `pane_id`.  Returns the
+    ;; pane id that should end up focused ("" when none here).
+    proc _build! {node pane_id ctx} {
+        if [== [get $node kind] "split"] {
+            ;; Split first (the placeholder view shows the pane's
+            ;; current buffer), then fill both sides.
+            let cur [weft::ws::view-buffer [weft::ws::pane-view $pane_id]]
+            let newp [weft::ws::pane-split! $pane_id [get $node axis] $cur]
+            let split [get [weft::ws::node $newp] parent]
+
+            weft::ws::split-ratio-set! $split [get $node ratio]
+
+            let fa [weft::session::_build! [get $node a] $pane_id $ctx]
+            let fb [weft::session::_build! [get $node b] $newp $ctx]
+
+            if [not [empty? $fa]] { return $fa }
+
+            return $fb
+        }
+
+        let bid [weft::session::_ensure-buffer $node $ctx]
+
+        weft::ws::pane-show-buffer! $pane_id $bid
+        weft::ws::view-restore! [weft::ws::pane-view $pane_id] \
+            [get $node view]
+
+        if [get $node focused] { return $pane_id }
+
+        return ""
+    }
+
+    ;; Restore the saved session into a FRESH workspace (root must be
+    ;; a single pane -- the boot shape).  Returns 1, 0 when there is
+    ;; nothing to restore, or a structured error.
+    proc restore! {ctx} {
+        let v [weft::persist::read-value [weft::session::_path] session]
+
+        if [weft::error::error? $v] { return 0 }
+
+        let root [weft::ws::tree-root]
+
+        if [not [== [get [weft::ws::node $root] kind] pane]] {
+            return [weft::error::make invalid-args
+                "session restore needs a fresh single-pane workspace"]
+        }
+
+        let f [weft::session::_build! [get $v tree] $root $ctx]
+
+        if [not [empty? $f]] {
+            weft::ws::focus! $f
+        }
+
+        return 1
+    }
+}

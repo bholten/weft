@@ -1,0 +1,981 @@
+;; Command-pipeline acceptance gates, stage A: structured resolution.
+;;   weft --headless test/cmd-gates.lcl
+;; The test host fakes fs/id editor-side; process/fs.file?/env.get
+;; capabilities are the REAL posix ones -- resolution walks the real
+;; PATH and spawn gates run real processes (echo, pwd, /bin/sh).
+
+proc gate {name ok} {
+    if [not $ok] { error "GATE FAILED: $name" }
+    puts "ok: $name"
+}
+
+require "weft/host/test.lcl"
+
+weft::ws::init! [weft::testhost::editor-hooks]
+
+let _b [weft::ws::buffer-create! "cmd-fixture" "" "text\n"]
+let _ctx [weft::ctx::make #{buffer $_b ns user}]
+
+proc drain-tasks {} {
+    var i 0
+    while [and [> [+ [weft::tasks::poll-all!] [weft::shell::seq-tick!]] 0] \
+            [< $i 200000]] {
+        set! i [+ $i 1]
+    }
+    return $i
+}
+
+;; ---- resolution routes: resolution chooses the language ----
+
+gate "::-qualified head routes lcl" \
+    [== lcl [get [weft::cmd::resolve {weft::version} $_ctx] route]]
+
+gate "lcl-callable head routes lcl" \
+    [== lcl [get [weft::cmd::resolve {puts hi} $_ctx] route]]
+
+gate "thread-first head routes lcl" \
+    [== lcl [get [weft::cmd::resolve {-> [q::doc] {q::count}} $_ctx] route]]
+
+gate "dynamic head routes lcl" \
+    [== lcl [get [weft::cmd::resolve {$cmd foo} $_ctx] route]]
+
+gate "namespace form routes lcl" \
+    [== lcl [get [weft::cmd::resolve "namespace x \{ \}" $_ctx] route]]
+
+gate "external head routes argv" \
+    [== argv [get [weft::cmd::resolve {echo hi} $_ctx] route]]
+
+let _pe [weft::cmd::resolve {echo hi} $_ctx]
+gate "argv plan resolves the executable" \
+    [>= [String::find [get $_pe exe] {echo}] 0]
+gate "argv plan carries literal argv" \
+    [== [get [get $_pe argv] 1] {hi}]
+gate "argv plan carries the buffer cwd" \
+    [not [empty? [get $_pe cwd]]]
+
+gate "unquoted pipe routes shell" \
+    [== shell [get [weft::cmd::resolve {echo hi | sort} $_ctx] route]]
+
+gate "braced pipe stays argv" \
+    [== argv [get [weft::cmd::resolve "echo \{|\}" $_ctx] route]]
+
+gate "glob characters do NOT imply shell" \
+    [== argv [get [weft::cmd::resolve {ls *.c} $_ctx] route]]
+
+gate "redirection routes shell" \
+    [== shell [get [weft::cmd::resolve {echo hi > /dev/null} $_ctx] route]]
+
+gate "several statements with external head route shell" \
+    [== shell [get [weft::cmd::resolve "echo a\necho b" $_ctx] route]]
+
+gate "several statements with lcl head route lcl" \
+    [== lcl [get [weft::cmd::resolve "puts a\nputs b" $_ctx] route]]
+
+gate "un-lexable text routes shell (raw handoff)" \
+    [== shell [get [weft::cmd::resolve "echo \"open" $_ctx] route]]
+
+gate "unresolved head is a structured error, not a spawn" \
+    [== error \
+        [get [weft::cmd::resolve {definitely-not-a-cmd-xyz} $_ctx] route]]
+
+gate "dynamic external argument is an error with a hint" \
+    [>= [String::find [weft::error::message \
+        [get [weft::cmd::resolve {echo $PATH} $_ctx] error]] {sh}] 0]
+
+gate "namespace-valued head falls through to external resolution" \
+    [not [== lcl [get [weft::cmd::resolve {String c} $_ctx] route]]]
+
+gate "quoted argument decodes into one argv word" \
+    [== [get [get [weft::cmd::resolve "echo \"a b\"" $_ctx] argv] 1] \
+        "a b"]
+
+;; ---- live shadowing: define user::git, git becomes lcl ----
+
+gate "git resolves external before shadowing" \
+    [not [== lcl [get [weft::cmd::resolve {git status} $_ctx] route]]]
+weft::image::eval-in! user {proc git {*rest} { return "shadowed" }} $_ctx
+gate "user:: definition shadows the external live" \
+    [== lcl [get [weft::cmd::resolve {git status} $_ctx] route]]
+
+;; ---- which ----
+
+gate "which finds sh on PATH" [not [empty? [weft::cmd::which {sh}]]]
+gate "which misses bogus names" \
+    [empty? [weft::cmd::which {definitely-not-a-cmd-xyz}]]
+
+;; ---- semantic commands: cd mutates the buffer cwd ----
+
+gate "cd routes semantic" \
+    [== semantic [get [weft::cmd::resolve {cd /tmp} $_ctx] route]]
+
+let _cdt [weft::shell::run-text! {cd /tmp} $_ctx]
+gate "cd succeeds" [== [weft::task::state $_cdt] succeeded]
+gate "cd set the executing buffer's cwd" \
+    [== [weft::ws::buffer-cwd $_b] {/tmp}]
+
+gate "cd to a non-directory fails structurally" \
+    [== [weft::task::state \
+        [weft::shell::run-text! {cd /definitely/not/here} $_ctx]] failed]
+gate "failed cd leaves cwd alone" [== [weft::ws::buffer-cwd $_b] {/tmp}]
+
+;; ---- the buffer cwd flows into spawned processes ----
+
+let _pwt [weft::shell::run-text! {pwd} $_ctx]
+gate "pwd routes through argv as a pending task" \
+    [== [weft::task::state $_pwt] pending]
+drain-tasks
+let _out [weft::shell::output-buffer!]
+let _otext [Lk::doc_text [weft::ws::buffer-doc $_out]]
+gate "process ran in the buffer's cwd" \
+    [>= [String::find $_otext "$ pwd\n/tmp\n"] 0]
+
+;; ---- sh: the explicit shell spelling ----
+
+gate "sh routes semantic" \
+    [== semantic [get [weft::cmd::resolve "sh \{ls\}" $_ctx] route]]
+weft::shell::run-text! "sh \{echo piped-\$\$ | tr a-z A-Z\}" $_ctx
+drain-tasks
+gate "sh hands the braced text to the shell verbatim" \
+    [>= [String::find \
+        [Lk::doc_text [weft::ws::buffer-doc $_out]] {PIPED-}] 0]
+
+;; ---- run records: provenance over the task machinery ----
+
+let _nruns [len [weft::cmd::run-list]]
+weft::shell::run-text! {echo run-provenance} $_ctx
+drain-tasks
+gate "a process execution left a run record" \
+    [> [len [weft::cmd::run-list]] $_nruns]
+
+var _rr #{}
+foreach _rid [weft::cmd::run-list] {
+    let _cand [weft::cmd::run $_rid]
+    if [== [get $_cand form] {echo run-provenance}] {
+        set! _rr $_cand
+    }
+}
+gate "run record found by form" [not [empty? $_rr]]
+gate "run recorded provider argv" [== [get $_rr provider] argv]
+gate "run recorded the cwd" [== [get $_rr cwd] {/tmp}]
+gate "run exited cleanly" [== [get $_rr state] {exited}]
+gate "run recorded exit status" [== [get $_rr exit] 0]
+gate "run output region is non-empty" \
+    [> [get $_rr end] [get $_rr start]]
+
+;; the root `cmd` annotation over the run's output region
+let _store [weft::ws::buffer-store $_out]
+var _found 0
+foreach _a [Lk::annot_in_range $_store [get $_rr start] [get $_rr end]] {
+    if [== [Lk::annot_layer $_store $_a] "cmd"] {
+        let _m [Lk::annot_meta_all $_store $_a]
+        if [== [get $_m run] [get $_rr id]] {
+            set! _found 1
+            gate "root annotation carries the cwd" \
+                [== [get $_m cwd] {/tmp}]
+        }
+    }
+}
+gate "run left a root cmd annotation on its region" [== 1 $_found]
+
+;; ---- command-not-found reports into *output*, no spawn ----
+
+gate "unresolved head fails as a task" \
+    [== [weft::task::state \
+        [weft::shell::run-text! {definitely-not-a-cmd-xyz} $_ctx]] failed]
+gate "not-found message lands in output" \
+    [>= [String::find [Lk::doc_text [weft::ws::buffer-doc $_out]] \
+        {command not found}] 0]
+
+;; ---- explain: resolution without execution ----
+
+gate "explain names the argv route" \
+    [>= [String::find [weft::cmd::explain {echo hi}] {argv}] 0]
+gate "explain names the executable" \
+    [>= [String::find [weft::cmd::explain {echo hi}] {echo}] 0]
+gate "explain names the lcl route" \
+    [>= [String::find [weft::cmd::explain {puts hi}] {lcl}] 0]
+gate "explain names the shell reason" \
+    [>= [String::find [weft::cmd::explain {a | b}] {operator}] 0]
+
+let _nruns2 [len [weft::cmd::run-list]]
+weft::cmd::explain {echo side-effect-check}
+gate "explain left no run record" \
+    [== [len [weft::cmd::run-list]] $_nruns2]
+
+;; ============================================================
+;; Stage B: the producer-agnostic output sink
+;; ============================================================
+
+let _sb [weft::ws::buffer-create! "sink-fixture" "" ""]
+let _sdoc [weft::ws::buffer-doc $_sb]
+
+;; ---- emit!: append -> exact range -> metadata, atomically ----
+
+let _e1 [weft::sink::emit! $_sb "plain\n"]
+gate "emit returns the exact landed range" \
+    [and [== [get $_e1 start] 0] [== [get $_e1 end] 6]]
+gate "emit appended the text" \
+    [== [Lk::doc_text $_sdoc] "plain\n"]
+
+weft::testhost::presented-reset!
+let _e2 [weft::sink::emit! $_sb "src/editor.c\n" #{layer {loc}
+    meta #{kind {file-location} path {/x/src/editor.c}}
+    present #{ptype {qjump} value #{buffer $_sb start 0 end 0}}}]
+gate "emit range advances past prior output" \
+    [== [get $_e2 start] 6]
+
+let _sstore [weft::ws::buffer-store $_sb]
+var _sfound 0
+foreach _sa [Lk::annot_in_range $_sstore [get $_e2 start] [get $_e2 end]] {
+    if [== [Lk::annot_layer $_sstore $_sa] "loc"] {
+        set! _sfound 1
+        gate "emitted metadata rides the exact range" \
+            [== [get [Lk::annot_meta_all $_sstore $_sa] path] \
+                {/x/src/editor.c}]
+    }
+}
+gate "emit attached the annotation" [== 1 $_sfound]
+gate "emit attached the presentation" \
+    [> [len [weft::testhost::presented]] 0]
+
+;; Adjacent emissions stay disjoint: lk end anchors are RIGHT-biased,
+;; so a span closed at the buffer tail would grow over the next
+;; append -- emit! excludes the trailing newline from the annotation.
+let _r1 [weft::sink::emit! $_sb "row-one\n" #{layer {row} meta #{i 1}}]
+let _r2 [weft::sink::emit! $_sb "row-two\n" #{layer {row} meta #{i 2}}]
+var _r1end -1
+foreach _ra [Lk::annot_in_range $_sstore [get $_r1 start] \
+        [Lk::doc_len $_sdoc]] {
+    if [== [Lk::annot_layer $_sstore $_ra] "row"] {
+        if [== [get [Lk::annot_meta_all $_sstore $_ra] i] 1] {
+            set! _r1end [get [Lk::annot_span $_sstore $_ra] 1]
+        }
+    }
+}
+gate "an earlier emission's annotation does not swallow the next" \
+    [and [> $_r1end 0] [<= $_r1end [get $_r2 start]]]
+
+;; ---- streaming sessions: arbitrary chunks -> framed lines ----
+
+let _sid [weft::sink::open! $_sb]
+let _f1 [weft::sink::feed! $_sid "ab"]
+gate "chunk without newline frames nothing" [== [len $_f1] 0]
+
+let _f2 [weft::sink::feed! $_sid "c\nde\nfg"]
+gate "delimiters frame completed lines" [== [len $_f2] 2]
+gate "framed line spans its chunks" \
+    [== [get [get $_f2 0] text] {abc}]
+gate "framed range is absolute and includes the newline" \
+    [== [String::range [Lk::doc_text $_sdoc] \
+        [get [get $_f2 0] start] [get [get $_f2 0] end]] "abc\n"]
+gate "second line framed with advancing offsets" \
+    [and [== [get [get $_f2 1] text] {de}] \
+         [== [get [get $_f2 1] start] [get [get $_f2 0] end]]]
+
+let _f3 [weft::sink::close! $_sid]
+gate "close flushes the unterminated tail" \
+    [and [== [len $_f3] 1] [== [get [get $_f3 0] text] {fg}]]
+
+;; ---- interleave: a foreign append splits the open line ----
+
+let _sid2 [weft::sink::open! $_sb]
+weft::sink::feed! $_sid2 "partial"
+Lk::doc_insert $_sdoc [Lk::doc_len $_sdoc] "INTRUDER"
+let _f4 [weft::sink::feed! $_sid2 "-rest\n"]
+gate "foreign append flushes the open line at its true extent" \
+    [and [== [get [get $_f4 0] text] {partial}] \
+         [== [get [get $_f4 0] split] 1]]
+gate "flushed record range excludes foreign text" \
+    [== [String::range [Lk::doc_text $_sdoc] \
+        [get [get $_f4 0] start] [get [get $_f4 0] end]] {partial}]
+gate "post-interleave line frames cleanly" \
+    [== [get [get $_f4 1] text] {-rest}]
+weft::sink::close! $_sid2
+
+;; ---- exec streams frame through the sink (footer intact) ----
+
+let _bt [weft::shell::run-text! {echo sink-framed} $_ctx]
+drain-tasks
+gate "process output still lands with exit footer" \
+    [>= [String::find [Lk::doc_text [weft::ws::buffer-doc $_out]] \
+        "sink-framed\n\[exit 0\]"] 0]
+
+;; ---- stage D: filters (docs/commands.md "Filters") ----
+
+gate "leading | routes filter (pipe)" \
+    [== filter [get [weft::cmd::resolve {|sort} $_ctx] route]]
+gate "leading < routes filter (insert)" \
+    [== insert [get [weft::cmd::resolve {< date} $_ctx] mode]]
+gate "leading > routes filter (send)" \
+    [== send [get [weft::cmd::resolve {>wc -l} $_ctx] mode]]
+gate "filter plan carries the shell command" \
+    [== {wc -l} [get [weft::cmd::resolve {>wc -l} $_ctx] command]]
+gate "a lone | is a structured error" \
+    [== error [get [weft::cmd::resolve {|} $_ctx] route]]
+gate "|| is not a filter spelling" \
+    [== error [get [weft::cmd::resolve {|| true} $_ctx] route]]
+gate "interior pipe still routes shell" \
+    [== shell [get [weft::cmd::resolve {echo hi | sort} $_ctx] route]]
+gate "explain shows the filter mode" \
+    [>= [String::find [weft::cmd::explain {|sort}] {mode:       pipe}] 0]
+
+;; pipe: the range through sort, replaced as ONE transaction
+let _fb [weft::ws::buffer-create! "filter-fixture" "" "c\nb\na\ntail\n"]
+let _fdoc [weft::ws::buffer-doc $_fb]
+let _fhist [get [weft::ws::buffer $_fb] hist]
+let _fctx [weft::ctx::make #{buffer $_fb start 0 end 6 ns user}]
+let _ft [weft::shell::run-text! {|sort} $_fctx]
+gate "|sort starts as a pending task" [== [weft::task::state $_ft] pending]
+gate "filter task is marked quiet" \
+    [== 1 [get [weft::tasks::meta [get $_ft id]] quiet]]
+drain-tasks
+gate "|sort replaced exactly the range" \
+    [== [Lk::doc_text $_fdoc] "a\nb\nc\ntail\n"]
+let _fev [weft::filter::take-events!]
+gate "filter reported one event" [== 1 [len $_fev]]
+gate "a successful pipe does not surface *output*" \
+    [== 0 [get [get $_fev 0] surface]]
+Lk::history_undo $_fhist $_fdoc
+gate "the replacement was one undo step" \
+    [== [Lk::doc_text $_fdoc] "c\nb\na\ntail\n"]
+Lk::history_redo $_fhist $_fdoc
+
+var _frun #{}
+foreach _rid [weft::cmd::run-list] {
+    if [== [get [weft::cmd::run $_rid] form] {|sort}] {
+        set! _frun [weft::cmd::run $_rid]
+    }
+}
+gate "filter left a run record with provider filter" \
+    [== [get $_frun provider] filter]
+gate "filter run exited 0" [== [get $_frun exit] 0]
+
+;; failure: source untouched, stderr + exit land in *output*, surfaced
+let _before [Lk::doc_text $_fdoc]
+weft::shell::run-text! {|sh -c 'echo boom >&2; exit 3'} $_fctx
+drain-tasks
+gate "a failing filter leaves the source untouched" \
+    [== [Lk::doc_text $_fdoc] $_before]
+let _fev2 [weft::filter::take-events!]
+gate "a failing filter surfaces *output*" [== 1 [get [get $_fev2 0] surface]]
+let _otext2 [Lk::doc_text [weft::ws::buffer-doc $_out]]
+gate "its stderr landed in *output*" [>= [String::find $_otext2 {boom}] 0]
+gate "its exit landed in *output*" [>= [String::find $_otext2 "\[exit 3\]"] 0]
+
+;; staleness: the buffer changes while the filter runs -> not applied,
+;; result kept in *output*
+let _fctx3 [weft::ctx::make #{buffer $_fb start 0 end 6 ns user}]
+weft::shell::run-text! {|sh -c 'sleep 0.3; tr a-z A-Z'} $_fctx3
+Lk::doc_insert $_fdoc 0 "X"
+drain-tasks
+gate "a stale filter result is not applied" \
+    [== [Lk::doc_text $_fdoc] "Xa\nb\nc\ntail\n"]
+gate "the stale result was kept in *output*" \
+    [>= [String::find [Lk::doc_text [weft::ws::buffer-doc $_out]] "A\nB\nC"] 0]
+let _fev3 [weft::filter::take-events!]
+gate "staleness is reported and surfaced" \
+    [and [== 1 [get [get $_fev3 0] surface]] \
+         [>= [String::find [get [get $_fev3 0] note] {changed}] 0]]
+Lk::doc_delete $_fdoc 0 1
+
+;; insert: zero-width range at pos, no stdin
+let _fctx4 [weft::ctx::make #{buffer $_fb pos 6 ns user}]
+weft::shell::run-text! {<echo INS} $_fctx4
+drain-tasks
+gate "<cmd inserts at the cursor" \
+    [== [Lk::doc_text $_fdoc] "a\nb\nc\nINS\ntail\n"]
+Lk::doc_delete $_fdoc 6 4
+
+;; send: stdin is the range, stdout streams to *output*
+let _olen5 [Lk::doc_len [weft::ws::buffer-doc $_out]]
+weft::shell::run-text! {>wc -l} $_fctx
+drain-tasks
+gate ">cmd leaves the source alone" [== [Lk::doc_text $_fdoc] "a\nb\nc\ntail\n"]
+let _otail5 [String::range [Lk::doc_text [weft::ws::buffer-doc $_out]] \
+    $_olen5 [Lk::doc_len [weft::ws::buffer-doc $_out]]]
+gate ">wc -l counted the three selected lines in *output*" \
+    [>= [String::find $_otail5 "\n3\n"] 0]
+weft::filter::take-events!
+
+;; no operand: a structured refusal, not a spawn
+let _ft6 [weft::shell::run-text! {|sort} [weft::ctx::make #{buffer $_fb ns user}]]
+gate "|cmd without a selection is invalid-args" \
+    [and [== [weft::task::state $_ft6] failed] \
+         [== invalid-args [weft::error::code [weft::task::failure $_ft6]]]]
+
+;; a large input through an echoing filter: chunked feed, no deadlock
+var _big ""
+var _bi 0
+while [< $_bi 3000] {
+    set! _big "$_big line-$_bi-0123456789abcdefghijklmnopqrstuvwxyz\n"
+    set! _bi [+ $_bi 1]
+}
+let _bb [weft::ws::buffer-create! "filter-big" "" $_big]
+let _bdoc [weft::ws::buffer-doc $_bb]
+weft::shell::run-text! {|cat} [weft::ctx::make #{buffer $_bb start 0 end [Lk::doc_len $_bdoc] ns user}]
+drain-tasks
+gate "a >64KiB selection round-trips through |cat" \
+    [== [Lk::doc_text $_bdoc] $_big]
+weft::shell::run-text! {|head -1} [weft::ctx::make #{buffer $_bb start 0 end [Lk::doc_len $_bdoc] ns user}]
+drain-tasks
+gate "|head -1 on a large selection (EPIPE) keeps the image alive and applies" \
+    [== [Lk::doc_text $_bdoc] " line-0-0123456789abcdefghijklmnopqrstuvwxyz\n"]
+weft::filter::take-events!
+
+;; preview: pends a transform plan instead of applying
+let _fctx7 [weft::ctx::make #{buffer $_fb start 0 end 6 ns user}]
+weft::filter::pipe {tr a-z A-Z} #{preview 1 ctx $_fctx7}
+drain-tasks
+gate "preview leaves the source alone until apply" \
+    [== [Lk::doc_text $_fdoc] "a\nb\nc\ntail\n"]
+gate "preview pended a transform plan" [weft::transform::pending?]
+weft::transform::apply
+gate "applying the previewed plan replaces the range" \
+    [== [Lk::doc_text $_fdoc] "A\nB\nC\ntail\n"]
+weft::filter::take-events!
+
+;; ---- stage D2: operands (docs/commands.md "Operands") ----
+
+let _ob [weft::ws::buffer-create! "operand-fixture" "" "hello world\n/tmp\n"]
+let _octx [weft::ctx::make #{buffer $_ob start 0 end 11 ns user}]
+let _op [weft::cmd::operand-of $_octx]
+gate "start/end in ctx derive a text operand" \
+    [and [== text [get $_op kind]] [== {hello world} [get $_op text]]]
+gate "operand carries its buffer and range" \
+    [and [== $_ob [get $_op buffer]] [== 11 [get $_op end]]]
+gate "no selection means no operand" \
+    [== 0 [len [Dict::keys [weft::cmd::operand-of [weft::ctx::make #{buffer $_ob}]]]]]
+let _xop #{kind text text {elsewhere} buffer $_ob start 0 end 0}
+gate "an explicit ctx operand wins" \
+    [== {elsewhere} [get [weft::cmd::operand-of \
+        [weft::ctx::make #{buffer $_ob start 0 end 5 operand $_xop}]] text]]
+
+;; argv: the operand is one more argv element, verbatim
+let _oplan [weft::cmd::resolve {echo -n} $_octx]
+gate "the plan carries the operand" [has? $_oplan operand]
+gate "explain shows the operand" \
+    [>= [String::find [get [weft::image::eval-in! user \
+        "weft::cmd::explain \{echo -n\}" $_octx] value] {operand:}] 0]
+let _olen [Lk::doc_len [weft::ws::buffer-doc $_out]]
+weft::shell::run-text! {echo -n} $_octx
+drain-tasks
+let _otail [String::range [Lk::doc_text [weft::ws::buffer-doc $_out]] \
+    $_olen [Lk::doc_len [weft::ws::buffer-doc $_out]]]
+gate "argv route appends the operand as one element" \
+    [>= [String::find $_otail "\$ echo -n hello world\nhello world"] 0]
+
+;; shell: the operand is $1, never spliced; "$@" appended when absent
+let _sctx [weft::ctx::make #{buffer $_ob start 0 end 11 ns user}]
+let _olen2 [Lk::doc_len [weft::ws::buffer-doc $_out]]
+weft::shell::run-text! {printf %s a | cat} $_sctx
+drain-tasks
+let _otail2 [String::range [Lk::doc_text [weft::ws::buffer-doc $_out]] \
+    $_olen2 [Lk::doc_len [weft::ws::buffer-doc $_out]]]
+gate "shell route hands the operand as \$1 of the last command" \
+    [>= [String::find $_otail2 "hello world': No such file"] 0]
+let _olen3 [Lk::doc_len [weft::ws::buffer-doc $_out]]
+weft::shell::run-text! {printf '[%s]\n' "$1" | cat} $_sctx
+drain-tasks
+let _otail3 [String::range [Lk::doc_text [weft::ws::buffer-doc $_out]] \
+    $_olen3 [Lk::doc_len [weft::ws::buffer-doc $_out]]]
+gate "text that places \$1 itself gets no \"\$@\" appended" \
+    [>= [String::find $_otail3 "\[hello world\]\n"] 0]
+let _qraw {it's "a" $HOME `x`}
+let _qb [weft::ws::buffer-create! "operand-q" "" "$_qraw\n"]
+let _qctx [weft::ctx::make #{buffer $_qb start 0 end 18 ns user}]
+let _olen4 [Lk::doc_len [weft::ws::buffer-doc $_out]]
+weft::shell::run-text! {printf '<%s>' "$1" | cat} $_qctx
+drain-tasks
+let _otail4 [String::range [Lk::doc_text [weft::ws::buffer-doc $_out]] \
+    $_olen4 [Lk::doc_len [weft::ws::buffer-doc $_out]]]
+gate "a quote-hostile operand survives the shell route" \
+    [>= [String::find $_otail4 "<$_qraw>"] 0]
+
+;; semantic: cd takes the operand as its target
+let _cdctx [weft::ctx::make #{buffer $_ob start 12 end 16 ns user}]
+weft::shell::run-text! {cd} $_cdctx
+drain-tasks
+gate "cd with an operand changes to it" \
+    [== {/tmp} [weft::ws::buffer-cwd $_ob]]
+
+;; lcl: the operand is a value in ctx, read through weft::operand
+let _lr [weft::image::eval-in! user {weft::operand} $_octx]
+gate "weft::operand reads the operand text in an lcl command" \
+    [== {hello world} [get $_lr value]]
+let _lr2 [weft::image::eval-in! user {weft::operand} [weft::ctx::make #{buffer $_ob ns user}]]
+gate "weft::operand is empty without one" [== "" [get $_lr2 value]]
+
+;; a verified location enriches the operand; weft::open uses it
+let _ofile "/tmp/weft-operand-gate.txt"
+weft::cap::invoke "fs.write" #{path $_ofile text "gate\n"} #{}
+let _lb [weft::ws::buffer-create! "operand-loc" "" "see weft-operand-gate.txt here\n"]
+weft::ws::buffer-set-cwd! $_lb "/tmp"
+Lk::annot_add [weft::ws::buffer-store $_lb] 4 25 "loc" #{kind {file} path $_ofile}
+let _lop [weft::cmd::operand-of [weft::ctx::make #{buffer $_lb start 4 end 25}]]
+gate "a covering loc annotation rides the operand as location" \
+    [and [has? $_lop location] [== $_ofile [get [get $_lop location] path]]]
+gate "a partial cover is not a location" \
+    [not [has? [weft::cmd::operand-of [weft::ctx::make #{buffer $_lb start 2 end 25}]] location]]
+let _or [weft::image::eval-in! user {weft::open} [weft::ctx::make #{buffer $_lb start 4 end 25 ns user}]]
+gate "weft::open with no args opens the operand's location" \
+    [and [get $_or ok] [== $_ofile [get [get $_or value] path]]]
+
+;; filter: an explicit operand in another buffer is the filter's range
+let _fb2 [weft::ws::buffer-create! "operand-filter" "" "b\na\n"]
+let _fop [weft::cmd::operand-from-range $_fb2 0 4]
+weft::shell::run-text! {|sort} [weft::ctx::make #{buffer $_ob operand $_fop ns user}]
+drain-tasks
+weft::filter::take-events!
+gate "a filter with a cross-buffer operand edits the operand's buffer" \
+    [== "a\nb\n" [Lk::doc_text [weft::ws::buffer-doc $_fb2]]]
+
+;; ---- the selection SET: N selections = N execution units ----
+;; (docs/commands.md "Selections"; lk multi-cursor E1-E4)
+
+;; ws: the plural accessors over the caret-set hooks
+let _msb [weft::ws::buffer-create! "multisel" "" "b\na\nd\nc\n"]
+let _msv [weft::ws::view-create! $_msb]
+weft::testhost::editor-multi-select! [weft::ws::view-editor $_msv] ((0 4) (4 8))
+gate "view-selections reports the caret set in document order" \
+    [== "(0 4) (4 8)" [String::from [weft::ws::view-selections $_msv]]]
+gate "view-carets reports the caret positions" \
+    [== "4 8" [String::from [weft::ws::view-carets $_msv]]]
+weft::testhost::editor-multi-select! [weft::ws::view-editor $_msv] ((2 2) (5 5))
+gate "zero-width carets are not selections" \
+    [== 0 [len [weft::ws::view-selections $_msv]]]
+gate "but they are carets" \
+    [== "2 5" [String::from [weft::ws::view-carets $_msv]]]
+
+;; exec sequencer: units run IN ORDER, independent records
+let _nrec0 [len [weft::cmd::run-list]]
+let _slen0 [Lk::doc_len [weft::ws::buffer-doc $_out]]
+weft::shell::run-texts! (\
+    #{text {echo seq-one} ctx [weft::ctx::make #{buffer $_msb ns user}]} \
+    #{text {echo seq-two} ctx [weft::ctx::make #{buffer $_msb ns user}]})
+drain-tasks
+let _stail [String::range [Lk::doc_text [weft::ws::buffer-doc $_out]] \
+    $_slen0 [Lk::doc_len [weft::ws::buffer-doc $_out]]]
+gate "both sequenced units ran" \
+    [and [>= [String::find $_stail {seq-one}] 0] \
+         [>= [String::find $_stail {seq-two}] 0]]
+gate "the units ran in order" \
+    [< [String::find $_stail {seq-one}] [String::find $_stail {seq-two}]]
+gate "each unit left its own run record" \
+    [== [+ $_nrec0 2] [len [weft::cmd::run-list]]]
+
+;; filter group: N ranges -> N runs -> ONE transaction
+let _mdoc [weft::ws::buffer-doc $_msb]
+let _mhist [get [weft::ws::buffer $_msb] hist]
+let _mctx [weft::ctx::make #{buffer $_msb selections ((0 4) (4 8)) ns user}]
+weft::shell::run-text! {|sort} $_mctx
+drain-tasks
+gate "a selection-set pipe filtered every range" \
+    [== [Lk::doc_text $_mdoc] "a\nb\nc\nd\n"]
+let _mev [weft::filter::take-events!]
+gate "the group reported ONE event" [== 1 [len $_mev]]
+gate "the group event counts the ranges" \
+    [>= [String::find [get [get $_mev 0] note] {2 ranges}] 0]
+Lk::history_undo $_mhist $_mdoc
+gate "the whole group was ONE undo step" \
+    [== [Lk::doc_text $_mdoc] "b\na\nd\nc\n"]
+Lk::history_redo $_mhist $_mdoc
+
+;; group failure: any member's non-zero exit applies NOTHING
+let _mbefore [Lk::doc_text $_mdoc]
+weft::shell::run-text! {|sh -c 'grep -q c && exit 3; tr a-z A-Z'} \
+    [weft::ctx::make #{buffer $_msb selections ((0 4) (4 8)) ns user}]
+drain-tasks
+gate "a failing member leaves the whole source untouched" \
+    [== [Lk::doc_text $_mdoc] $_mbefore]
+let _mev2 [weft::filter::take-events!]
+gate "the group failure is one surfaced event" \
+    [and [== 1 [len $_mev2]] [== 1 [get [get $_mev2 0] surface]]]
+
+;; group staleness: an edit while the group runs -> nothing applied
+weft::shell::run-text! {|sh -c 'sleep 0.3; tr a-z A-Z'} \
+    [weft::ctx::make #{buffer $_msb selections ((0 4) (4 8)) ns user}]
+Lk::doc_insert $_mdoc 0 "Z"
+drain-tasks
+gate "a stale group applies nothing" \
+    [== [Lk::doc_text $_mdoc] "Za\nb\nc\nd\n"]
+let _mev3 [weft::filter::take-events!]
+gate "group staleness is reported" \
+    [>= [String::find [get [get $_mev3 0] note] {changed}] 0]
+Lk::doc_delete $_mdoc 0 1
+
+;; group insert: N zero-width carets = N insertion points
+weft::shell::run-text! {<printf Z} \
+    [weft::ctx::make #{buffer $_msb selections ((2 2) (4 4)) ns user}]
+drain-tasks
+gate "<cmd inserts at every caret" \
+    [== [Lk::doc_text $_mdoc] "a\nZb\nZc\nd\n"]
+Lk::history_undo $_mhist $_mdoc
+gate "the multi-insert was ONE undo step" \
+    [== [Lk::doc_text $_mdoc] "a\nb\nc\nd\n"]
+weft::filter::take-events!
+
+;; group preview: one plan over all the ranges
+weft::filter::pipe {tr a-z A-Z} #{preview 1 \
+    ctx [weft::ctx::make #{buffer $_msb selections ((0 4) (4 8)) ns user}]}
+drain-tasks
+gate "a group preview leaves the source alone" \
+    [== [Lk::doc_text $_mdoc] "a\nb\nc\nd\n"]
+gate "a group preview pended a transform plan" [weft::transform::pending?]
+weft::transform::apply
+gate "applying the group plan lands every range" \
+    [== [Lk::doc_text $_mdoc] "A\nB\nC\nD\n"]
+weft::filter::take-events!
+
+;; send over a set: N independent streams, source untouched
+let _slen6 [Lk::doc_len [weft::ws::buffer-doc $_out]]
+weft::shell::run-text! {>wc -c} \
+    [weft::ctx::make #{buffer $_msb selections ((0 4) (4 8)) ns user}]
+drain-tasks
+gate ">cmd over a set leaves the source alone" \
+    [== [Lk::doc_text $_mdoc] "A\nB\nC\nD\n"]
+let _stail6 [String::range [Lk::doc_text [weft::ws::buffer-doc $_out]] \
+    $_slen6 [Lk::doc_len [weft::ws::buffer-doc $_out]]]
+let _sx1 [String::find $_stail6 "\[exit 0\]"]
+let _sx2 [String::find [String::range $_stail6 [+ $_sx1 1] \
+    [String::length $_stail6]] "\[exit 0\]"]
+gate ">cmd over a set ran once per range (two exit footers)" \
+    [and [>= $_sx1 0] [>= $_sx2 0]]
+weft::filter::take-events!
+
+;; overlapping ranges are refused (a caret set is disjoint)
+let _mt7 [weft::shell::run-text! {|sort} \
+    [weft::ctx::make #{buffer $_msb selections ((0 5) (3 8)) ns user}]]
+gate "overlapping ctx selections are invalid-args" \
+    [and [== [weft::task::state $_mt7] failed] \
+         [== invalid-args [weft::error::code [weft::task::failure $_mt7]]]]
+
+;; ---- output goes here: ctx `out` (docs/commands.md) ----
+
+let _hb [weft::ws::buffer-create! "here-fixture" "" "notes\n"]
+weft::ws::buffer-set-cwd! $_hb "/tmp"
+let _hctx [weft::ctx::make #{buffer $_hb out $_hb ns user}]
+let _olen_before [Lk::doc_len [weft::ws::buffer-doc $_out]]
+let _ht [weft::shell::run-text! {echo inline-run} $_hctx]
+gate "an inline run is marked quiet" \
+    [== 1 [get [weft::tasks::meta [get $_ht id]] quiet]]
+drain-tasks
+let _htext [Lk::doc_text [weft::ws::buffer-doc $_hb]]
+gate "inline output lands in the executing buffer" \
+    [>= [String::find $_htext "\$ echo inline-run\ninline-run\n"] 0]
+gate "inline exit footer lands there too" \
+    [>= [String::find $_htext "\[exit 0\]"] 0]
+gate "*output* did not grow" \
+    [== $_olen_before [Lk::doc_len [weft::ws::buffer-doc $_out]]]
+
+var _hrun #{}
+foreach _rid [weft::cmd::run-list] {
+    if [== [get [weft::cmd::run $_rid] form] {echo inline-run}] {
+        set! _hrun [weft::cmd::run $_rid]
+    }
+}
+gate "the inline run record targets the executing buffer" \
+    [== $_hb [get $_hrun buffer]]
+
+;; recognizers enrich inline output in place: ls a dir with a known
+;; file, the row gets a verified loc annotation IN this buffer
+weft::shell::run-text! {touch /tmp/weft-here-gate.txt} $_hctx
+drain-tasks
+weft::shell::run-text! {ls weft-here-gate.txt} $_hctx
+drain-tasks
+var _hloc 0
+let _hstore [weft::ws::buffer-store $_hb]
+foreach _aid [Lk::annot_in_range $_hstore 0 \
+    [Lk::doc_len [weft::ws::buffer-doc $_hb]] "loc"] {
+    if [== {/tmp/weft-here-gate.txt} [Lk::annot_meta $_hstore $_aid "path"]] {
+        set! _hloc 1
+    }
+}
+gate "recognizers verify inline rows in the executing buffer" $_hloc
+
+;; the lcl route echoes inline too
+weft::shell::run-text! {weft::version} $_hctx
+gate "an lcl evaluation echoes into the executing buffer" \
+    [>= [String::find [Lk::doc_text [weft::ws::buffer-doc $_hb]] \
+        "> weft::version"] 0]
+gate "*output* still did not grow" \
+    [== $_olen_before [Lk::doc_len [weft::ws::buffer-doc $_out]]]
+
+;; emitters honor it: weft::buffers rows land inline
+let _hlen [Lk::doc_len [weft::ws::buffer-doc $_hb]]
+weft::shell::run-text! {weft::buffers} $_hctx
+gate "weft::buffers emits its menu into the executing buffer" \
+    [>= [String::find [String::range [Lk::doc_text [weft::ws::buffer-doc $_hb]] \
+        $_hlen [Lk::doc_len [weft::ws::buffer-doc $_hb]]] {here-fixture}] 0]
+
+;; a dead `out` falls back to *output*, never errors
+let _dead [weft::ws::buffer-create! "here-dead" "" ""]
+weft::ws::buffer-close! $_dead 0
+weft::shell::run-text! {echo fell-back} \
+    [weft::ctx::make #{buffer $_hb out $_dead ns user}]
+drain-tasks
+gate "a closed out buffer falls back to *output*" \
+    [>= [String::find [Lk::doc_text [weft::ws::buffer-doc $_out]] \
+        {fell-back}] 0]
+
+;; ---- weft::buffers: the first non-process producer ----
+
+weft::testhost::presented-reset!
+let _bv [weft::buffers]
+gate "buffers returns an emitted summary" \
+    [and [== [get $_bv kind] emitted] [> [get $_bv count] 0]]
+
+let _mtext [Lk::doc_text [weft::ws::buffer-doc $_out]]
+gate "buffer menu rows landed in *output*" \
+    [>= [String::find $_mtext {sink-fixture}] 0]
+gate "menu rows carry presentations" \
+    [>= [len [weft::testhost::presented]] [get $_bv count]]
+
+var _brow 0
+foreach _ma [Lk::annot_in_range [weft::ws::buffer-store $_out] 0 \
+        [Lk::doc_len [weft::ws::buffer-doc $_out]]] {
+    let _mstore [weft::ws::buffer-store $_out]
+    if [== [Lk::annot_layer $_mstore $_ma] "qjump"] {
+        if [== [get [Lk::annot_meta_all $_mstore $_ma] kind] \
+                {buffer-row}] {
+            set! _brow [+ $_brow 1]
+        }
+    }
+}
+gate "each row is a qjump annotation with buffer-row meta" \
+    [>= $_brow [get $_bv count]]
+
+;; ============================================================
+;; Stage C: generic contextual recognizers
+;; ============================================================
+
+let _rb [weft::ws::buffer-create! "recog-fixture" "" ""]
+let _rrid [weft::cmd::run-start! #{form {recog-test} provider argv
+    cwd {/etc} argv () buffer $_rb task {} start 0 end 0}]
+let _rsid [weft::sink::open! $_rb]
+
+weft::recog::lines! $_rrid [weft::sink::feed! $_rsid \
+    "passwd zzznope /etc/passwd:42 https://example.com/x. /etc\n"]
+weft::recog::lines! $_rrid [weft::sink::feed! $_rsid \
+    "meet at 10:30 sharp\n"]
+
+let _rstore [weft::ws::buffer-store $_rb]
+var _rk ()
+var _fl_line 0
+var _fl_span ()
+var _file_span ()
+
+foreach _la [Lk::annot_by_layer $_rstore "loc"] {
+    let _lm [Lk::annot_meta_all $_rstore $_la]
+    let _lk [get $_lm kind]
+    set! _rk [List::push $_rk \
+        "$_lk:[weft::ctx::field $_lm path][weft::ctx::field $_lm url]"]
+
+    if [== $_lk {fileline}] {
+        set! _fl_line [get $_lm line]
+        set! _fl_span [Lk::annot_span $_rstore $_la]
+    }
+
+    if [== $_lk {file}] {
+        set! _file_span [Lk::annot_span $_rstore $_la]
+    }
+}
+
+gate "bare token verified against the run cwd becomes a file" \
+    [has? $_rk {file:/etc/passwd}]
+gate "the file annotation spans exactly the token" \
+    [and [== [get $_file_span 0] 0] [== [get $_file_span 1] 6]]
+gate "file:line with verified file part recognized" \
+    [has? $_rk {fileline:/etc/passwd}]
+gate "fileline carries the parsed line number" [== $_fl_line 42]
+gate "url recognized with trailing punctuation trimmed" \
+    [has? $_rk {url:https://example.com/x}]
+gate "directory token recognized as dir" [has? $_rk {dir:/etc}]
+gate "unverifiable token is not annotated" \
+    [not [has? $_rk {file:/etc/zzznope}]]
+gate "prose num:num dies at verification (no /etc/10)" \
+    [not [has? $_rk {fileline:/etc/10}]]
+
+var _fl_overlap 0
+foreach _la [Lk::annot_by_layer $_rstore "loc"] {
+    let _sp [Lk::annot_span $_rstore $_la]
+
+    if [and [< [get $_sp 0] [get $_fl_span 1]] \
+            [> [get $_sp 1] [get $_fl_span 0]]] {
+        set! _fl_overlap [+ $_fl_overlap 1]
+    }
+}
+gate "claimed ranges are not re-annotated by later passes" \
+    [== 1 $_fl_overlap]
+
+;; ---- end to end: ls output rows become clickable locations ----
+
+weft::ws::buffer-set-cwd! $_b {/etc}
+weft::shell::run-text! {ls} $_ctx
+drain-tasks
+
+var _lsfound 0
+let _ostore [weft::ws::buffer-store $_out]
+foreach _la [Lk::annot_by_layer $_ostore "loc"] {
+    let _lm [Lk::annot_meta_all $_ostore $_la]
+
+    if [== [weft::ctx::field $_lm path] {/etc/passwd}] {
+        set! _lsfound 1
+    }
+}
+gate "ls rows become verified file locations in *output*" \
+    [== 1 $_lsfound]
+
+;; ---- weft::open: opening and creating are one gesture ----
+;; Driven through the image so weft::open reads a real execution ctx,
+;; exactly as an EXECUTE or REPL invocation would.
+
+weft::testhost::fs-put! "/tmp/wopen/there.txt" "found me"
+weft::ws::buffer-set-cwd! $_b {/tmp/wopen}
+
+let _o1 [weft::image::eval-in! user {weft::open "there.txt"} $_ctx]
+gate "open evaluates" [get $_o1 ok]
+gate "open returns the open kind" [== open [get [get $_o1 value] kind]]
+gate "a relative path resolves against the buffer's cwd" \
+    [== {/tmp/wopen/there.txt} [get [get $_o1 value] path]]
+gate "open reads the file through the fs capability" \
+    [== "found me" [Lk::doc_text [weft::ws::buffer-doc \
+        [get [get $_o1 value] buffer]]]]
+
+let _o2 [weft::image::eval-in! user {weft::open "/tmp/wopen/there.txt"} $_ctx]
+gate "an absolute path is taken as given" \
+    [== {/tmp/wopen/there.txt} [get [get $_o2 value] path]]
+gate "opening the same path twice is the same buffer" \
+    [== [get [get $_o1 value] buffer] [get [get $_o2 value] buffer]]
+
+;; Creating IS opening: a path with no file behind it becomes an empty
+;; buffer bound to that path, which is why there is no weft::new.
+let _o3 [weft::image::eval-in! user {weft::open "brand-new.md"} $_ctx]
+gate "a missing path opens as a new buffer" \
+    [not [weft::error::error? [get $_o3 value]]]
+gate "the new buffer is bound to the resolved path" \
+    [== {/tmp/wopen/brand-new.md} \
+        [get [weft::ws::buffer [get [get $_o3 value] buffer]] path]]
+gate "the new buffer is empty and clean" \
+    [and [== "" [Lk::doc_text [weft::ws::buffer-doc \
+             [get [get $_o3 value] buffer]]]] \
+         [not [weft::ws::buffer-dirty? [get [get $_o3 value] buffer]]]]
+
+;; ---- the command menu: text is the menu ----
+
+gate "output-buffer-id agrees with output-buffer!" \
+    [== [weft::shell::output-buffer!] [weft::shell::output-buffer-id]]
+
+let _cm_before [Lk::doc_len [weft::ws::buffer-doc $_out]]
+let _cm [weft::commands]
+gate "commands emits" [== emitted [get $_cm kind]]
+gate "commands emits every row" [> [get $_cm count] 20]
+gate "commands wrote into *output*" \
+    [> [Lk::doc_len [weft::ws::buffer-doc $_out]] $_cm_before]
+
+let _cm_text [String::range [Lk::doc_text [weft::ws::buffer-doc $_out]] \
+    $_cm_before [Lk::doc_len [weft::ws::buffer-doc $_out]]]
+gate "commands prints its group titles" \
+    [>= [String::find $_cm_text {Transforms}] 0]
+gate "commands names itself (the menu is discoverable from itself)" \
+    [>= [String::find $_cm_text {weft::commands}] 0]
+
+;; ---- messages: flashes are kept ----
+weft::shell::notice! "open: no such file"
+weft::shell::notice! "saved /t/x"
+let _ms_before [Lk::doc_len [weft::ws::buffer-doc $_out]]
+let _ms [weft::messages 1]
+gate "messages emits the newest notices last" \
+    [and [== 1 [get $_ms count]] \
+         [>= [String::find [String::range [Lk::doc_text [weft::ws::buffer-doc $_out]] \
+             $_ms_before [Lk::doc_len [weft::ws::buffer-doc $_out]]] "saved /t/x"] 0]]
+gate "notices carry a timestamp" \
+    [has? [get [weft::shell::notices] 0] at]
+
+;; The anti-rot gate.  A curated menu earns its curation only if it
+;; cannot drift out of agreement with the image: every qualified name
+;; must still resolve to a proc, and every bare head must still route
+;; somewhere real through the resolver (`cd` and `sh` are semantic,
+;; `->` is an lcl builtin -- all three are heads a user can click).
+var _cm_rows 0
+var _cm_bad ()
+
+foreach _grp ${weft::command_menu} {
+    foreach _row [get $_grp rows] {
+        let _form [get $_row 0]
+        let _head [get [String::split $_form " "] 0]
+        set! _cm_rows [+ $_cm_rows 1]
+
+        if [>= [String::find $_head {::}] 0] {
+            var _hv ""
+            var _he ""
+
+            if [not [== 0 [catch { getvar $_head } _hv _he]]] {
+                set! _cm_bad [List::push $_cm_bad $_head]
+            } else {
+                if [not [proc? $_hv]] {
+                    set! _cm_bad [List::push $_cm_bad $_head]
+                }
+            }
+        } else {
+            if [== error [get [weft::cmd::resolve $_form $_ctx] route]] {
+                set! _cm_bad [List::push $_cm_bad $_head]
+            }
+        }
+
+        gate "menu row documents itself: $_head" \
+            [not [empty? [get $_row 1]]]
+    }
+}
+
+gate "every menu head resolves ([String::join $_cm_bad " "])" \
+    [== 0 [len $_cm_bad]]
+gate "menu row count matches what was emitted" \
+    [== $_cm_rows [get $_cm count]]
+
+;; ---- weft::template: the prompt is a line ----
+
+let _tb [weft::ws::buffer-create! "tmpl" "" "alpha\nbeta\n\ngamma\n"]
+let _tv [weft::ws::view-create! $_tb]
+let _ted [weft::ws::view-editor $_tv]
+let _tdoc [weft::ws::buffer-doc $_tb]
+
+proc _tmpl {text ctx} {
+    return [weft::image::eval-in! user "weft::template {$text}" $ctx]
+}
+
+;; cursor inside "alpha" (pos 2): pasted on its own line below, cursor
+;; in the first hole
+weft::testhost::editor-multi-select! $_ted [list [list 2 2]]
+let _t1 [_tmpl {replace-all {} {}} #{buffer $_tb view $_tv}]
+gate "template evaluates" [get $_t1 ok]
+gate "template lands on its own line after the cursor's" \
+    [== "alpha\nreplace-all {} {}\nbeta\n\ngamma\n" [Lk::doc_text $_tdoc]]
+gate "cursor parks inside the first {} hole" \
+    [== [+ 6 13] [weft::testhost::editor-cursor $_ted]]
+gate "the paste is one undo step" \
+    [and [Lk::history_undo [get [weft::ws::buffer $_tb] hist] $_tdoc] \
+         [== "alpha\nbeta\n\ngamma\n" [Lk::doc_text $_tdoc]]]
+
+;; an EMPTY cursor line is taken in place (the scratch-buffer case)
+weft::testhost::editor-multi-select! $_ted [list [list 11 11]]
+_tmpl {wc -l} #{buffer $_tb view $_tv}
+gate "an empty line is taken in place" \
+    [== "alpha\nbeta\nwc -l\ngamma\n" [Lk::doc_text $_tdoc]]
+gate "no hole: cursor at the end of the paste" \
+    [== 16 [weft::testhost::editor-cursor $_ted]]
+
+;; a selection: after the line its END sits on
+_tmpl {upper} #{buffer $_tb view $_tv start 0 end 8}
+gate "with a selection the template follows its last line" \
+    [== "alpha\nbeta\nupper\nwc -l\ngamma\n" [Lk::doc_text $_tdoc]]
+
+;; no view at all: the tail
+let _tb2 [weft::ws::buffer-create! "tmpl2" "" "x"]
+_tmpl {y} #{buffer $_tb2}
+gate "no view: the template goes to the tail" \
+    [== "x\ny" [Lk::doc_text [weft::ws::buffer-doc $_tb2]]]
+
+let _t0 [_tmpl {y} #{}]
+gate "template without a buffer is an error" [not [get $_t0 ok]]
+
+puts "cmd gates: all passed"

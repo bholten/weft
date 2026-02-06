@@ -1,0 +1,72 @@
+;;; weft::error -- the structured error convention (plan section 5).
+;;;
+;;; Errors that cross module or host boundaries are dict values, not bare
+;;; strings.  Code vocabulary (capabilities and tasks use these):
+;;;   unsupported | denied | cancelled | invalid-args | host-failure
+;;; plus domain codes as modules need them.  Bare strings arriving from
+;;; catch are wrapped at the boundary with `from-caught`.
+namespace weft::error {
+
+    ;;; Make a structured error value from a code and a message.
+    ;;;
+    ;;; Examples:
+    ;;; >> let e [weft::error::make invalid-args "offset out of range"]
+    ;;; >> weft::error::code $e
+    ;;; "invalid-args"
+    ;;; >> weft::error::message $e
+    ;;; "offset out of range"
+    proc make {code message} {
+        return #{weft_error 1 code $code message $message data #{}}
+    }
+
+    ;;; Make a structured error value carrying extra data.
+    ;;;
+    ;;; Examples:
+    ;;; >> let e [weft::error::make-with denied "capability denied" #{"cap" "fs.read"}]
+    ;;; >> get [weft::error::data $e] "cap"
+    ;;; "fs.read"
+    proc make-with {code message data} {
+        return #{weft_error 1 code $code message $message data $data}
+    }
+
+    ;;; Is `v` a structured error value?
+    ;;;
+    ;;; Any dict carrying the `weft_error` marker key counts; every
+    ;;; other value does not.
+    ;;;
+    ;;; Examples:
+    ;;; >> weft::error::error? [weft::error::make cancelled "user stop"]
+    ;;; 1
+    ;;; >> weft::error::error? "an ordinary string"
+    ;;; 0
+    proc error? {v} {
+        if [not [dict? $v]] { return [int 0] }
+
+        return [has? $v weft_error]
+    }
+
+    ;;; The error's code.
+    proc code {e} { return [get $e code] }
+
+    ;;; The error's human-readable message.
+    proc message {e} { return [get $e message] }
+
+    ;;; The error's data dict (empty unless made with `make-with`).
+    proc data {e} { return [get $e data] }
+
+    ;;; Wrap a bare `catch` string as a host-failure error; a value
+    ;;; that already is a structured error passes through unchanged.
+    ;;;
+    ;;; Examples:
+    ;;; >> weft::error::code [weft::error::from-caught "exec failed: exit 127"]
+    ;;; "host-failure"
+    ;;; >> weft::error::message [weft::error::from-caught "exec failed: exit 127"]
+    ;;; "exec failed: exit 127"
+    ;;; >> weft::error::code [weft::error::from-caught [weft::error::make denied "no"]]
+    ;;; "denied"
+    proc from-caught {caught} {
+        if [weft::error::error? $caught] { return $caught }
+
+        return [weft::error::make host-failure $caught]
+    }
+}

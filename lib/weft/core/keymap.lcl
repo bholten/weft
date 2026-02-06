@@ -1,0 +1,331 @@
+;;; weft::keymap -- keybindings as data: ONE registry, chords by scope.
+;;;
+;;; Three writers, one table (docs/commands.md "Keys"):
+;;;
+;;;   intent!  -- the SHELL declares what it can do: a name (`Save`,
+;;;               `SplitH`, `BarClose`), the presentation scope the
+;;;               chord fires from (`pane`, `search_edit`, ...), a
+;;;               listing group, one line of doc, and the command
+;;;               form that does the same thing as a word, when one
+;;;               exists (`weft::split-h`).  lib/weft/ui/intents.lcl
+;;;               is the table; it is pure data and loads headless.
+;;;   chord!   -- a HOST PROFILE maps chords to intents
+;;;               (config/bindings-native.lcl).  Chords are per host;
+;;;               the intents and commands are not.
+;;;   bind!    -- CONFIG binds a chord to a script evaluated in the
+;;;               image with the focused buffer and selection as ctx
+;;;               (`weft::config::bind!` is the documented spelling;
+;;;               it forwards here).
+;;;
+;;; Every row carries the SOURCE that wrote it (native / user / live:
+;;; boot marks the source around the config files it loads; anything
+;;; bound afterwards -- REPL, *scratch* -- is live).  Resolution is
+;;; "later wins": for one (scope, chord) the last registered row is
+;;; the one the shell registers, and the rows it hides are kept in
+;;; the table marked `shadowed` -- the listing says who shadowed
+;;; what instead of silently dropping it.  That order is exactly the
+;;; load order, so init.lcl overrides the profile and a live bind!
+;;; overrides init.lcl with no precedence table at all.
+;;;
+;;; `table` is what the shell iterates to emit lk `keybinding` rows
+;;; (only `active` rows; a chord naming an intent nobody declared is
+;;; `unbound`, listed as a profile error, never registered), and what
+;;; `weft::keys` prints.  It is memoised on a generation counter, so
+;;; the per-frame DSL body pays a dict lookup, not a rebuild.
+namespace weft::keymap {
+
+    var _intents #{}
+    var _groups ()
+    var _rows ()
+    var _gestures ()
+    var _source live
+    var _gen 0
+    var _registered_gen -1
+    var _cache_gen -1
+    var _cache ()
+
+    ;;; Split a chord into its lk `keybinding` pieces: the last `+`
+    ;;; part is the key, the rest (joined) the mods -- "" for a bare
+    ;;; key.
+    ;;;
+    ;;;     >>> weft::keymap::parse-chord "ctrl+shift+return"
+    ;;;     #{chord ctrl+shift+return key return mods ctrl+shift}
+    ;;;     >>> get [weft::keymap::parse-chord "escape"] mods
+    ;;;
+    proc parse-chord {chord} {
+        let parts [String::split $chord "+"]
+        let n [len $parts]
+        let key [get $parts [- $n 1]]
+        var mods ""
+
+        if [> $n 1] {
+            set! mods [String::join [List::slice $parts 0 [- $n 1]] "+"]
+        }
+
+        return #{chord $chord key $key mods $mods}
+    }
+
+    ;;; The source stamped on rows registered from now on: boot sets
+    ;;; `native` around the system config, `user` around init.lcl,
+    ;;; then `live`.
+    proc source! {src} {
+        set! _source $src
+        return $src
+    }
+
+    proc source {} {
+        return $_source
+    }
+
+    proc _touch {} {
+        set! _gen [+ $_gen 1]
+    }
+
+    proc generation {} {
+        return $_gen
+    }
+
+    ;;; Declare (or redeclare) an intent: `spec` keys `scope`
+    ;;; (default pane), `group`, `doc`, `form`.  Groups keep their
+    ;;; first-registration order for the listing.
+    proc intent! {name spec} {
+        var s #{scope pane group "" doc "" form ""}
+        set! s [Dict::merge $s $spec]
+
+        ;; `scope` may be one ptype or a list of them (an intent that
+        ;; lives in several bars): `scopes` is always the list, and
+        ;; `scope` the display/shadowing key.
+        var scs [get $s scope]
+
+        if [not [list? $scs]] { set! scs [list $scs] }
+
+        set! s [Dict::merge $s \
+            #{name $name scopes $scs scope [String::join $scs "/"]}]
+        set! _intents [put $_intents $name $s]
+
+        let g [get $s group]
+
+        if [and [not [empty? $g]] [not [has? $_groups $g]]] {
+            set! _groups [List::push $_groups $g]
+        }
+
+        weft::keymap::_touch
+        return $name
+    }
+
+    proc intents {} {
+        return $_intents
+    }
+
+    proc intent {name} {
+        if [has? $_intents $name] { return [get $_intents $name] }
+
+        return #{}
+    }
+
+    ;;; Intent groups in registration order.
+    proc groups {} {
+        return $_groups
+    }
+
+    ;;; Profile row: `chord` fires intent `intent` (scope and doc come
+    ;;; from the intent at table time, so a profile may load before
+    ;;; the shell declares them).
+    proc chord! {chord intent} {
+        let p [weft::keymap::parse-chord $chord]
+        weft::keymap::_touch
+        set! _rows [List::push $_rows \
+            [Dict::merge $p \
+                #{kind intent intent $intent source $_source gen $_gen}]]
+        return $chord
+    }
+
+    ;;; Config row: `chord` evaluates `script` (scope pane).  `doc` is
+    ;;; the optional one-liner the listing shows beside the script.
+    proc bind! {chord script (doc "")} {
+        let p [weft::keymap::parse-chord $chord]
+        weft::keymap::_touch
+        set! _rows [List::push $_rows \
+            [Dict::merge $p \
+                #{kind script script $script doc $doc source $_source \
+                  gen $_gen}]]
+        return $chord
+    }
+
+    ;;; The shell says "I have registered the table as it is now".
+    ;;; Rows added after that are `pending` until it registers again
+    ;;; (it does, on the next frame, when lk exposes
+    ;;; clear_translators; else they wait for a restart) -- so the
+    ;;; table never claims a chord the widget does not have.  Before
+    ;;; any shell has registered (headless), nothing is pending.
+    proc registered! {} {
+        set! _registered_gen $_gen
+        set! _cache_gen -1
+        return $_gen
+    }
+
+    proc registered-gen {} {
+        return $_registered_gen
+    }
+
+    proc _pending? {r} {
+        if [< $_registered_gen 0] { return 0 }
+
+        return [> [get $r gen] $_registered_gen]
+    }
+
+    ;;; Registered rows in order, unresolved.
+    proc rows {} {
+        return $_rows
+    }
+
+    ;;; The script rows only -- `weft::config::bindings-list`'s
+    ;;; contract: #{chord key mods script ...}.
+    proc scripts {} {
+        var out ()
+
+        foreach r $_rows {
+            if [== script [get $r kind]] { set! out [List::push $out $r] }
+        }
+
+        return $out
+    }
+
+    ;;; A mouse gesture the shell owns, for the listing only (they
+    ;;; are translators + the raw handler, not rebindable chords).
+    proc gesture! {gesture doc} {
+        set! _gestures [List::push $_gestures #{gesture $gesture doc $doc}]
+        weft::keymap::_touch
+        return $gesture
+    }
+
+    proc gestures {} {
+        return $_gestures
+    }
+
+    ;;; The listing group of a script row, by its source.
+    proc source-group {src} {
+        if [== $src native] {
+            return "Host profile (config/bindings-native.lcl)"
+        }
+
+        if [== $src user] {
+            return "Your bindings (~/.config/weft/init.lcl)"
+        }
+
+        if [== $src live] { return "Bound live (this session)" }
+
+        return "Bound by $src"
+    }
+
+    proc _resolve-row {r} {
+        var st active
+
+        if [weft::keymap::_pending? $r] { set! st pending }
+
+        if [== script [get $r kind]] {
+            return [Dict::merge $r \
+                #{scope pane scopes (pane) \
+                  group [weft::keymap::source-group [get $r source]] \
+                  form [get $r script] command "" status $st}]
+        }
+
+        let nm [get $r intent]
+
+        if [not [has? $_intents $nm]] {
+            return [Dict::merge $r \
+                #{scope "" scopes () group "" doc "" form "" command "" \
+                  status unbound}]
+        }
+
+        let it [get $_intents $nm]
+
+        return [Dict::merge $r \
+            #{scope [get $it scope] scopes [get $it scopes] \
+              group [get $it group] doc [get $it doc] \
+              form [get $it form] command $nm status $st}]
+    }
+
+    ;;; The resolved table: every row with `scope group doc form
+    ;;; command status` filled in.  status: `active` (the shell
+    ;;; registers it) / `shadowed` (a later row took this scope+chord;
+    ;;; `shadowed_by` is that row's source) / `pending` (added after
+    ;;; the shell last registered; shadows nothing yet) / `unbound`
+    ;;; (no such intent).  Memoised per generation.
+    proc table {} {
+        if [== $_cache_gen $_gen] { return $_cache }
+
+        var res ()
+        var last #{}
+        var i 0
+
+        foreach r $_rows {
+            let row [weft::keymap::_resolve-row $r]
+            set! res [List::push $res $row]
+
+            if [== active [get $row status]] {
+                set! last [put $last "[get $row scope]|[get $row chord]" $i]
+            }
+
+            set! i [+ $i 1]
+        }
+
+        var out ()
+        set! i 0
+
+        foreach row $res {
+            var fin $row
+
+            if [== active [get $row status]] {
+                let k "[get $row scope]|[get $row chord]"
+                let w [get $last $k]
+
+                if [not [== $w $i]] {
+                    set! fin [Dict::merge $row \
+                        #{status shadowed shadowed_by [get [get $res $w] source]}]
+                }
+            }
+
+            set! out [List::push $out $fin]
+            set! i [+ $i 1]
+        }
+
+        set! _cache $out
+        set! _cache_gen $_gen
+        return $out
+    }
+
+    ;;; Every table row for `chord`, any scope and status -- what
+    ;;; "what does ctrl+s do?" needs.
+    proc lookup {chord} {
+        var out ()
+
+        foreach r [weft::keymap::table] {
+            if [== [get $r chord] $chord] { set! out [List::push $out $r] }
+        }
+
+        return $out
+    }
+
+    ;;; The active rows only, in table order.
+    proc active {} {
+        var out ()
+
+        foreach r [weft::keymap::table] {
+            if [== active [get $r status]] { set! out [List::push $out $r] }
+        }
+
+        return $out
+    }
+
+    ;;; Forget everything (tests).
+    proc reset! {} {
+        set! _intents #{}
+        set! _groups ()
+        set! _rows ()
+        set! _gestures ()
+        set! _registered_gen -1
+        weft::keymap::_touch
+        return ""
+    }
+}

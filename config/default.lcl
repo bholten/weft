@@ -1,0 +1,35 @@
+;; System default configuration.  User config (~/.config/weft/init.lcl)
+;; loads after this and may override any of it.
+
+weft::config::put! font_path "$weft_root/assets/fonts/Roboto_Mono/static/RobotoMono-Regular.ttf"
+weft::config::put! font_size 15
+weft::config::put! icon_path "$weft_root/assets/icons/icon.png"
+weft::config::put! window_width 1100
+weft::config::put! window_height 700
+
+;; Editor wrap mode: none | character | word -- the global default;
+;; per-filetype overrides below win.
+weft::config::put! wrap_mode character
+
+;; ---- per-filetype settings ----
+;; Prose word-wraps; code keeps the global default.
+weft::config::filetype! ".md" #{wrap word}
+weft::config::filetype! ".txt" #{wrap word}
+
+;; Languages: filetypes with a `lang` get tree-sitter highlighting
+;; when the host has that grammar (`ts.langs` capability lists them).
+weft::config::filetype! ".lcl" #{lang lcl}
+weft::config::filetype! ".c" #{lang c}
+weft::config::filetype! ".h" #{lang c}
+
+;; Buffers with no file behind them take their NAME as the filetype
+;; key, so the machine buffers configure like any extension.  These
+;; three hold Lcl: the REPL, the scratch buffer you land in with no
+;; file arguments, and the annotation editor's records.
+weft::config::filetype! "*lcl*" #{lang lcl}
+weft::config::filetype! "*scratch*" #{lang lcl}
+weft::config::filetype! "*annot-edit*" #{lang lcl}
+
+;; ---- default keybindings: a host profile ----
+;; Commands are portable; chords are per host.  See the file.
+load "$weft_config_dir/bindings-native.lcl"

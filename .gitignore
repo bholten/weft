@@ -1,0 +1,24 @@
+# Build artifacts
+build/
+
+# Compiled objects
+*.o
+*.a
+*.so
+*.dylib
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+compile_commands.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Emacs lock files
+.#*
+**/.#*

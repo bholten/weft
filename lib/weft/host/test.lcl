@@ -1,0 +1,277 @@
+;;; Test host (plan P1): fake capability bindings + fake editor hooks so
+;;; workspace tests run headless and deterministically.
+;;;
+;;; Loaded ON TOP of whatever host boot registered -- re-registering a
+;;; capability name replaces it, so after this file loads, fs.* and
+;;; id.new hit in-memory state.  Never loaded by boot; test scripts
+;;; require it themselves.
+
+namespace weft::testhost {
+
+    ;; ---- in-memory filesystem ----
+
+    var _fs #{}
+
+    ;; Fake mtimes: a global tick bumped on every write, so "the file
+    ;; changed since we recorded its mtime" is observable in tests
+    ;; without a clock.
+    var _fs_mtimes #{}
+    var _fs_tick 0
+
+    proc fs-put! {path text} {
+        set! _fs [put $_fs $path $text]
+        set! _fs_tick [+ $_fs_tick 1]
+        set! _fs_mtimes [put $_fs_mtimes $path $_fs_tick]
+        return $path
+    }
+
+    proc fs-mtime {path} {
+        if [has? $_fs_mtimes $path] { return [get $_fs_mtimes $path] }
+        return 0
+    }
+
+    proc fs-get {path} {
+        if [has? $_fs $path] { return [get $_fs $path] }
+        return ""
+    }
+
+    proc fs-has? {path} {
+        return [has? $_fs $path]
+    }
+
+    ;; ---- fake editors ----
+    ;;
+    ;; A fake editor is a dict in a registry: #{cursor N doc <handle>}.
+    ;; Handles are stable ids, so tests can check that rearranging panes
+    ;; never recreates an editor.
+
+    var _editors #{}
+    var _editor_counter 0
+
+    ;; Presentations recorded, not rendered: list of
+    ;; #{annot <id> ptype .. value #{}} per store is overkill -- tests
+    ;; only need the flat list.
+    var _presented ()
+
+    proc presented {} {
+        return $_presented
+    }
+
+    proc presented-reset! {} {
+        set! _presented ()
+        return ""
+    }
+
+    proc editor-make {doc hist store ft} {
+        set! _editor_counter [+ $_editor_counter 1]
+        let id "fed-$_editor_counter"
+        set! _editors [put $_editors $id #{cursor 0 sel () sels () doc $doc}]
+        return $id
+    }
+
+    proc editor-select! {ed start end} {
+        var st [get $_editors $ed]
+        set! st [put $st sel [list $start $end]]
+        set! st [put $st sels [list [list $start $end]]]
+        set! _editors [put $_editors $ed $st]
+        return ""
+    }
+
+    ;; A caret SET: ranges is ((start end) ...) in document order --
+    ;; (start start) spells a caret without a selection.  The first
+    ;; entry plays primary for the singular accessor.
+    proc editor-multi-select! {ed ranges} {
+        var st [get $_editors $ed]
+        set! st [put $st sels $ranges]
+
+        if [> [len $ranges] 0] {
+            let p [get $ranges 0]
+
+            if [== [get $p 0] [get $p 1]] {
+                set! st [put $st sel ()]
+                set! st [put $st cursor [get $p 0]]
+            } else {
+                set! st [put $st sel $p]
+            }
+        }
+
+        set! _editors [put $_editors $ed $st]
+        return ""
+    }
+
+    proc editor-selection {ed} {
+        return [get [get $_editors $ed] sel]
+    }
+
+    ;; Index-parallel caret-set report, the Lk::editor_selections
+    ;; shape: (start end) per caret, () for a caret with none.
+    proc editor-selections {ed} {
+        let st [get $_editors $ed]
+        var out ()
+
+        foreach s [get $st sels] {
+            if [== [get $s 0] [get $s 1]] {
+                set! out [List::push $out ()]
+            } else {
+                set! out [List::push $out $s]
+            }
+        }
+
+        if [> [len $out] 0] { return $out }
+
+        if [== 2 [len [get $st sel]]] {
+            return [list [get $st sel]]
+        }
+
+        return [list ()]
+    }
+
+    ;; Caret positions in document order (>= 1), the range END playing
+    ;; the cursor of a caret with a selection.
+    proc editor-carets {ed} {
+        let st [get $_editors $ed]
+        var out ()
+
+        foreach s [get $st sels] {
+            set! out [List::push $out [get $s 1]]
+        }
+
+        if [> [len $out] 0] { return $out }
+
+        if [== 2 [len [get $st sel]]] {
+            return [list [get [get $st sel] 1]]
+        }
+
+        return [list [get $st cursor]]
+    }
+
+    proc editor-free {ed} {
+        set! _editors [del $_editors $ed]
+        return 1
+    }
+
+    proc editor-alive? {ed} {
+        return [has? $_editors $ed]
+    }
+
+    proc editor-cursor {ed} {
+        return [get [get $_editors $ed] cursor]
+    }
+
+    proc editor-cursor-set! {ed pos} {
+        set! _editors [put $_editors $ed \
+            [put [get $_editors $ed] cursor $pos]]
+        return $pos
+    }
+
+    proc editor-snapshot {ed} {
+        return #{cursor [weft::testhost::editor-cursor $ed]}
+    }
+
+    proc editor-restore {ed snap} {
+        weft::testhost::editor-cursor-set! $ed [get $snap cursor]
+        return 1
+    }
+
+    proc editor-set-editable! {ed flag} {
+        set! _editors [put $_editors $ed
+            [put [get $_editors $ed] editable $flag]]
+        return 1
+    }
+
+    proc editor-editable {ed} {
+        let e [get $_editors $ed]
+
+        if [not [has? $e editable]] { return 1 }
+
+        return [get $e editable]
+    }
+
+    proc record-present {store annot_id ptype value} {
+        set! _presented [List::push $_presented \
+            #{annot $annot_id ptype $ptype value $value}]
+        return ""
+    }
+
+    ;; The hooks dict weft::ws::init! wants.
+    proc editor-hooks {} {
+        return #{make [lambda {doc hist store ft} {
+                    return [weft::testhost::editor-make $doc $hist $store $ft]
+                }]
+                free [lambda {ed} {
+                    return [weft::testhost::editor-free $ed]
+                }]
+                snapshot [lambda {ed} {
+                    return [weft::testhost::editor-snapshot $ed]
+                }]
+                restore [lambda {ed snap} {
+                    return [weft::testhost::editor-restore $ed $snap]
+                }]
+                set_editable [lambda {ed flag} {
+                    return [weft::testhost::editor-set-editable! $ed $flag]
+                }]
+                present [lambda {store annot_id ptype value} {
+                    return [weft::testhost::record-present $store \
+                        $annot_id $ptype $value]
+                }]
+                selection [lambda {ed} {
+                    return [weft::testhost::editor-selection $ed]
+                }]
+                selections [lambda {ed} {
+                    return [weft::testhost::editor-selections $ed]
+                }]
+                carets [lambda {ed} {
+                    return [weft::testhost::editor-carets $ed]
+                }]}
+    }
+}
+
+;; ---- capability overrides ----
+
+weft::cap::register #{name "fs.read"
+    description "TEST: read from the in-memory filesystem"
+    args "path" returns "string"
+    invoke [lambda {argd ctx} {
+        let p [get $argd path]
+        if [not [::weft::testhost::fs-has? $p]] {
+            error "test fs: no such file: $p"
+        }
+        return [::weft::testhost::fs-get $p]
+    }]}
+
+weft::cap::register #{name "fs.write"
+    description "TEST: write to the in-memory filesystem"
+    args "path text" returns "1"
+    invoke [lambda {argd ctx} {
+        ::weft::testhost::fs-put! [get $argd path] [get $argd text]
+        return 1
+    }]}
+
+weft::cap::register #{name "fs.exists?"
+    description "TEST: whether an in-memory path exists"
+    args "path" returns "0/1"
+    invoke [lambda {argd ctx} {
+        return [::weft::testhost::fs-has? [get $argd path]]
+    }]}
+
+weft::cap::register #{name "fs.mkdir"
+    description "TEST: directories are implicit in the fake fs"
+    args "path" returns "1"
+    invoke [lambda {argd ctx} { return 1 }]}
+
+weft::cap::register #{name "fs.mtime"
+    description "TEST: write-tick mtime from the fake fs"
+    args "path" returns "int"
+    invoke [lambda {argd ctx} {
+        return [::weft::testhost::fs-mtime [get $argd path]]
+    }]}
+
+var _test_id_counter 0
+
+weft::cap::register #{name "id.new"
+    description "TEST: deterministic id sequence"
+    args "" returns "string"
+    invoke [lambda {argd ctx} {
+        set! _test_id_counter [+ $_test_id_counter 1]
+        return "t$_test_id_counter"
+    }]}

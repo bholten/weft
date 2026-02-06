@@ -1,0 +1,397 @@
+;; P5 acceptance gates, stage A: the wire codec + persistence root.
+;;   weft --headless test/p5-gates.lcl
+;; Durable files are wire-encoded portable values in envelope wrappers;
+;; the doc registry mints stable ids in the data dir.  Persisted data
+;; is decoded, never evaluated.
+
+proc gate {name ok} {
+    if [not $ok] { error "GATE FAILED: $name" }
+    puts "ok: $name"
+}
+
+require "weft/host/test.lcl"
+
+weft::ws::init! [weft::testhost::editor-hooks]
+
+;; The persistence root writes into the fake fs.
+weft::config::put! data_dir "/data"
+weft::persist::reset!
+
+;; ---- wire codec ----
+
+;; NB round-trip inputs are BRACED where they carry $, [, or quotes --
+;; the codec must preserve raw bytes that lcl's own quoting cannot.
+proc rt? {v} {
+    let dec [weft::wire::decode [weft::wire::encode $v]]
+
+    if [weft::error::error? $dec] { return 0 }
+
+    return [== $dec $v]
+}
+
+gate "wire: ints round-trip typed" \
+    [and [rt? [+ 41 1]] [int? [weft::wire::decode "42"]]]
+gate "wire: floats round-trip" [rt? [/ 5.0 8.0]]
+gate "wire: strings with \$ \[ \] round-trip" [rt? {a $var [cmd] end}]
+gate "wire: quotes and backslashes round-trip" [rt? {say "hi" \ \\ done}]
+gate "wire: unbalanced braces round-trip" \
+    [and [rt? "open \{ brace"] [rt? "close \} brace"]]
+gate "wire: raw newlines round-trip" [rt? "line one\nline two\n"]
+gate "wire: empty containers round-trip" [and [rt? ()] [rt? #{}]]
+gate "wire: nesting round-trips" \
+    [rt? #{k (1 2 #{deep "yes"}) other "v"}]
+gate "wire: dict encoding is key-sorted (deterministic)" \
+    [== [weft::wire::encode #{b 2 a 1}] [weft::wire::encode #{a 1 b 2}]]
+
+var _mal_ok 1
+
+foreach _bad ("(1 2" "\"open" "42 junk" "#\{k 1\}" "#\{\"k\"\}" "") {
+    if [not [weft::error::error? [weft::wire::decode $_bad]]] {
+        set! _mal_ok 0
+    }
+}
+
+gate "wire: malformed input yields structured errors" $_mal_ok
+
+;; A handle must refuse to encode (runtime references never persist).
+let _hb [weft::ws::buffer-create! "h" "" "x"]
+var _h_r ""
+var _h_e ""
+gate "wire: handles refuse to encode" \
+    [not [== 0 [catch { \
+        weft::wire::encode #{d [weft::ws::buffer-doc $_hb]} } _h_r _h_e]]]
+
+;; ---- envelope-wrapped file IO ----
+
+let _w [weft::persist::write-value! "/data/probe" probe #{n 7}]
+gate "write-value! reports success" [== 1 $_w]
+
+let _rv [weft::persist::read-value "/data/probe" probe]
+gate "read-value returns the payload" [== 7 [get $_rv n]]
+gate "read-value rejects a kind mismatch" \
+    [weft::error::error? [weft::persist::read-value "/data/probe" other]]
+gate "read-value on a missing file is a structured error" \
+    [weft::error::error? [weft::persist::read-value "/data/absent" probe]]
+
+;; Corrupt bytes decode to an error, never evaluate: if this string
+;; were eval'd the sentinel would flip.  (NB braced -- quoting it
+;; would run the substitution right here in the gate.)
+var _sentinel 0
+weft::testhost::fs-put! "/data/evil" {[set! _sentinel 1]}
+gate "corrupt store files never evaluate" \
+    [and [weft::error::error? [weft::persist::read-value "/data/evil" probe]] \
+         [== 0 $_sentinel]]
+
+;; ---- data dir + doc registry ----
+
+gate "data dir honors config" [== "/data" [weft::persist::data-dir]]
+
+let _id1 [weft::persist::doc-id "/src/a.c"]
+let _id2 [weft::persist::doc-id "/src/b.c"]
+gate "doc ids are minted per path" \
+    [and [not [empty? $_id1]] [not [== $_id1 $_id2]]]
+gate "doc ids are stable across asks" \
+    [== $_id1 [weft::persist::doc-id "/src/a.c"]]
+
+;; The registry survives an image restart (reset! forgets memory; the
+;; fake fs keeps the file).
+weft::persist::reset!
+weft::config::put! data_dir "/data"
+gate "doc ids survive a reload from disk" \
+    [== $_id1 [weft::persist::doc-id "/src/a.c"]]
+
+;; mtime bookkeeping: recorded at save, compared at load (P5-B's
+;; staleness fast path).
+weft::testhost::fs-put! "/src/a.c" "int main;"
+
+let _mt [weft::persist::file-mtime "/src/a.c"]
+gate "file mtimes are visible" [> $_mt 0]
+
+weft::persist::record-mtime! "/src/a.c" $_mt
+gate "recorded mtime reads back" \
+    [== $_mt [weft::persist::saved-mtime "/src/a.c"]]
+
+weft::testhost::fs-put! "/src/a.c" "int main; /* edited */"
+gate "a rewrite moves the file mtime past the recorded one" \
+    [> [weft::persist::file-mtime "/src/a.c"] \
+       [weft::persist::saved-mtime "/src/a.c"]]
+gate "unregistered paths report mtime 0" \
+    [== 0 [weft::persist::saved-mtime "/src/nope.c"]]
+
+;; ---- stage B: context anchors ----
+
+let _atext "alpha beta gamma delta epsilon zeta eta theta"
+
+let _cap [weft::anchor::capture $_atext 11]
+gate "anchor capture windows the position" \
+    [and [== 11 [get $_cap approx]] \
+         [and [== "alpha beta " [get $_cap before]] \
+              [== "gamma delta epsilon zeta eta the" [get $_cap after]]]]
+
+let _r1 [weft::anchor::resolve $_atext $_cap]
+gate "unchanged text resolves ok at full confidence" \
+    [and [== 11 [get $_r1 pos]] \
+         [and [== ok [get $_r1 status]] [== 100 [get $_r1 confidence]]]]
+
+;; An insertion ahead of the anchor shifts it; context still matches.
+let _r2 [weft::anchor::resolve "PREFIX! $_atext" $_cap]
+gate "shifted text re-anchors exactly" \
+    [and [== 19 [get $_r2 pos]] [== ok [get $_r2 status]]]
+
+;; Only the before-context survives this rewrite.
+let _r3 [weft::anchor::resolve "alpha beta ZZZ" $_cap]
+gate "partial context is fuzzy, not orphaned" \
+    [and [== fuzzy [get $_r3 status]] \
+         [and [> [get $_r3 confidence] 0] \
+              [< [get $_r3 confidence] 100]]]
+
+let _r4 [weft::anchor::resolve "nothing in common here" $_cap]
+gate "lost context is orphaned at confidence 0" \
+    [and [== orphaned [get $_r4 status]] [== 0 [get $_r4 confidence]]]
+
+;; Ambiguity: periodic text makes the context match at several
+;; offsets; the occurrence closest to the recorded one wins, at
+;; reduced confidence.
+var _amb ""
+var _i 0
+
+while [< $_i 12] {
+    set! _amb "${_amb}rhythm "
+    set! _i [+ $_i 1]
+}
+
+let _acap [weft::anchor::capture $_amb 42]
+let _r5 [weft::anchor::resolve $_amb $_acap]
+gate "ambiguous context picks the closest occurrence" \
+    [and [== 42 [get $_r5 pos]] \
+         [and [== ok [get $_r5 status]] [< [get $_r5 confidence] 100]]]
+
+;; ---- stage B: annotations at rest ----
+
+weft::testhost::fs-put! "/notes/essay.txt" "one two three four five six"
+
+let _eb [weft::ws::buffer-open! "/notes/essay.txt" #{}]
+let _estore [weft::ws::buffer-store $_eb]
+
+Lk::annot_layer_register $_estore "notes"
+Lk::annot_add $_estore 4 13 "notes" #{kind "remark" who "gate"}
+
+;; A derived layer must NOT persist (search is a defined producer).
+weft::producer::attach! $_eb search
+weft::search::query! $_eb "two"
+weft::producer::tick! $_eb
+gate "derived layer is live before save" \
+    [> [len [Lk::annot_by_layer $_estore "search"]] 0]
+
+gate "save persists exactly the authored annotations" \
+    [== 1 [weft::persist::annots-save! $_eb]]
+
+;; Reopen: exact fast path (file untouched since the save).
+weft::search::clear! $_eb
+weft::ws::buffer-close! $_eb 0
+
+let _eb2 [weft::ws::buffer-open! "/notes/essay.txt" #{}]
+let _estore2 [weft::ws::buffer-store $_eb2]
+let _notes2 [Lk::annot_by_layer $_estore2 "notes"]
+gate "reopen restores the authored annotation" [== 1 [len $_notes2]]
+
+let _sp2 [Lk::annot_span $_estore2 [get $_notes2 0]]
+gate "unchanged file restores exact offsets" \
+    [and [== 4 [get $_sp2 0]] [== 13 [get $_sp2 1]]]
+gate "metadata rides through persistence" \
+    [== "remark" [Lk::annot_meta $_estore2 [get $_notes2 0] kind]]
+gate "no orphans on a clean round-trip" \
+    [== 0 [len [weft::persist::orphans $_eb2]]]
+
+;; External edit: a prefix insertion means offsets are stale and the
+;; annotation must re-anchor to the shifted span.
+weft::ws::buffer-close! $_eb2 0
+weft::testhost::fs-put! "/notes/essay.txt" "zero one two three four five six"
+
+let _eb3 [weft::ws::buffer-open! "/notes/essay.txt" #{}]
+let _estore3 [weft::ws::buffer-store $_eb3]
+let _notes3 [Lk::annot_by_layer $_estore3 "notes"]
+gate "externally edited file re-anchors the annotation" \
+    [== 1 [len $_notes3]]
+
+let _sp3 [Lk::annot_span $_estore3 [get $_notes3 0]]
+gate "re-anchored span tracks the shift" \
+    [and [== 9 [get $_sp3 0]] [== 18 [get $_sp3 1]]]
+
+;; Save from the re-anchored state, then destroy the context: the
+;; annotation must come back as an orphan, parked not attached.
+weft::ws::buffer-save! $_eb3 #{}
+weft::ws::buffer-close! $_eb3 0
+weft::testhost::fs-put! "/notes/essay.txt" "utterly different content now"
+
+let _eb4 [weft::ws::buffer-open! "/notes/essay.txt" #{}]
+let _estore4 [weft::ws::buffer-store $_eb4]
+gate "lost context attaches nothing" \
+    [== 0 [len [Lk::annot_by_layer $_estore4 "notes"]]]
+gate "the lost annotation is parked as an orphan" \
+    [== 1 [len [weft::persist::orphans $_eb4]]]
+gate "orphans keep their record (layer + meta)" \
+    [== "notes" [get [get [weft::persist::orphans $_eb4] 0] layer]]
+
+;; Orphans survive a save/reload cycle until adopted or dropped.
+weft::ws::buffer-save! $_eb4 #{}
+weft::ws::buffer-close! $_eb4 0
+
+let _eb5 [weft::ws::buffer-open! "/notes/essay.txt" #{}]
+gate "orphans carry forward across sessions" \
+    [== 1 [len [weft::persist::orphans $_eb5]]]
+
+;; Annotation-only change on a clean buffer persists via close.
+let _cstore [weft::ws::buffer-store $_eb5]
+Lk::annot_layer_register $_cstore "notes"
+Lk::annot_add $_cstore 0 7 "notes" #{kind "second"}
+weft::ws::buffer-close! $_eb5 0
+
+let _eb6 [weft::ws::buffer-open! "/notes/essay.txt" #{}]
+gate "clean-close persists annotation-only changes" \
+    [== 1 [len [Lk::annot_by_layer [weft::ws::buffer-store $_eb6] "notes"]]]
+
+;; ---- stage C: the orphan flow ----
+;; _eb6 is open with one attached "notes" annotation and one parked
+;; orphan (the original remark whose context was destroyed).
+
+gate "orphan indices out of range are structured errors" \
+    [and [weft::error::error? [weft::persist::orphan-adopt! $_eb6 5 0 4]] \
+         [weft::error::error? [weft::persist::orphan-drop! $_eb6 -1]]]
+
+;; Adopt the orphan onto a chosen span: it re-attaches with its layer
+;; and metadata and leaves the parked list.
+let _adopted [weft::persist::orphan-adopt! $_eb6 0 8 17]
+gate "adopt re-attaches the orphan" \
+    [not [weft::error::error? $_adopted]]
+gate "adopted orphan leaves the parked list" \
+    [== 0 [len [weft::persist::orphans $_eb6]]]
+
+let _estore6 [weft::ws::buffer-store $_eb6]
+let _sp6 [Lk::annot_span $_estore6 $_adopted]
+gate "adopted annotation sits on the chosen span" \
+    [and [== 8 [get $_sp6 0]] [== 17 [get $_sp6 1]]]
+gate "adopted annotation keeps its metadata" \
+    [== "remark" [Lk::annot_meta $_estore6 $_adopted kind]]
+
+;; The adoption persists: fresh anchors are captured from the adopted
+;; span on the way out.
+weft::ws::buffer-close! $_eb6 0
+
+let _eb7 [weft::ws::buffer-open! "/notes/essay.txt" #{}]
+gate "adoption survives a reload" \
+    [== 2 [len [Lk::annot_by_layer [weft::ws::buffer-store $_eb7] "notes"]]]
+gate "no orphans after adoption round-trip" \
+    [== 0 [len [weft::persist::orphans $_eb7]]]
+
+let _rep7 [weft::persist::load-report $_eb7]
+gate "load report counts the resolutions" \
+    [and [== 2 [get $_rep7 ok]] \
+         [and [== 0 [get $_rep7 fuzzy]] [== 0 [get $_rep7 orphaned]]]]
+
+;; Drop: orphan a record again, then discard it for good.
+weft::ws::buffer-close! $_eb7 0
+weft::testhost::fs-put! "/notes/essay.txt" "completely new life for this file"
+
+let _eb8 [weft::ws::buffer-open! "/notes/essay.txt" #{}]
+gate "rewrite orphans both annotations" \
+    [== 2 [len [weft::persist::orphans $_eb8]]]
+gate "load report counts new orphans" \
+    [== 2 [get [weft::persist::load-report $_eb8] orphaned]]
+
+weft::persist::orphan-drop! $_eb8 0
+gate "drop removes exactly one orphan" \
+    [== 1 [len [weft::persist::orphans $_eb8]]]
+
+;; The drop is durable: close (clean) persists the shrunken list.
+weft::ws::buffer-close! $_eb8 0
+
+let _eb9 [weft::ws::buffer-open! "/notes/essay.txt" #{}]
+gate "dropped orphans stay dropped across sessions" \
+    [== 1 [len [weft::persist::orphans $_eb9]]]
+
+;; The api surface reads ctx like any command: orphans lists, adopt
+;; needs a selection.
+let _api_out [weft::image::eval-in! user {weft::orphans} #{buffer $_eb9}]
+gate "weft::orphans lists via execution ctx" \
+    [and [get $_api_out ok] \
+         [>= [String::find [get $_api_out value] "#0"] 0]]
+
+;; Inspector surfaces the parked orphan.
+let _insp [weft::inspect::report #{buffer $_eb9 pos 0}]
+gate "inspector shows parked orphans" \
+    [>= [String::find $_insp "orphan(s) parked"] 0]
+
+;; ---- stage D: sessions ----
+
+weft::testhost::fs-put! "/proj/main.c" "int main(void) { return 0; }\n"
+weft::testhost::fs-put! "/proj/util.c" "static int util;\n"
+
+;; A real shape: main | (util / jot), ratio 0.3 on the outer split,
+;; cursor parked in main, focus on main.
+weft::ws::init! [weft::testhost::editor-hooks]
+
+let _sb1 [weft::ws::buffer-open! "/proj/main.c" #{}]
+let _sp1 [weft::ws::tree-init! [weft::ws::view-create! $_sb1]]
+
+let _sb2 [weft::ws::buffer-open! "/proj/util.c" #{}]
+let _sp2 [weft::ws::pane-split! $_sp1 h $_sb2]
+
+weft::ws::split-ratio-set! [get [weft::ws::node $_sp2] parent] 0.3
+
+let _sb3 [weft::ws::buffer-create! "*jot*" "" ";; ephemeral\n"]
+let _sp3 [weft::ws::pane-split! $_sp2 v $_sb3]
+
+weft::ws::view-restore! [weft::ws::pane-view $_sp1] #{cursor 5}
+weft::ws::focus! $_sp1
+
+gate "session saves" [== 1 [weft::session::save!]]
+gate "session file exists in the data dir" \
+    [weft::testhost::fs-has? "/data/session"]
+
+;; Image restart: fresh workspace, single boot pane.
+weft::ws::init! [weft::testhost::editor-hooks]
+
+let _fresh [weft::ws::buffer-create! "*scratch*" "" ""]
+
+weft::ws::tree-init! [weft::ws::view-create! $_fresh]
+gate "session restores" [== 1 [weft::session::restore! #{}]]
+gate "restore rebuilds all panes" [== 3 [len [weft::ws::panes]]]
+
+let _rroot [weft::ws::node [weft::ws::tree-root]]
+gate "outer split keeps its axis and ratio" \
+    [and [== split [get $_rroot kind]] \
+         [and [== h [get $_rroot axis]] [== 0.3 [get $_rroot ratio]]]]
+
+let _rinner [weft::ws::node [get $_rroot b]]
+gate "inner split keeps its axis" \
+    [and [== split [get $_rinner kind]] [== v [get $_rinner axis]]]
+
+proc pane-path {pid} {
+    return [get [weft::ws::buffer \
+        [weft::ws::view-buffer [weft::ws::pane-view $pid]]] path]
+}
+
+proc pane-name {pid} {
+    return [get [weft::ws::buffer \
+        [weft::ws::view-buffer [weft::ws::pane-view $pid]]] name]
+}
+
+gate "file panes reopen their paths" \
+    [and [== "/proj/main.c" [pane-path [get $_rroot a]]] \
+         [== "/proj/util.c" [pane-path [get $_rinner a]]]]
+gate "scratch panes come back by name, content ephemeral" \
+    [and [== "*jot*" [pane-name [get $_rinner b]]] \
+         [== 0 [Lk::doc_len [weft::ws::buffer-doc \
+            [weft::ws::view-buffer [weft::ws::pane-view [get $_rinner b]]]]]]]
+gate "focus lands where it was" \
+    [== "/proj/main.c" [pane-path [weft::ws::focused-pane]]]
+gate "the cursor survives in the focused view" \
+    [== 5 [get [weft::ws::view-snapshot \
+        [weft::ws::pane-view [weft::ws::focused-pane]]] cursor]]
+
+gate "restore refuses a non-fresh workspace" \
+    [weft::error::error? [weft::session::restore! #{}]]
+
+puts ""
+puts "P5 STAGE A+B+C+D GATES PASSED"

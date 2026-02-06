@@ -1,0 +1,5 @@
+puts "Hello!"
+
+let foo 42
+
+puts $foo

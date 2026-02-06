@@ -1,0 +1,69 @@
+;;; weft::cap -- the capability registry: the one host interface
+;;; (plan section 4).
+;;;
+;;; Every host effect is a registered capability: descriptive metadata
+;;; plus an invoke function.  Registration is data, so this registry also
+;;; powers menus, documentation, and the inspector.
+;;;
+;;; Descriptor shape:
+;;;   #{name "fs.read" description "..." args "..." returns "..."
+;;;     invoke [lambda {argd ctx} { ... }]}
+;;;
+;;; invoke functions receive (args-dict, ctx-dict) and either return a
+;;; plain value (wrapped into a succeeded task), return a task
+;;; themselves, or raise -- raises become failed tasks with structured
+;;; errors.  availability vs permission are distinct questions from day
+;;; one; policy is permissive until untrusted documents exist.
+
+namespace weft::cap {
+
+    var registry #{}
+
+    proc register {desc} {
+        set! registry [put $registry [get $desc name] $desc]
+        return [get $desc name]
+    }
+
+    proc available? {name} {
+        return [has? $registry $name]
+    }
+
+    ;; Policy hook.  Initially allowed? == available?; the distinction
+    ;; exists so availability never hardens into authorization.
+    proc allowed? {name ctx} {
+        return [weft::cap::available? $name]
+    }
+
+    proc names {} {
+        return [List::sort [Dict::keys $registry]]
+    }
+
+    proc describe {name} {
+        if [not [has? $registry $name]] { return #{} }
+        return [get $registry $name]
+    }
+
+    ;; Invoke a capability.  Always returns a task.
+    proc invoke {name argd ctx} {
+        if [not [has? $registry $name]] {
+            return [weft::task::failed [weft::error::make unsupported \
+                "capability '$name' is not available on this host"]]
+        }
+
+        if [not [weft::cap::allowed? $name $ctx]] {
+            return [weft::task::failed [weft::error::make denied \
+                "capability '$name' is not permitted in this context"]]
+        }
+
+        let fn [get [get $registry $name] invoke]
+        var r ""
+        var e ""
+
+        if [== 0 [catch { apply $fn $argd $ctx } r e]] {
+            if [weft::task::task? $r] { return $r }
+            return [weft::task::done $r]
+        }
+
+        return [weft::task::failed [weft::error::from-caught $e]]
+    }
+}

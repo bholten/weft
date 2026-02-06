@@ -1,0 +1,712 @@
+;;; weft::filter -- the selection through a program (command pipeline
+;;; stage D, docs/commands.md "Filters").  Acme's | < > as vocabulary
+;;; first, notation second:
+;;;
+;;;   pipe    |cmd   range -> stdin, stdout REPLACES the range
+;;;   insert  <cmd   no stdin,         stdout REPLACES the range
+;;;                  (a zero-width range at the cursor = insert)
+;;;   send    >cmd   range -> stdin, stdout streams to *output*
+;;;
+;;; `cmd` runs through /bin/sh -c in the buffer's cwd (pipelines inside
+;;; it work).  The range is EXACTLY ctx start/end (or a zero-width
+;;; range at ctx pos) -- no newline cleverness.  The replacement is a
+;;; revision-checked plan committed as ONE transaction through
+;;; weft::transform::commit!: a filter is an async task, and if the
+;;; buffer changed while it ran the result goes to *output* instead of
+;;; the document (nothing lost, nothing clobbered).  A non-zero exit
+;;; leaves the source untouched.  Every filter leaves a run record
+;;; (provider `filter`) and the root `cmd` annotation like any other
+;;; process route.
+;;;
+;;; Input is fed to the child in bounded chunks per frame while stdout
+;;; and stderr are drained, so an echoing filter cannot deadlock on a
+;;; full pipe; the host ignores SIGPIPE, so a child that exits early
+;;; just ends the feed.
+
+namespace weft::filter {
+
+    var _jobs #{}
+    var _seq 0
+    var _events ()
+    var _chunk 16384
+    var _groups #{}
+    var _gseq 0
+
+    ;; ---- events for the UI: async outcomes the shell flashes ----
+    ;; #{kind done form note surface 0/1 review 0/1 status}
+
+    proc _event! {ev} {
+        set! _events [List::push $_events $ev]
+        return ""
+    }
+
+    proc take-events! {} {
+        let evs $_events
+        set! _events ()
+        return $evs
+    }
+
+    ;; ---- the operand ranges ----
+
+    ;; The ranges a filter maps over, most specific first: an explicit
+    ;; operand (ONE range, possibly in another buffer -- it carries
+    ;; its buffer) · the ctx selection SET (`selections`, the lk
+    ;; caret set: N disjoint ranges in document order; zero-width
+    ;; entries spell carets) · start/end · a zero-width range at pos.
+    ;; Returns a LIST of #{start end} dicts -- () when the ctx carries
+    ;; no range at all.
+    proc ranges-of {ctx} {
+        if [has? $ctx operand] {
+            let o [get $ctx operand]
+
+            if [and [dict? $o] [has? $o start]] {
+                return [list #{start [get $o start] end [get $o end]
+                    buffer [get $o buffer]}]
+            }
+        }
+
+        if [has? $ctx selections] {
+            let sels [get $ctx selections]
+
+            if [and [list? $sels] [> [len $sels] 0]] {
+                var out ()
+
+                foreach s $sels {
+                    if [== 2 [len $s]] {
+                        set! out [List::push $out \
+                            #{start [get $s 0] end [get $s 1]}]
+                    }
+                }
+
+                if [> [len $out] 0] { return $out }
+            }
+        }
+
+        if [and [has? $ctx start] [has? $ctx end]] {
+            return [list #{start [get $ctx start] end [get $ctx end]}]
+        }
+
+        if [has? $ctx pos] {
+            return [list #{start [get $ctx pos] end [get $ctx pos]}]
+        }
+
+        return ()
+    }
+
+    proc _glyph {mode} {
+        if [== $mode insert] { return "<" }
+        if [== $mode send] { return ">" }
+        return "|"
+    }
+
+    ;; ---- starting one ----
+
+    ;; run! mode cmdline ctx ?opts  -> pending task (or failed)
+    ;; opts: #{preview 1} pends the replacement as a transform plan.
+    proc run! {mode cmdline ctx *rest} {
+        var opts #{}
+
+        if [> [len $rest] 0] { set! opts [get $rest 0] }
+
+        if [not [or [== $mode pipe] [or [== $mode insert] [== $mode send]]]] {
+            return [weft::task::failed [weft::error::make invalid-args \
+                "filter: unknown mode '$mode' (pipe insert send)"]]
+        }
+
+        let cmd [String::trim $cmdline]
+
+        if [empty? $cmd] {
+            return [weft::task::failed [weft::error::make invalid-args \
+                {filter: no command}]]
+        }
+
+        let rgs [weft::filter::ranges-of $ctx]
+        var bid [weft::ctx::field $ctx buffer]
+
+        if [and [> [len $rgs] 0] [has? [get $rgs 0] buffer]] {
+            set! bid [get [get $rgs 0] buffer]
+        }
+
+        if [or [empty? $bid] [not [weft::ws::buffer? $bid]]] {
+            return [weft::task::failed [weft::error::make invalid-args \
+                {filter: no buffer in ctx}]]
+        }
+
+        if [== 0 [len $rgs]] {
+            if [== $mode insert] {
+                return [weft::task::failed [weft::error::make invalid-args \
+                    {filter: <cmd needs a selection or a cursor in ctx}]]
+            }
+
+            return [weft::task::failed [weft::error::make invalid-args \
+                "filter: [weft::filter::_glyph $mode]cmd needs a selection (ctrl+p applies one to the focused view's selection)"]]
+        }
+
+        let doc [weft::ws::buffer-doc $bid]
+        let dlen [Lk::doc_len $doc]
+        let sorted [List::sort_by $rgs [lambda {r} { return [get $r start] }]]
+        var prev_end 0
+
+        foreach r $sorted {
+            let start [get $r start]
+            let end [get $r end]
+
+            if [or [< $start 0] [or [> $end $dlen] [> $start $end]]] {
+                return [weft::task::failed [weft::error::make invalid-args \
+                    "filter: range $start..$end is outside the buffer (0..$dlen)"]]
+            }
+
+            if [< $start $prev_end] {
+                return [weft::task::failed [weft::error::make invalid-args \
+                    "filter: ranges overlap at $start (a caret set is disjoint)"]]
+            }
+
+            set! prev_end $end
+        }
+
+        var preview 0
+
+        if [has? $opts preview] { set! preview [get $opts preview] }
+
+        ;; One range: one job, exactly as ever.
+        if [== 1 [len $sorted]] {
+            return [weft::filter::_start! $mode $cmd $ctx $bid \
+                [get $sorted 0] #{preview $preview}]
+        }
+
+        ;; N ranges (the selection set): N runs of the same program.
+        ;; send jobs are independent (the sink frames interleaved
+        ;; lines safely); pipe/insert jobs JOIN -- every result into
+        ;; ONE ascending plan, committed as ONE transaction when the
+        ;; last child exits (all ranges land, or none do).
+        var gid ""
+
+        if [not [== $mode send]] {
+            set! _gseq [+ $_gseq 1]
+            set! gid "fgroup-$_gseq"
+            set! _groups [put $_groups $gid #{form \
+                "[weft::filter::_glyph $mode]$cmd" mode $mode
+                expect [len $sorted] got 0 aborted 0 results #{}
+                buffer $bid base_rev [Lk::doc_revision $doc]
+                out [weft::shell::out-buffer! $ctx] preview $preview}]
+        }
+
+        var first ""
+        var started ()
+        var idx 0
+
+        foreach r $sorted {
+            let t [weft::filter::_start! $mode $cmd $ctx $bid $r \
+                #{preview $preview group $gid idx $idx}]
+
+            if [not [== [weft::task::state $t] pending]] {
+                ;; A spawn refused mid-fan-out: cancel what started;
+                ;; nothing has touched the document yet.
+                foreach stid $started { weft::tasks::cancel! $stid }
+
+                if [not [empty? $gid]] {
+                    set! _groups [del $_groups $gid]
+                }
+
+                return $t
+            }
+
+            set! started [List::push $started [get $t id]]
+
+            if [empty? $first] { set! first [get $t id] }
+
+            set! idx [+ $idx 1]
+        }
+
+        return [weft::task::pending $first]
+    }
+
+    ;; Spawn ONE filter job over one range.  jopts: #{preview 0/1
+    ;; group gid idx i} -- an empty group means a lone job that
+    ;; commits (or previews) its own result.
+    proc _start! {mode cmd ctx bid rg jopts} {
+        let doc [weft::ws::buffer-doc $bid]
+        let start [get $rg start]
+        let end [get $rg end]
+        var input ""
+
+        if [not [== $mode insert]] {
+            set! input [String::range [Lk::doc_text $doc] $start $end]
+        }
+
+        let cwd [weft::cmd::ctx-cwd $ctx]
+        let argv ("/bin/sh" "-c" $cmd)
+        var spawn_args #{argv $argv merge 0}
+
+        if [not [empty? $cwd]] {
+            set! spawn_args [put $spawn_args cwd $cwd]
+        }
+
+        let spawn_t [weft::cap::invoke "process.spawn" $spawn_args $ctx]
+
+        if [not [== [weft::task::state $spawn_t] succeeded]] {
+            return $spawn_t
+        }
+
+        let h [weft::task::result $spawn_t]
+        let out [weft::shell::out-buffer! $ctx]
+        let exec_id [weft::ctx::field $ctx execution]
+        set! _seq [+ $_seq 1]
+        let tid "filter-$_seq"
+        let form "[weft::filter::_glyph $mode]$cmd"
+        let ostart [Lk::doc_len [weft::ws::buffer-doc $out]]
+
+        weft::shell::_append! $out "$form\n"
+
+        let rid [weft::cmd::run-start! #{form $form provider {filter}
+            cwd $cwd argv $argv buffer $out task $tid start $ostart
+            end [Lk::doc_len [weft::ws::buffer-doc $out]]}]
+        var sid ""
+
+        if [== $mode send] { set! sid [weft::sink::open! $out] }
+
+        var j #{mode $mode form $form cmdline $cmd
+            input $input offset 0 stdin_open 1 stdout "" stderr ""
+            buffer $bid start $start end $end
+            base_rev [Lk::doc_revision $doc]
+            h $h rid $rid sid $sid out $out
+            preview [get $jopts preview]}
+
+        if [has? $jopts group] {
+            if [not [empty? [get $jopts group]]] {
+                set! j [put $j group [get $jopts group]]
+                set! j [put $j idx [get $jopts idx]]
+            }
+        }
+
+        set! _jobs [put $_jobs $tid $j]
+
+        ;; meta buffer = the SOURCE: closing the buffer a filter is
+        ;; editing cancels it (tasks::cancel-for-buffer!).
+        weft::tasks::register! $tid #{poll [lambda {} {
+                    return [weft::filter::_poll $tid]
+                }]
+                cancel [lambda {} {
+                    return [weft::filter::_cancel $tid]
+                }]
+                meta #{buffer $bid execution $exec_id run $rid quiet 1}}
+
+        return [weft::task::pending $tid]
+    }
+
+    ;; ---- the frame-polled lifecycle ----
+
+    proc _read {h stderr} {
+        return [weft::task::result [weft::cap::invoke "process.read" \
+            #{proc $h stderr $stderr} #{}]]
+    }
+
+    ;; Drain both streams; returns the updated job.
+    proc _drain {j_in} {
+        var j $j_in
+        let h [get $j h]
+        var more 1
+
+        while $more {
+            let c [weft::filter::_read $h 0]
+
+            if [empty? $c] {
+                set! more 0
+            } else {
+                if [== [get $j mode] send] {
+                    weft::recog::lines! [get $j rid] \
+                        [weft::sink::feed! [get $j sid] $c]
+                    weft::cmd::run-grew! [get $j rid]
+                } else {
+                    set! j [put $j stdout "[get $j stdout]$c"]
+                }
+            }
+        }
+
+        set! more 1
+
+        while $more {
+            let c [weft::filter::_read $h 1]
+
+            if [empty? $c] {
+                set! more 0
+            } else {
+                set! j [put $j stderr "[get $j stderr]$c"]
+            }
+        }
+
+        return $j
+    }
+
+    ;; Feed at most one chunk of stdin; close it when everything has
+    ;; been written (or the child stopped reading).  Returns the job.
+    proc _feed {j_in} {
+        var j $j_in
+
+        if [not [get $j stdin_open]] { return $j }
+
+        let input [get $j input]
+        let total [String::length $input]
+        var off [get $j offset]
+
+        if [< $off $total] {
+            var stop [+ $off $_chunk]
+
+            if [> $stop $total] { set! stop $total }
+
+            let wt [weft::cap::invoke "process.write" \
+                #{proc [get $j h] text [String::range $input $off $stop]} #{}]
+
+            if [== [weft::task::state $wt] succeeded] {
+                set! off [+ $off [weft::task::result $wt]]
+                set! j [put $j offset $off]
+            } else {
+                ;; EPIPE: the child closed its stdin early (head -1,
+                ;; false).  Stop feeding; the exit status speaks.
+                set! off $total
+                set! j [put $j offset $off]
+            }
+        }
+
+        if [>= $off $total] {
+            weft::cap::invoke "process.close-stdin" #{proc [get $j h]} #{}
+            set! j [put $j stdin_open 0]
+        }
+
+        return $j
+    }
+
+    proc _poll {tid} {
+        var j [get $_jobs $tid]
+
+        set! j [weft::filter::_drain $j]
+        set! j [weft::filter::_feed $j]
+        set! _jobs [put $_jobs $tid $j]
+
+        if [weft::task::result [weft::cap::invoke "process.alive?" \
+                #{proc [get $j h]} #{}]] {
+            return [weft::task::pending $tid]
+        }
+
+        set! j [weft::filter::_drain $j]
+        set! _jobs [put $_jobs $tid $j]
+
+        let w [weft::task::result [weft::cap::invoke "process.reap" \
+            #{proc [get $j h]} #{}]]
+        var status 0
+
+        if [has? $w status] { set! status [get $w status] }
+
+        weft::filter::_finish! $tid $status
+
+        return [weft::task::done #{status $status}]
+    }
+
+    ;; Append to *output*, newline-terminated; empty text is skipped
+    ;; (lk rejects empty inserts).
+    proc _say! {out text} {
+        if [empty? $text] { return "" }
+
+        weft::shell::_append! $out [weft::filter::_ensure-nl $text]
+        return ""
+    }
+
+    proc _ensure-nl {text} {
+        if [empty? $text] { return "" }
+
+        let n [String::length $text]
+
+        if [== [String::range $text [- $n 1] $n] "\n"] { return $text }
+
+        return "$text\n"
+    }
+
+    proc _finish! {tid status} {
+        let j [get $_jobs $tid]
+        set! _jobs [del $_jobs $tid]
+
+        let out [get $j out]
+        let mode [get $j mode]
+        let form [get $j form]
+        let rid [get $j rid]
+        var note ""
+        var surface 0
+        var review 0
+
+        ;; A GROUP member reports its stderr and exit like any job,
+        ;; then hands its result to the join -- the group commits (or
+        ;; refuses) once, when the last member is in.
+        if [has? $j group] {
+            if [not [empty? [get $j stderr]]] {
+                weft::filter::_say! $out [get $j stderr]
+            }
+
+            weft::shell::_append! $out "\[exit $status\]\n\n"
+            weft::cmd::run-exit! $rid $status {exited}
+            weft::filter::_group-collect! $j $status
+            return ""
+        }
+
+        if [== $mode send] {
+            weft::recog::lines! $rid [weft::sink::close! [get $j sid]]
+        }
+
+        ;; stderr lands in *output* whatever happened -- quietly on
+        ;; success, surfaced on failure.
+        if [not [empty? [get $j stderr]]] {
+            weft::filter::_say! $out [get $j stderr]
+        }
+
+        if [not [== $mode send]] {
+            if [== $status 0] {
+                let plan #{transform $form buffer [get $j buffer]
+                    base_rev [get $j base_rev]
+                    edits (#{start [get $j start] end [get $j end]
+                        text [get $j stdout]})}
+                let src_doc [weft::ws::buffer-doc [get $j buffer]]
+                var fresh [weft::ws::buffer? [get $j buffer]]
+
+                if $fresh {
+                    set! fresh [== [Lk::doc_revision $src_doc] \
+                        [get $j base_rev]]
+                }
+
+                if [not $fresh] {
+                    weft::filter::_say! $out [get $j stdout]
+                    set! note "$form: buffer changed while it ran -- result kept in *output*, source untouched"
+                    set! surface 1
+                } else {
+                    if [get $j preview] {
+                        let pr [weft::transform::propose! $form \
+                            [get $j buffer] [get $plan edits]]
+
+                        if [== [get $pr kind] plan] {
+                            set! note "$form: plan ready -- review in *diff*"
+                            set! review 1
+                        } else {
+                            set! note "$form: nothing to change"
+                        }
+                    } else {
+                        let r [weft::transform::commit! $plan]
+
+                        if [weft::error::error? $r] {
+                            weft::filter::_say! $out [get $j stdout]
+                            set! note "$form: [weft::error::message $r] -- result kept in *output*"
+                            set! surface 1
+                        } else {
+                            let nin [String::length [get $j input]]
+                            let nout [String::length [get $j stdout]]
+                            set! note "$form: $nin -> $nout bytes"
+                        }
+                    }
+                }
+            } else {
+                ;; Failure: source untouched; whatever it printed is
+                ;; still worth reading.
+                weft::filter::_say! $out [get $j stdout]
+                set! note "!! $form: exit $status -- source untouched"
+                set! surface 1
+            }
+        } else {
+            if [not [== $status 0]] {
+                set! note "!! $form: exit $status"
+                set! surface 1
+            } else {
+                set! note "$form: done"
+            }
+        }
+
+        weft::shell::_append! $out "\[exit $status\]\n\n"
+        weft::cmd::run-exit! $rid $status {exited}
+        weft::filter::_event! #{kind done form $form note $note
+            surface $surface review $review status $status}
+
+        return ""
+    }
+
+    proc _cancel {tid} {
+        let j [get $_jobs $tid]
+        set! _jobs [del $_jobs $tid]
+
+        weft::cap::invoke "process.kill" #{proc [get $j h]} #{}
+
+        if [== [get $j mode] send] { weft::sink::close! [get $j sid] }
+
+        let out [get $j out]
+        weft::shell::_append! $out "\[killed\]\n\n"
+        weft::cap::invoke "process.close" #{proc [get $j h]} #{}
+        weft::cmd::run-exit! [get $j rid] "" {cancelled}
+
+        ;; A cancelled member ABORTS its group: the join still waits
+        ;; for the rest (their kills arrive through this same path
+        ;; when the whole buffer is closing), then applies nothing.
+        if [has? $j group] {
+            let gid [get $j group]
+
+            if [has? $_groups $gid] {
+                var g [get $_groups $gid]
+                set! g [put $g aborted 1]
+                set! g [put $g got [+ [get $g got] 1]]
+                set! _groups [put $_groups $gid $g]
+
+                if [>= [get $g got] [get $g expect]] {
+                    weft::filter::_group-finish! $gid
+                }
+            }
+        }
+
+        return ""
+    }
+
+    ;; ---- the group join (N ranges -> ONE transaction) ----
+
+    proc _group-collect! {j status} {
+        let gid [get $j group]
+
+        if [not [has? $_groups $gid]] { return "" }
+
+        var g [get $_groups $gid]
+        var rs [get $g results]
+
+        set! rs [put $rs [get $j idx] #{status $status
+            start [get $j start] end [get $j end]
+            stdout [get $j stdout]
+            input_len [String::length [get $j input]]}]
+        set! g [put $g results $rs]
+        set! g [put $g got [+ [get $g got] 1]]
+        set! _groups [put $_groups $gid $g]
+
+        if [>= [get $g got] [get $g expect]] {
+            weft::filter::_group-finish! $gid
+        }
+
+        return ""
+    }
+
+    proc _group-finish! {gid} {
+        let g [get $_groups $gid]
+        set! _groups [del $_groups $gid]
+
+        let out [get $g out]
+        let form [get $g form]
+        let n [get $g expect]
+        let bid [get $g buffer]
+        var note ""
+        var surface 0
+        var review 0
+        var worst 0
+        var edits ()
+        var nin 0
+        var nout 0
+        var i 0
+
+        ;; Results in index order = ascending document order (the
+        ;; ranges were sorted before the fan-out).
+        while [< $i $n] {
+            if [has? [get $g results] $i] {
+                let r [get [get $g results] $i]
+
+                if [> [get $r status] $worst] {
+                    set! worst [get $r status]
+                }
+
+                set! edits [List::push $edits #{start [get $r start]
+                    end [get $r end] text [get $r stdout]}]
+                set! nin [+ $nin [get $r input_len]]
+                set! nout [+ $nout [String::length [get $r stdout]]]
+            }
+
+            set! i [+ $i 1]
+        }
+
+        if [or [get $g aborted] [not [== $worst 0]]] {
+            foreach e $edits {
+                weft::filter::_say! $out [get $e text]
+            }
+
+            if [get $g aborted] {
+                set! note "!! $form: cancelled -- source untouched ($n ranges)"
+            } else {
+                set! note "!! $form: exit $worst -- source untouched ($n ranges)"
+            }
+
+            set! surface 1
+        } else {
+            var fresh [weft::ws::buffer? $bid]
+
+            if $fresh {
+                set! fresh [== [Lk::doc_revision [weft::ws::buffer-doc $bid]] \
+                    [get $g base_rev]]
+            }
+
+            if [not $fresh] {
+                foreach e $edits {
+                    weft::filter::_say! $out [get $e text]
+                }
+
+                set! note "$form: buffer changed while it ran -- results kept in *output*, source untouched"
+                set! surface 1
+            } else {
+                if [get $g preview] {
+                    let pr [weft::transform::propose! $form $bid $edits]
+
+                    if [== [get $pr kind] plan] {
+                        set! note "$form: plan ready ($n ranges) -- review in *diff*"
+                        set! review 1
+                    } else {
+                        set! note "$form: nothing to change"
+                    }
+                } else {
+                    let r [weft::transform::commit! #{transform $form
+                        buffer $bid base_rev [get $g base_rev]
+                        edits $edits}]
+
+                    if [weft::error::error? $r] {
+                        foreach e $edits {
+                            weft::filter::_say! $out [get $e text]
+                        }
+
+                        set! note "$form: [weft::error::message $r] -- results kept in *output*"
+                        set! surface 1
+                    } else {
+                        set! note "$form: $n ranges, $nin -> $nout bytes, one transaction"
+                    }
+                }
+            }
+        }
+
+        weft::filter::_event! #{kind done form $form note $note
+            surface $surface review $review status $worst}
+
+        return ""
+    }
+
+    ;; ---- vocabulary ----
+    ;; pipe/insert/send {cmd ?opts}: ctx is the running evaluation's
+    ;; (an attached REPL's target selection, a binding's selection)
+    ;; unless opts carries one.  opts: #{preview 1 ctx #{...}}.
+
+    proc _vocab {mode cmd rest} {
+        var opts #{}
+
+        if [> [len $rest] 0] { set! opts [get $rest 0] }
+
+        var ctx [weft::image::ctx]
+
+        if [has? $opts ctx] { set! ctx [get $opts ctx] }
+
+        return [weft::filter::run! $mode $cmd $ctx $opts]
+    }
+
+    proc pipe {cmd *rest} {
+        return [weft::filter::_vocab pipe $cmd $rest]
+    }
+
+    proc insert {cmd *rest} {
+        return [weft::filter::_vocab insert $cmd $rest]
+    }
+
+    proc send {cmd *rest} {
+        return [weft::filter::_vocab send $cmd $rest]
+    }
+}

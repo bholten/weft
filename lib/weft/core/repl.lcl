@@ -1,0 +1,129 @@
+;;; weft::repl -- attachment: the REPL as a lens on another buffer
+;;; (plan section 6).
+;;;
+;;; Legacy attachment swapped an ambient current-buffer pointer under
+;;; every binding.  Here it reduces to CTX CONSTRUCTION: when the REPL
+;;; is attached, its evaluations carry the target buffer -- and the
+;;; target's live selection -- as their ctx, so everything that
+;;; consults ctx (transforms first of all) acts on the target with no
+;;; rebinding anywhere.  The remote-control workflow: select in the
+;;; target, run from the REPL.
+;;;
+;;; `weft::repl::attach` with NO argument attaches to the buffer the
+;;; command is EXECUTED in (its execution ctx carries it) -- middle-
+;;; click the words in the buffer you want to control.  From the REPL,
+;;; pass a buffer id explicitly.
+
+namespace weft::repl {
+
+    var attached ""
+
+    proc attached? {} {
+        if [empty? $attached] { return 0 }
+
+        if [not [weft::ws::buffer? $attached]] {
+            ;; Target closed: detach lazily.
+            set! attached ""
+            return 0
+        }
+
+        return 1
+    }
+
+    proc attach {*rest} {
+        var bid ""
+
+        if [== 1 [len $rest]] {
+            ;; A name or an id, EXACT policy (docs/buffers.md): the
+            ;; last column of a weft::buffers row, or its name.
+            set! bid [weft::ws::buffer-resolve [get $rest 0] exact \
+                [weft::image::ctx]]
+
+            if [weft::error::error? $bid] { return $bid }
+        } else {
+            set! bid [weft::ctx::field [weft::image::ctx] buffer]
+        }
+
+        if [not [weft::ws::buffer? $bid]] {
+            return [weft::error::make invalid-args
+                "attach: no such buffer '$bid' (execute weft::repl::attach IN the target buffer, or pass an id)"]
+        }
+
+        if [== "*lcl*" [get [weft::ws::buffer $bid] name]] {
+            return [weft::error::make invalid-args
+                "attach: cannot attach the repl to itself -- execute this in the target buffer instead"]
+        }
+
+        set! attached $bid
+
+        return "attached: [get [weft::ws::buffer $bid] name] ($bid)"
+    }
+
+    proc detach {} {
+        if [empty? $attached] { return "not attached" }
+
+        let was $attached
+
+        set! attached ""
+
+        return "detached: $was"
+    }
+
+    ;; One line for humans (REPL echo, inspector).
+    proc target {} {
+        if [not [weft::repl::attached?]] { return "not attached" }
+
+        let b [weft::ws::buffer $attached]
+        var sel "no selection"
+        let s [weft::repl::selection]
+
+        if [== 2 [len $s]] {
+            set! sel "selection \[[get $s 0], [get $s 1])"
+        }
+
+        return "attached: [get $b name] ($attached) $sel"
+    }
+
+    ;; The attached buffer's live selection, read from the view of it
+    ;; in the workspace (first view when several; () when unviewed or
+    ;; nothing selected).
+    proc selection {} {
+        if [not [weft::repl::attached?]] { return () }
+
+        ;; The view the user last touched: with two views of the
+        ;; target open, the selection they made is the one they mean.
+        let v [weft::ws::active-view-of-buffer $attached]
+
+        if [empty? $v] { return () }
+
+        return [weft::ws::view-selection $v]
+    }
+
+    ;; Ctx fields for a REPL evaluation while attached: the target
+    ;; buffer, plus its selection as the range when one exists.
+    proc ctx-fields {} {
+        if [not [weft::repl::attached?]] { return #{} }
+
+        var f #{buffer $attached}
+        let s [weft::repl::selection]
+
+        if [== 2 [len $s]] {
+            set! f [Dict::merge $f #{start [get $s 0] end [get $s 1]}]
+        }
+
+        ;; A caret SET in the target rides as `selections` (start/end
+        ;; above stays the primary): filters and user scripts map over
+        ;; N ranges.
+        let v [weft::ws::active-view-of-buffer $attached]
+
+        if [not [empty? $v]] {
+            let sels [weft::ws::view-selections $v]
+
+            if [>= [len $sels] 2] {
+                set! f [Dict::merge $f #{selections $sels}]
+            }
+        }
+
+        return $f
+    }
+}

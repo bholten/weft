@@ -1,0 +1,312 @@
+;;; weft::wire -- the durable value codec (plan section 5, P5).
+;;;
+;;; Everything weft writes to disk is a portable value (string, int,
+;;; float, list, dict) rendered to text by encode and read back by
+;;; decode.  The format looks like lcl literals but is NOT read by
+;;; eval: persisted data is never executed, and the codec's quoted
+;;; strings carry arbitrary bytes -- raw newlines, braces, `$`, `[` --
+;;; that braced lcl literals cannot (annot context windows are raw
+;;; document text).  Only `\` and `"` are escaped (as \\ and \").
+;;;
+;;;   42   3.14   "text"   (v v v)   #{"k" v "k2" v}
+;;;
+;;; Dict keys are encoded sorted, so equal values produce identical
+;;; bytes (diffable stores).  decode returns the value, or a
+;;; weft::error value on malformed input -- callers check with
+;;; weft::error::error? (the envelope's decode -> migrate -> validate
+;;; chain starts here).
+namespace weft::wire {
+
+    ;; ---- encode ----
+
+    proc _enc-string {s} {
+        var out [String::replace $s "\\" "\\\\"]
+        set! out [String::replace $out "\"" "\\\""]
+
+        return "\"$out\""
+    }
+
+    ;;; Render a portable value (string, int, float, list, dict) to
+    ;;; wire text.
+    ;;;
+    ;;; Dict keys encode sorted, so equal values produce identical
+    ;;; bytes (diffable stores).  Handles, closures, and namespaces
+    ;;; error: they do not persist.
+    ;;;
+    ;;; Examples:
+    ;;; >> weft::wire::encode "hi"
+    ;;; "\"hi\""
+    ;;; >> weft::wire::encode [weft::wire::decode {#{"b" 2 "a" 1}}]
+    ;;; "#{\"a\" 1 \"b\" 2}"
+    ;;; >> weft::wire::encode [lambda {x} {$x}]
+    ;;; !! unsupported value type
+    proc encode {v} {
+        if [int? $v] { return [String::from $v] }
+        if [float? $v] { return [String::from $v] }
+
+        if [list? $v] {
+            var parts ()
+
+            foreach item $v {
+                set! parts [List::push $parts [weft::wire::encode $item]]
+            }
+
+            return "([String::join $parts " "])"
+        }
+
+        if [dict? $v] {
+            var parts ()
+
+            foreach k [List::sort [Dict::keys $v]] {
+                set! parts [List::push $parts [weft::wire::_enc-string $k]]
+                set! parts [List::push $parts
+                    [weft::wire::encode [get $v $k]]]
+            }
+
+            return "#\{[String::join $parts " "]\}"
+        }
+
+        if [string? $v] { return [weft::wire::_enc-string $v] }
+
+        error "weft::wire::encode: unsupported value type (handles, closures, and namespaces do not persist)"
+    }
+
+    ;; ---- decode ----
+    ;; A recursive-descent reader over byte positions.  Parse state is
+    ;; namespace-local (one decode at a time; decode is re-entrant only
+    ;; through its own recursion, which shares the cursor by design).
+
+    var _text ""
+    var _pos 0
+    var _len 0
+
+    proc _peek {} {
+        if [>= $_pos $_len] { return "" }
+
+        return [String::index $_text $_pos]
+    }
+
+    proc _skip-ws {} {
+        var going 1
+
+        while $going {
+            let c [weft::wire::_peek]
+
+            if [or [or [== $c " "] [== $c "\t"]]
+                   [or [== $c "\n"] [== $c "\r"]]] {
+                set! _pos [+ $_pos 1]
+            } else {
+                set! going 0
+            }
+        }
+
+        return ""
+    }
+
+    proc _fail {msg} {
+        error "weft::wire::decode: $msg at byte $_pos"
+    }
+
+    proc _read-string {} {
+        set! _pos [+ $_pos 1]
+
+        var out ""
+        var going 1
+
+        while $going {
+            if [>= $_pos $_len] {
+                weft::wire::_fail "unterminated string"
+            }
+
+            let c [String::index $_text $_pos]
+
+            if [== $c "\""] {
+                set! going 0
+                set! _pos [+ $_pos 1]
+            } else {
+                if [== $c "\\"] {
+                    set! _pos [+ $_pos 1]
+
+                    if [>= $_pos $_len] {
+                        weft::wire::_fail "trailing escape"
+                    }
+
+                    let e [String::index $_text $_pos]
+
+                    if [not [or [== $e "\\"] [== $e "\""]]] {
+                        weft::wire::_fail "unknown escape '\\$e'"
+                    }
+
+                    set! out "$out$e"
+                } else {
+                    set! out "$out$c"
+                }
+
+                set! _pos [+ $_pos 1]
+            }
+        }
+
+        return $out
+    }
+
+    proc _read-list {} {
+        set! _pos [+ $_pos 1]
+
+        var out ()
+        var going 1
+
+        while $going {
+            weft::wire::_skip-ws
+
+            let c [weft::wire::_peek]
+
+            if [== $c ""] {
+                weft::wire::_fail "unterminated list"
+            }
+
+            if [== $c ")"] {
+                set! going 0
+                set! _pos [+ $_pos 1]
+            } else {
+                set! out [List::push $out [weft::wire::_read-value]]
+            }
+        }
+
+        return $out
+    }
+
+    proc _read-dict {} {
+        set! _pos [+ $_pos 2]
+
+        var out #{}
+        var going 1
+
+        while $going {
+            weft::wire::_skip-ws
+
+            let c [weft::wire::_peek]
+
+            if [== $c ""] {
+                weft::wire::_fail "unterminated dict"
+            }
+
+            if [== $c "\}"] {
+                set! going 0
+                set! _pos [+ $_pos 1]
+            } else {
+                if [not [== $c "\""]] {
+                    weft::wire::_fail "dict key must be a string"
+                }
+
+                let k [weft::wire::_read-string]
+
+                weft::wire::_skip-ws
+
+                if [== [weft::wire::_peek] "\}"] {
+                    weft::wire::_fail "dict key '$k' has no value"
+                }
+
+                set! out [put $out $k [weft::wire::_read-value]]
+            }
+        }
+
+        return $out
+    }
+
+    proc _read-number {} {
+        let start $_pos
+        var going 1
+
+        while $going {
+            let c [weft::wire::_peek]
+
+            if [or [or [== $c ""] [== $c " "]]
+                   [or [or [== $c "\t"] [== $c "\n"]] [or [== $c "\r"]
+                       [or [== $c ")"] [== $c "\}"]]]]] {
+                set! going 0
+            } else {
+                set! _pos [+ $_pos 1]
+            }
+        }
+
+        let tok [String::range $_text $start $_pos]
+        var v ""
+        var e ""
+
+        if [or [>= [String::find $tok "."] 0]
+               [or [>= [String::find $tok "e"] 0]
+                   [>= [String::find $tok "E"] 0]]] {
+            if [not [== 0 [catch { float $tok } v e]]] {
+                weft::wire::_fail "bad number '$tok'"
+            }
+        } else {
+            if [not [== 0 [catch { int $tok } v e]]] {
+                weft::wire::_fail "bad number '$tok'"
+            }
+        }
+
+        return $v
+    }
+
+    proc _read-value {} {
+        weft::wire::_skip-ws
+
+        let c [weft::wire::_peek]
+
+        if [== $c ""] { weft::wire::_fail "unexpected end of input" }
+        if [== $c "\""] { return [weft::wire::_read-string] }
+        if [== $c "("] { return [weft::wire::_read-list] }
+
+        if [== $c "#"] {
+            if [not [== [String::index $_text [+ $_pos 1]] "\{"]] {
+                weft::wire::_fail "expected '\{' after '#'"
+            }
+
+            return [weft::wire::_read-dict]
+        }
+
+        return [weft::wire::_read-number]
+    }
+
+    ;;; Read wire text back into the value it encodes.
+    ;;;
+    ;;; Returns the value, or a weft::error value on malformed input
+    ;;; -- decode never throws; callers check weft::error::error?.
+    ;;;
+    ;;; Examples:
+    ;;; >> weft::wire::decode {(1 "two" 3.5)}
+    ;;; (1 "two" 3.5)
+    ;;; >> weft::wire::decode {"say \"hi\""}
+    ;;; "say \"hi\""
+    ;;; >> weft::error::error? [weft::wire::decode "(1"]
+    ;;; 1
+    ;;; >> weft::error::code [weft::wire::decode {(1) junk}]
+    ;;; "invalid-args"
+    proc decode {text} {
+        set! _text $text
+        set! _pos 0
+        set! _len [String::length $text]
+
+        var v ""
+        var e ""
+
+        if [not [== 0 [catch { weft::wire::_read-value } v e]]] {
+            set! _text ""
+
+            return [weft::error::from-caught $e]
+        }
+
+        weft::wire::_skip-ws
+
+        if [< $_pos $_len] {
+            set! _text ""
+
+            return [weft::error::make invalid-args
+                "weft::wire::decode: trailing garbage at byte $_pos"]
+        }
+
+        set! _text ""
+
+        return $v
+    }
+}

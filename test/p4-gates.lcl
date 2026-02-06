@@ -1,0 +1,278 @@
+;; P4 acceptance gates, stage A: generation-driven producer re-render.
+;;   weft --headless test/p4-gates.lcl
+;; Producers tick on (document revision, producer generation) -- a
+;; configuration change (new plumb rule, changed search query) rescans
+;; open buffers live, without waiting for an edit.
+
+proc gate {name ok} {
+    if [not $ok] { error "GATE FAILED: $name" }
+    puts "ok: $name"
+}
+
+require "weft/host/test.lcl"
+
+weft::ws::init! [weft::testhost::editor-hooks]
+
+;; ---- generation-driven re-render (the qol.md live re-render gap) ----
+weft::producer::define! [weft::plumb::producer-def]
+
+let _b [weft::ws::buffer-create! "notes" "" "alpha TODO-1 beta\nTODO-22 gamma\n"]
+let _store [weft::ws::buffer-store $_b]
+
+weft::producer::attach! $_b plumb
+weft::producer::tick! $_b
+gate "no matching rules, no plumb annotations" \
+    [== 0 [len [Lk::annot_by_layer $_store "plumb"]]]
+gate "settled producer does not rescan" [== 0 [weft::producer::tick! $_b]]
+
+weft::plumb::rule! #{name todo pattern {TODO-[0-9]+}
+    style #{fg (250 200 120)}
+    action [lambda {value ctx} { return "" }]}
+
+gate "rule change alone triggers a rescan" [== 1 [weft::producer::tick! $_b]]
+gate "matches annotated without a document edit" \
+    [== 2 [len [Lk::annot_by_layer $_store "plumb"]]]
+gate "generation settles after the rescan" [== 0 [weft::producer::tick! $_b]]
+
+;; The revision path is unchanged: edits still drive rescans.
+Lk::doc_insert [weft::ws::buffer-doc $_b] 0 "TODO-333 "
+weft::producer::tick! $_b
+gate "document edits still drive rescans" \
+    [== 3 [len [Lk::annot_by_layer $_store "plumb"]]]
+
+;; ---- producers without a generation closure tick on revision only ----
+var _runs 0
+weft::producer::define! #{name counter layers (counter)
+    update [lambda {ctx} { set! _runs [+ $_runs 1] ; return "" }]}
+weft::producer::attach! $_b counter
+weft::producer::tick! $_b
+gate "generation-less producer runs on first tick" [== 1 $_runs]
+weft::plumb::rule! #{name other pattern {XYZZY}
+    action [lambda {value ctx} { return "" }]}
+weft::producer::tick! $_b
+gate "foreign generation bump does not run it" [== 1 $_runs]
+
+;; ---- all-matches search producer (stage B) ----
+weft::producer::define! [weft::search::producer-def]
+
+let _sb [weft::ws::buffer-create! "hay" "" "one two one three\none four one\n"]
+let _sstore [weft::ws::buffer-store $_sb]
+weft::producer::attach! $_sb search
+
+weft::producer::tick! $_sb
+gate "no query, no search annotations" \
+    [== 0 [len [Lk::annot_by_layer $_sstore "search"]]]
+
+weft::search::query! $_sb "one"
+weft::producer::tick! $_sb
+gate "query annotates every match" \
+    [== 4 [len [Lk::annot_by_layer $_sstore "search"]]]
+gate "search settles after the rescan" [== 0 [weft::producer::tick! $_sb]]
+
+weft::search::query! $_sb "three"
+weft::producer::tick! $_sb
+gate "query change re-annotates without an edit" \
+    [== 1 [len [Lk::annot_by_layer $_sstore "search"]]]
+
+Lk::doc_insert [weft::ws::buffer-doc $_sb] 0 "three blind three "
+weft::producer::tick! $_sb
+gate "edits keep search current" \
+    [== 3 [len [Lk::annot_by_layer $_sstore "search"]]]
+
+weft::search::clear! $_sb
+weft::producer::tick! $_sb
+gate "clearing the query clears the layer" \
+    [== 0 [len [Lk::annot_by_layer $_sstore "search"]]]
+
+gate "queries are per buffer" [empty? [weft::search::query $_b]]
+
+;; Matches never overlap: "aaa" contains one "aa", not two.  (The
+;; old pure-Lcl weft::search::matches helper was deleted in P4-E Q5;
+;; the properties are gated on the live doc_find scan instead.)
+let _ob [weft::ws::buffer-create! "olap" "" "aaa then abcdabX"]
+let _ostore [weft::ws::buffer-store $_ob]
+
+weft::producer::attach! $_ob search
+weft::search::query! $_ob "aa"
+weft::producer::tick! $_ob
+gate "matches do not overlap" \
+    [== 1 [len [Lk::annot_by_layer $_ostore "search"]]]
+
+weft::search::query! $_ob "ab"
+weft::producer::tick! $_ob
+
+let _oann [Lk::annot_by_layer $_ostore "search"]
+let _osp [Lk::annot_span $_ostore [get $_oann 1]]
+gate "match offsets are absolute" \
+    [and [== 13 [get $_osp 0]] [== 15 [get $_osp 1]]]
+
+;; ---- tree-sitter producer (stage D; real ts capabilities, like the
+;; p2 gates use real process capabilities) ----
+if $weft_have_ts {
+
+weft::producer::define! [weft::ts::producer-def]
+weft::config::filetype! ".lcl" #{lang lcl}
+
+gate "host lists embedded grammars" \
+    [has? [weft::task::result [weft::cap::invoke "ts.langs" #{} #{}]] "lcl"]
+gate "unknown language fails unsupported" \
+    [== unsupported [weft::error::code [weft::task::failure \
+        [weft::cap::invoke "ts.open" #{lang "cobol"} #{}]]]]
+
+;; NB braced: quoted text would interpolate the $a.
+let _tb [weft::ws::buffer-create! "mod.lcl" "code.lcl" {proc foo {a} {return $a}
+;; note
+}]
+let _tstore [weft::ws::buffer-store $_tb]
+
+weft::producer::attach! $_tb ts
+weft::producer::tick! $_tb
+gate "lcl buffer grows ts annotations" \
+    [> [len [Lk::annot_by_layer $_tstore "ts"]] 3]
+gate "one session per buffer" [== 1 [weft::ts::session-count]]
+
+;; The capture rides the annotation; `proc` must be a keyword (the
+;; grammar's predicate-guarded pattern -- predicates ARE evaluated).
+var _kw 0
+foreach _id [Lk::annot_by_layer $_tstore "ts"] {
+    let _sp [Lk::annot_span $_tstore $_id]
+    if [and [== 0 [get $_sp 0]] [== 4 [get $_sp 1]]] {
+        if [== keyword [Lk::annot_meta $_tstore $_id capture]] {
+            set! _kw 1
+        }
+    }
+}
+gate "predicates hold: proc captures as keyword" $_kw
+
+;; Same-range override order: the params-block pattern sits LATER in
+;; highlights.scm than the bare command-name pattern, but its match
+;; starts EARLIER (anchored at `proc`), so the cursor emits it first.
+;; The host must break same-range ties by pattern index, not emission
+;; order -- `a` in {a} is a parameter, not a command name.
+var _param ""
+foreach _id [Lk::annot_by_layer $_tstore "ts"] {
+    let _sp [Lk::annot_span $_tstore $_id]
+    if [and [== 10 [get $_sp 0]] [== 11 [get $_sp 1]]] {
+        set! _param [Lk::annot_meta $_tstore $_id capture]
+    }
+}
+gate "same-range ties go to the later pattern (param, not command)" \
+    [== "variable.parameter" $_param]
+gate "capture styles resolve with dotted fallback" \
+    [> [len [Dict::keys [weft::ts::style-of "keyword.repeat"]]] 0]
+gate "ts settles until something changes" [== 0 [weft::producer::tick! $_tb]]
+
+;; Filetype change: clean stop/replace -- the plain-text mapping has
+;; no language, so the session closes and the layer empties, with no
+;; document edit (workspace metadata generation drives the rescan).
+weft::ws::buffer-set-filetype! $_tb ".txt"
+weft::producer::tick! $_tb
+gate "filetype change drops highlighting live" \
+    [== 0 [len [Lk::annot_by_layer $_tstore "ts"]]]
+gate "filetype change closes the session" [== 0 [weft::ts::session-count]]
+
+weft::ws::buffer-set-filetype! $_tb ".lcl"
+weft::producer::tick! $_tb
+gate "filetype change back re-highlights live" \
+    [> [len [Lk::annot_by_layer $_tstore "ts"]] 3]
+gate "fresh session opened" [== 1 [weft::ts::session-count]]
+
+;; Editing keeps highlights current through the revision path.
+Lk::doc_insert [weft::ws::buffer-doc $_tb] 0 ";; lead\n"
+weft::producer::tick! $_tb
+var _cmt 0
+foreach _id [Lk::annot_by_layer $_tstore "ts"] {
+    let _sp [Lk::annot_span $_tstore $_id]
+    if [and [== 0 [get $_sp 0]] \
+            [== comment [Lk::annot_meta $_tstore $_id capture]]] {
+        set! _cmt 1
+    }
+}
+gate "edits reparse: new leading comment captured" $_cmt
+
+;; Buffer close releases the session through producer detach.
+weft::ws::buffer-close! $_tb 1
+gate "buffer close releases the ts session" \
+    [== 0 [weft::ts::session-count]]
+
+;; ---- incremental reparse (stage C: doc deltas -> ts_tree_edit) ----
+;; The load-bearing property: a session that reparses incrementally
+;; (deltas drained through the doc subscription into ts.edit) must
+;; produce EXACTLY the spans a fresh parse of the same text produces.
+;; The legacy host failed this silently; these gates pin it across
+;; inserts, deletes, multi-edit transactions, and undo.
+
+proc ts-fingerprint {store} {
+    var keys ()
+    foreach id [Lk::annot_by_layer $store "ts"] {
+        let sp [Lk::annot_span $store $id]
+        set! keys [List::push $keys \
+            "[get $sp 0]:[get $sp 1]:[Lk::annot_meta $store $id capture]"]
+    }
+    return [String::join [List::sort $keys] ","]
+}
+
+;; Parse `text` in a brand-new buffer/session; return its fingerprint.
+proc ts-fresh-fingerprint {text} {
+    let b [weft::ws::buffer-create! "fresh.lcl" "fresh.lcl" $text]
+    weft::producer::attach! $b ts
+    weft::producer::tick! $b
+    let fp [ts-fingerprint [weft::ws::buffer-store $b]]
+    weft::ws::buffer-close! $b 1
+    return $fp
+}
+
+;; NB braced: quoted text would interpolate $x.
+var _inc_b [weft::ws::buffer-create! "inc.lcl" "inc.lcl" {proc one {x} {return $x}
+;; middle
+proc two {} {return 2}
+}]
+var _inc_doc [weft::ws::buffer-doc $_inc_b]
+var _inc_store [weft::ws::buffer-store $_inc_b]
+var _inc_hist [weft::ws::buffer-hist $_inc_b]
+weft::producer::attach! $_inc_b ts
+weft::producer::tick! $_inc_b
+
+Lk::doc_insert $_inc_doc 0 ";; lead\nvar n 1\n"
+weft::producer::tick! $_inc_b
+gate "incremental == fresh after leading insert" \
+    [== [ts-fingerprint $_inc_store] \
+        [ts-fresh-fingerprint [Lk::doc_text $_inc_doc]]]
+
+Lk::doc_delete $_inc_doc 0 8
+weft::producer::tick! $_inc_b
+gate "incremental == fresh after delete" \
+    [== [ts-fingerprint $_inc_store] \
+        [ts-fresh-fingerprint [Lk::doc_text $_inc_doc]]]
+
+;; Several edits in one transaction: deltas arrive as one sequential
+;; batch (each edit's coordinates in the state the previous left).
+Lk::doc_transact $_inc_doc {
+    Lk::doc_insert $_inc_doc 0 "namespace demo {\n"
+    Lk::doc_insert $_inc_doc [Lk::doc_len $_inc_doc] "}\n"
+}
+weft::producer::tick! $_inc_b
+gate "incremental == fresh after multi-edit transaction" \
+    [== [ts-fingerprint $_inc_store] \
+        [ts-fresh-fingerprint [Lk::doc_text $_inc_doc]]]
+
+;; Undo arrives through the same subscription.
+Lk::history_undo $_inc_hist $_inc_doc
+weft::producer::tick! $_inc_b
+gate "incremental == fresh after undo" \
+    [== [ts-fingerprint $_inc_store] \
+        [ts-fresh-fingerprint [Lk::doc_text $_inc_doc]]]
+
+gate "spans survive it all non-empty" \
+    [> [len [Lk::annot_by_layer $_inc_store "ts"]] 5]
+
+weft::ws::buffer-close! $_inc_b 1
+gate "incremental session releases on close" \
+    [== 0 [weft::ts::session-count]]
+
+} else {
+    puts "deferred: ts gates (host built without WEFT_LCL_TS)"
+}
+
+puts ""
+puts "P4 STAGE A+B+C+D GATES PASSED"

@@ -1,0 +1,48 @@
+;;; weft::envelope -- the versioned file envelope (plan section 5).
+;;;
+;;; Every durable artifact weft ever writes is wrapped:
+;;;   #{format weft version 1 kind <kind> payload <value>}
+;;; and every read passes through unwrap (decode -> migrate -> validate).
+;;; No migrations exist yet; this is the designated place for them.
+;;; Pre-release, compatibility may break freely; the release cut is when
+;;; version bumps start requiring migrations.
+
+namespace weft::envelope {
+
+    proc wrap {kind payload} {
+        return #{format weft version 1 kind $kind payload $payload}
+    }
+
+    ;; Returns the payload, or a weft::error value (check with
+    ;; weft::error::error?).
+    proc unwrap {v kind} {
+        if [not [dict? $v]] {
+            return [weft::error::make invalid-args \
+                "envelope: not a dict"]
+        }
+
+        if [not [has? $v format]] {
+            return [weft::error::make invalid-args \
+                "envelope: missing format field"]
+        }
+
+        if [not [== [get $v format] weft]] {
+            return [weft::error::make invalid-args \
+                "envelope: format is '[get $v format]', expected 'weft'"]
+        }
+
+        if [not [== [get $v kind] $kind]] {
+            return [weft::error::make invalid-args \
+                "envelope: kind is '[get $v kind]', expected '$kind'"]
+        }
+
+        ;; migrate: version 1 is current; older versions get migration
+        ;; steps here when they exist.
+        if [not [== [get $v version] 1]] {
+            return [weft::error::make invalid-args \
+                "envelope: version [get $v version] has no migration path"]
+        }
+
+        return [get $v payload]
+    }
+}

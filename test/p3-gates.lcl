@@ -1,0 +1,476 @@
+;; P3 acceptance gates, stage 1: the live image (plan section 13.7).
+;;   weft --headless test/p3-gates.lcl
+
+proc gate {name ok} {
+    if [not $ok] { error "GATE FAILED: $name" }
+    puts "ok: $name"
+}
+
+require "weft/host/test.lcl"
+weft::ws::init! [weft::testhost::editor-hooks]
+let _ctx [weft::ctx::make #{ns user}]
+
+;; ---- evaluation lands in the user package, value comes back ----
+let _r1 [weft::image::eval-in! user {proc double {n} { return [* $n 2] }} $_ctx]
+gate "definition evaluates ok" [get $_r1 ok]
+let _r2 [weft::image::eval-in! user {double 21} $_ctx]
+gate "definitions persist across evaluations" [== 42 [get $_r2 value]]
+gate "user package is enumerable" [has? [weft::image::user-defs] double]
+
+;; ---- scope is the whole image ----
+let _r3 [weft::image::eval-in! user {$weft_version} $_ctx]
+gate "reads reach image globals" [== [get $_r3 value] $weft_version]
+let _r4 [weft::image::eval-in! user {weft::version} $_ctx]
+gate "reads reach the weft API" [== [get $_r4 value] $weft_version]
+
+;; ---- user definitions call each other bare ----
+weft::image::eval-in! user {proc quadruple {n} { return [double [double $n]] }} $_ctx
+let _r5 [weft::image::eval-in! user {quadruple 10} $_ctx]
+gate "user definitions compose unqualified" [== 40 [get $_r5 value]]
+
+;; ---- errors are structured, recorded, and loud ----
+let _r6 [weft::image::eval-in! user {nosuchcmd-p3} $_ctx]
+gate "unknown command fails structurally" [not [get $_r6 ok]]
+gate "error names the command (strict mode)" [>= [String::find \
+    [weft::error::message [get $_r6 error]] "nosuchcmd-p3"] 0]
+
+;; ---- execution records: provenance as a property of execution ----
+let _recs [weft::image::records]
+gate "every evaluation left a record" [>= [len $_recs] 6]
+let _last [get $_recs [- [len $_recs] 1]]
+gate "records carry source" [== [get $_last source] "nosuchcmd-p3"]
+gate "records carry the namespace" [== [get $_last ns] user]
+gate "failed records carry the error" [not [get $_last ok]]
+gate "record ids are execution ids" [not [empty? [get $_last id]]]
+
+;; ---- the log is bounded ----
+var _i 0
+while [< $_i 210] {
+    weft::image::eval-in! user {+ 1 1} $_ctx
+    set! _i [+ $_i 1]
+}
+gate "log is a bounded ring" [== 200 [len [weft::image::records]]]
+weft::image::clear-log!
+gate "log clears" [== 0 [len [weft::image::records]]]
+
+;; ---- EXECUTE routes through the image ----
+weft::shell::run-text! "weft::version" $_ctx
+let _recs2 [weft::image::records]
+gate "run-text! leaves execution records" [== 1 [len $_recs2]]
+gate "run-text! record carries its source" \
+    [== [get [get $_recs2 0] source] "weft::version"]
+
+;; ---- guardrails ----
+gate "bad namespace name refused" \
+    [not [get [weft::image::eval-in! "no good!" {+ 1 1} $_ctx] ok]]
+
+;; ---- reset: interactive state clears separately (Ns::clear) ----
+gate "reset empties the user package" \
+    [and [> [weft::image::reset-user!] 0] \
+         [== 0 [len [weft::image::user-defs]]]]
+gate "reset is itself recorded" [== "<reset-user>" \
+    [get [get [weft::image::records] \
+        [- [len [weft::image::records]] 1]] source]]
+let _r8 [weft::image::eval-in! user {proc afresh {} { return 9 }} $_ctx]
+gate "the package is live after reset" \
+    [== 9 [get [weft::image::eval-in! user {afresh} $_ctx] value]]
+gate "old definitions are gone" \
+    [not [get [weft::image::eval-in! user {double 2} $_ctx] ok]]
+
+puts ""
+puts "P3 STAGE-1 GATES PASSED"
+puts ""
+
+;; ================= stage 2: transforms + edit plans ================
+
+let _tb [weft::ws::buffer-create! "tbuf" "" "hello world\nsecond line\n"]
+let _tdoc [weft::ws::buffer-doc $_tb]
+let _thist [get [weft::ws::buffer $_tb] hist]
+let _tctx #{buffer $_tb start 0 end 11}
+
+;; ---- running produces a plan, never a mutation ----
+let _p1 [weft::transform::run upper $_tctx]
+gate "run yields a plan" [== [get $_p1 kind] plan]
+gate "running mutated nothing" \
+    [== [Lk::doc_text $_tdoc] "hello world\nsecond line\n"]
+gate "plan is pending" [weft::transform::pending?]
+gate "plan carries base revision + edits" \
+    [== 1 [len [get [weft::transform::pending-plan] edits]]]
+
+;; ---- the plan is the diff ----
+let _dt [weft::transform::diff-text]
+gate "diff shows removals" [>= [String::find $_dt "- hello world"] 0]
+gate "diff shows additions" [>= [String::find $_dt "+ HELLO WORLD"] 0]
+gate "diff carries the decision buttons" \
+    [>= [String::find $_dt "weft::transform::apply"] 0]
+
+;; ---- apply: one transaction, one undo step ----
+weft::transform::apply
+gate "apply rewrites the range" \
+    [== [Lk::doc_text $_tdoc] "HELLO WORLD\nsecond line\n"]
+gate "apply clears pending" [not [weft::transform::pending?]]
+Lk::history_undo $_thist $_tdoc
+gate "the whole plan is one undo step" \
+    [== [Lk::doc_text $_tdoc] "hello world\nsecond line\n"]
+
+;; ---- no-change and errors ----
+weft::transform::run upper #{buffer $_tb start 12 end 12}
+gate "empty range is no_change, nothing pending" \
+    [not [weft::transform::pending?]]
+gate "unknown transform errors" \
+    [== [get [weft::transform::run nope $_tctx] kind] error]
+
+;; ---- staleness: the document moved on ----
+weft::transform::run upper $_tctx
+Lk::doc_insert $_tdoc 0 "x"
+let _st [weft::transform::apply]
+gate "stale plan refuses to apply" \
+    [== cancelled [weft::error::code $_st]]
+gate "stale apply clears pending" [not [weft::transform::pending?]]
+Lk::history_undo $_thist $_tdoc
+
+;; ---- edits tier: multi-location, back-to-front application ----
+weft::transform::register! #{name test-swap
+    description "gate helper" fn [lambda {ctx} {
+        return [::weft::transform::edits [list \
+            #{start 0 end 5 text "HELLO"} \
+            #{start 12 end 18 text "SECOND"}]]
+    }]}
+weft::transform::run test-swap #{buffer $_tb}
+weft::transform::apply
+gate "multi-edit plan applies at both sites" \
+    [== [Lk::doc_text $_tdoc] "HELLO world\nSECOND line\n"]
+Lk::history_undo $_thist $_tdoc
+gate "multi-edit plan is still one undo step" \
+    [== [Lk::doc_text $_tdoc] "hello world\nsecond line\n"]
+
+;; ---- overlapping edits are refused ----
+weft::transform::register! #{name test-overlap
+    description "gate helper" fn [lambda {ctx} {
+        return [::weft::transform::edits [list \
+            #{start 0 end 6 text "a"} #{start 3 end 9 text "b"}]]
+    }]}
+gate "overlapping edits refused" \
+    [== [get [weft::transform::run test-overlap #{buffer $_tb}] kind] error]
+
+;; ---- prompt tier: deterministic re-run with input ----
+let _pr [weft::transform::run prefix-lines $_tctx]
+gate "prompt surfaces the question" [== [get $_pr kind] prompt]
+gate "prompt leaves nothing pending" [not [weft::transform::pending?]]
+let _pr2 [weft::transform::run prefix-lines \
+    [Dict::merge [get $_pr ctx] #{input "## "}]]
+gate "re-run with input yields the plan" [== [get $_pr2 kind] plan]
+weft::transform::reject
+gate "reject clears pending" [not [weft::transform::pending?]]
+
+;; ---- transforms reach the running execution's ctx ----
+let _r9 [weft::image::eval-in! user {weft::transform::run "upper"} \
+    [weft::ctx::make #{buffer $_tb start 0 end 5 ns user}]]
+gate "evaluated code inherits the execution ctx" \
+    [== [get [get $_r9 value] kind] plan]
+weft::transform::reject
+
+puts ""
+puts "P3 STAGE-2 GATES PASSED"
+puts ""
+
+;; ================= stage 3: the inspector ==========================
+
+if $weft_have_regex {
+
+weft::producer::define! [weft::plumb::producer-def]
+weft::plumb::default-rules!
+
+let _ib [weft::ws::buffer-create! "inspected.c" "/t/inspected.c" \
+    "see src/x.c:9 here\n"]
+weft::producer::attach! $_ib plumb
+weft::producer::tick! $_ib
+weft::transform::run upper #{buffer $_ib start 0 end 3}
+
+let _rep [weft::inspect::report #{buffer $_ib pos 6}]
+
+gate "report heads with position context" \
+    [>= [String::find $_rep "inspect @ inspected.c pos 6"] 0]
+gate "report names buffer identity + filetype" \
+    [and [>= [String::find $_rep $_ib] 0] \
+         [>= [String::find $_rep {filetype=".c"}] 0]]
+gate "report shows the annotation at point" \
+    [>= [String::find $_rep "layer=plumb rule=file-line"] 0]
+gate "report shows producer status" \
+    [>= [String::find $_rep "plumb: ok"] 0]
+gate "report shows the pending transform" \
+    [>= [String::find $_rep "transform: upper"] 0]
+gate "report enumerates user definitions" \
+    [>= [String::find $_rep "afresh"] 0]
+gate "report tails recent executions" \
+    [>= [String::find $_rep "recent executions:"] 0]
+gate "report lists transforms and rules" \
+    [and [>= [String::find $_rep "sort-lines"] 0] \
+         [>= [String::find $_rep "file-line"] 0]]
+gate "report lists capabilities" \
+    [>= [String::find $_rep "fs.read"] 0]
+gate "report carries executable affordances" \
+    [>= [String::find $_rep "\[weft::image::records\]"] 0]
+weft::transform::reject
+
+gate "report on a position with no annotations says so" \
+    [>= [String::find [weft::inspect::report \
+        #{buffer $_ib pos 17}] "(none)"] 0]
+gate "report without a buffer degrades" \
+    [>= [String::find [weft::inspect::report #{}] "no buffer"] 0]
+
+puts ""
+puts "P3 STAGE-3 GATES PASSED"
+}
+puts ""
+
+;; ================= stage 4: REPL attachment as ctx =================
+
+let _tgt [weft::ws::buffer-create! "target.txt" "/t/target.txt" \
+    "alpha\nbeta\ngamma\n"]
+let _tv [weft::ws::view-create! $_tgt]
+
+;; attach-by-execution: the no-arg form takes its execution's buffer
+let _a1 [weft::image::eval-in! user {weft::repl::attach} \
+    [weft::ctx::make #{buffer $_tgt ns user}]]
+gate "attach binds to the executing buffer" \
+    [and [get $_a1 ok] [weft::repl::attached?]]
+gate "target reports the attachment" \
+    [>= [String::find [weft::repl::target] "target.txt"] 0]
+
+;; the lens: the target's live selection becomes the eval range
+weft::testhost::editor-select! [weft::ws::view-editor $_tv] 6 10
+let _cf [weft::repl::ctx-fields]
+gate "ctx-fields carry the target selection" \
+    [and [== [get $_cf buffer] $_tgt] [== 6 [get $_cf start]] \
+         [== 10 [get $_cf end]]]
+
+;; a transform run "from the repl" acts on the target's selection
+let _a2 [weft::image::eval-in! user {weft::transform::run "upper"} \
+    [weft::ctx::make [Dict::merge #{ns user} [weft::repl::ctx-fields]]]]
+gate "attached transform targets the selection" \
+    [== [get [get $_a2 value] kind] plan]
+weft::transform::apply
+gate "the target's selection was transformed" \
+    [== [Lk::doc_text [weft::ws::buffer-doc $_tgt]] "alpha\nBETA\ngamma\n"]
+
+;; two views of the target: the selection comes from the view the
+;; user touched LAST, not the first one created
+let _tp1 [weft::ws::tree-init! $_tv]
+let _tp2 [weft::ws::pane-split! $_tp1 h $_tgt]
+let _tv2 [weft::ws::pane-view $_tp2]
+weft::testhost::editor-select! [weft::ws::view-editor $_tv2] 0 5
+weft::testhost::editor-select! [weft::ws::view-editor $_tv] 6 10
+weft::ws::focus! $_tp2
+gate "selection reads from the last-focused view of the target" \
+    [== 0 [get [weft::repl::ctx-fields] start]]
+weft::ws::focus! $_tp1
+gate "and follows focus back" \
+    [== 6 [get [weft::repl::ctx-fields] start]]
+weft::ws::pane-close! $_tp2
+gate "a closed pane drops out of the focus history" \
+    [== $_tv [weft::ws::active-view-of-buffer $_tgt]]
+
+;; guards and lifecycle
+gate "self-attach is refused" [weft::error::error? \
+    [weft::repl::attach [weft::ws::buffer-create! "*lcl*" "" ""]]]
+gate "attach to nowhere is refused" \
+    [weft::error::error? [weft::repl::attach "buf-nope"]]
+gate "detach detaches" \
+    [and [not [weft::error::error? [weft::repl::detach]]] \
+         [not [weft::repl::attached?]]]
+
+weft::repl::attach $_tgt
+weft::ws::view-close! $_tv
+weft::ws::buffer-close! $_tgt 1
+gate "closing the target detaches lazily" [not [weft::repl::attached?]]
+
+puts ""
+puts "P3 STAGE-4 GATES PASSED"
+puts ""
+
+;; ================= stage 5: the annotation editor ==================
+
+let _ab [weft::ws::buffer-create! "notes.txt" "/t/notes.txt" \
+    "alpha beta gamma delta\n"]
+let _astore [weft::ws::buffer-store $_ab]
+Lk::annot_layer_register $_astore "notes"
+let _a1 [Lk::annot_add $_astore 0 5 "notes" #{note:text "first" note:mood "calm"}]
+let _a2 [Lk::annot_add $_astore 6 10 "notes" #{note:text "second"}]
+
+;; ---- authored styling: the style: metadata convention ----
+gate "style: parses r g b, #hex and names" \
+    [and [== (255 200 100) [weft::annot::parse-color "255 200 100"]] \
+         [and [== (255 200 100) [weft::annot::parse-color "#ffc864"]] \
+              [== 3 [len [weft::annot::parse-color red]]]]]
+gate "style: rejects junk without raising" \
+    [and [== () [weft::annot::parse-color "nope"]] \
+         [== () [weft::annot::parse-color "1 2"]]]
+gate "style-of builds an editor span style from metadata" \
+    [== #{fg (255 0 0) underline 1} \
+        [weft::annot::style-of #{"style:fg" "#ff0000" "style:underline" 1 note x}]]
+gate "style-of is empty without style: keys" \
+    [== 0 [len [Dict::keys [weft::annot::style-of #{note x}]]]]
+
+let _open [weft::annot::edit-at #{buffer $_ab start 0 end 22}]
+gate "edit-at opens a session" [weft::annot::pending?]
+let _eb [weft::annot::session-buffer]
+let _etext [Lk::doc_text [weft::ws::buffer-doc $_eb]]
+gate "session renders blocks with metadata" \
+    [and [>= [String::find $_etext {note:text "first"}] 0] \
+         [>= [String::find $_etext {note:mood "calm"}] 0]]
+gate "session carries the decision affordances" \
+    [>= [String::find $_etext "weft::annot::apply-edit"] 0]
+
+;; Simulate the user's edit: change first's mood, delete the second
+;; block entirely, add a fresh one.
+let _edoc [weft::ws::buffer-doc $_eb]
+var _new_text [String::replace $_etext {note:mood "calm"} {note:mood "stormy"}]
+set! _new_text [String::replace $_new_text \
+    "{id $_a2 layer \"notes\"\n  note:text \"second\"}" ""]
+set! _new_text "$_new_text\n{id new layer \"remarks\"\n  remark:text \"fresh\"}\n"
+Lk::doc_transact $_edoc {
+    Lk::doc_delete $_edoc 0 [Lk::doc_len $_edoc]
+    Lk::doc_insert $_edoc 0 $_new_text
+}
+
+let _ares [weft::annot::apply-edit]
+gate "apply reports the tally" \
+    [== $_ares "annotations: 1 added, 1 changed, 1 removed"]
+gate "apply clears the session" [not [weft::annot::pending?]]
+
+gate "deleted block removed the annotation" \
+    [== 0 [len [Lk::annot_at $_astore 7 "notes"]]]
+let _at0 [Lk::annot_at $_astore 2 "notes"]
+gate "changed block re-annotated the original span" \
+    [== 1 [len $_at0]]
+gate "changed metadata landed" [== "stormy" \
+    [Lk::annot_meta $_astore [get $_at0 0] note:mood]]
+gate "unchanged metadata survived" [== "first" \
+    [Lk::annot_meta $_astore [get $_at0 0] note:text]]
+let _in [Lk::annot_in_range $_astore 0 22]
+gate "new block added on its own layer over the scope" \
+    [has? [List::map $_in [lambda {id} { Lk::annot_layer $_astore $id }]] \
+        "remarks"]
+
+;; staleness: the target moved on after edit-at
+weft::annot::edit-at #{buffer $_ab start 0 end 5}
+Lk::doc_insert [weft::ws::buffer-doc $_ab] 0 "x"
+gate "stale session refuses" \
+    [== cancelled [weft::error::code [weft::annot::apply-edit]]]
+gate "stale refusal clears the session" [not [weft::annot::pending?]]
+
+;; cancel
+weft::annot::edit-at #{buffer $_ab start 0 end 5}
+weft::annot::cancel-edit
+gate "cancel clears the session" [not [weft::annot::pending?]]
+
+puts ""
+puts "P3 STAGE-5 GATES PASSED"
+puts ""
+
+;; ================= stage 6: rich config ============================
+
+;; ---- keybindings as data: chord parsing ----
+weft::config::bind! "ctrl+shift+u" {weft::transform::run "upper"}
+let _bl [weft::config::bindings-list]
+let _b0 [get $_bl [- [len $_bl] 1]]
+gate "bind! splits chord into key and mods" \
+    [and [== [get $_b0 key] u] [== [get $_b0 mods] "ctrl+shift"]]
+weft::config::bind! "f5" {weft::version}
+gate "modifierless chords parse" [== "" \
+    [get [get [weft::config::bindings-list] \
+        [- [len [weft::config::bindings-list]] 1]] mods]]
+
+;; ---- filetype settings with fallback ----
+weft::config::filetype! ".md" #{wrap word}
+gate "filetype setting resolves" \
+    [== word [weft::config::filetype-value ".md" wrap character]]
+gate "unset filetype falls back" \
+    [== character [weft::config::filetype-value ".c" wrap character]]
+gate "unset key falls back" \
+    [== 0 [weft::config::filetype-value ".md" nope 0]]
+
+;; ---- plumb rule scoping by filetype ----
+if $weft_have_regex {
+    weft::plumb::rule! #{name todo-c
+        pattern {TODO-[0-9]+}
+        filetypes (".c")
+        style #{fg (255 200 100)}
+        action [lambda {value ctx} { return "" }]}
+
+    let _cb [weft::ws::buffer-create! "s.c" "/t/s.c" "TODO-7 here\n"]
+    weft::producer::attach! $_cb plumb
+    weft::producer::tick! $_cb
+    gate "scoped rule fires in its filetype" \
+        [== 1 [len [Lk::annot_by_layer [weft::ws::buffer-store $_cb] "plumb"]]]
+
+    let _mb [weft::ws::buffer-create! "s.md" "/t/s.md" "TODO-7 here\n"]
+    weft::producer::attach! $_mb plumb
+    weft::producer::tick! $_mb
+    gate "scoped rule silent elsewhere" \
+        [== 0 [len [Lk::annot_by_layer [weft::ws::buffer-store $_mb] "plumb"]]]
+
+    let _fb [weft::ws::buffer-create! "u.md" "/t/u.md" "see a/b.c:3\n"]
+    weft::producer::attach! $_fb plumb
+    weft::producer::tick! $_fb
+    gate "unscoped rules still fire everywhere" \
+        [== 1 [len [Lk::annot_by_layer [weft::ws::buffer-store $_fb] "plumb"]]]
+}
+
+;; ---- bound scripts evaluate with selection ctx (the handler path) ----
+let _kb [weft::ws::buffer-create! "kb.txt" "/t/kb.txt" "make me loud\n"]
+let _kv [weft::ws::view-create! $_kb]
+weft::testhost::editor-select! [weft::ws::view-editor $_kv] 0 4
+let _sel [weft::ws::view-selection $_kv]
+let _kr [weft::image::eval-in! user {weft::transform::run "upper"} \
+    [weft::ctx::make #{buffer $_kb start [get $_sel 0] end [get $_sel 1] ns user}]]
+gate "bound script's ctx scopes the transform" \
+    [== [get [get $_kr value] kind] plan]
+weft::transform::apply
+gate "the selection was transformed" \
+    [== [Lk::doc_text [weft::ws::buffer-doc $_kb]] "MAKE me loud\n"]
+
+puts ""
+puts "P3 STAGE-6 GATES PASSED"
+puts ""
+
+;; ============== milestone: self-hosting (weft edits weft) ==========
+
+;; Live-patch a namespaced proc from an evaluation -- the core of the
+;; self-hosting claim.  QUALIFIED namespace blocks re-enter their
+;; absolute home even inside the user trampoline (lcl anchors
+;; qualified paths at the global frame).  NOTE (lcl f395513,
+;; compositional nesting): a BARE `namespace weft { ... }` evaluated
+;; inside `namespace user` no longer reaches the root `weft` -- it
+;; declares `user::weft`, which then shadows `weft::` for later user
+;; evaluations.  Patch root-level members through `Ns::set` instead.
+weft::image::eval-in! user \
+    {namespace weft::image { proc _probe {} { return "ORIGINAL" } }} \
+    [weft::ctx::make #{ns user}]
+gate "a namespace block from user defines into its absolute home" \
+    [== [weft::image::_probe] "ORIGINAL"]
+weft::image::eval-in! user \
+    {namespace weft::image { proc _probe {} { return "SELF-HOSTED" } }} \
+    [weft::ctx::make #{ns user}]
+gate "a live namespace patch takes effect at the call site" \
+    [== [weft::image::_probe] "SELF-HOSTED"]
+
+;; Root-level members (weft::version lives in `namespace weft`) are
+;; patched in place through the namespace value.
+weft::image::eval-in! user \
+    {Ns::set $weft version [lambda {} { return "ROOT-PATCHED" }]} \
+    [weft::ctx::make #{ns user}]
+gate "a root-namespace member is patchable via Ns::set" \
+    [== [weft::version] "ROOT-PATCHED"]
+
+;; The EXECUTE route treats a namespace block as Lcl, not shell.
+let _sh [weft::shell::run-text! \
+    {namespace weft::image { proc _probe {} { return "ROUTED" } }} \
+    [weft::ctx::make #{ns user}]]
+gate "EXECUTE routes namespace blocks to the image" \
+    [and [== [weft::task::state $_sh] succeeded] \
+         [== [weft::image::_probe] "ROUTED"]]
+
+puts ""
+puts "SELF-HOSTING MILESTONE GATES PASSED"

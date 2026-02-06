@@ -1,0 +1,33 @@
+;;; weft::ctx -- explicit execution contexts (plan section 6).
+;;;
+;;; Every command, transform, producer update, evaluation, and capability
+;;; invocation receives a ctx dict instead of consulting ambient
+;;; "current buffer" globals.  A ctx is plain data:
+;;;
+;;;   #{buffer <id> view <id> execution <id> selection <...> ...}
+;;;
+;;; Fields are optional; weft::ctx::field reads with an empty-string
+;;; default so consumers never probe with has?.  Execution ids are
+;;; monotonically increasing within a session and never reused --
+;;; array positions and node pointers are not identity.
+
+namespace weft::ctx {
+
+    var _exec_counter 0
+
+    proc next-execution {} {
+        set! _exec_counter [+ $_exec_counter 1]
+        return "x$_exec_counter"
+    }
+
+    ;; Build a ctx from a partial dict, stamping a fresh execution id.
+    proc make {fields} {
+        return [put $fields execution [weft::ctx::next-execution]]
+    }
+
+    proc field {ctx name} {
+        if [has? $ctx $name] { return [get $ctx $name] }
+
+        return ""
+    }
+}

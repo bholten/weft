@@ -1,0 +1,172 @@
+;;; weft::plumb -- plumbing rules as data, matches as annotations, LOOK
+;;; as presentation commands (plan P2).
+;;;
+;;; A rule is data plus an action closure:
+;;;
+;;;   #{name file-line
+;;;     pattern {([A-Za-z0-9_./~-]+):([0-9]+)}     ;; POSIX ERE, BRACED
+;;;     style #{fg (120 190 255) underline 1}      ;; span styling
+;;;     action <fn (value ctx) -> "">}
+;;;
+;;; Patterns must be braced literals: a double-quoted pattern would run
+;;; its [...] character classes through command substitution.
+;;;
+;;; The plumb producer rescans on revision change: it drops the plumb
+;;; layer and re-adds one annotation per match, each carrying a typed
+;;; presentation value #{rule <name> text <match> cap1 .. cap2 ..} --
+;;; a LOOK click arrives back as that value, no re-parsing.  Rule
+;;; actions receive (value, ctx); dispatch! routes by value.rule.
+
+namespace weft::plumb {
+
+    var rules #{}
+
+    ;; Rules generation: bumped on every rule change, reported to the
+    ;; producer registry so open buffers rescan live (P4) -- adding a
+    ;; rule re-annotates without waiting for a document edit.
+    var gen 0
+
+    ;; Combined with the config + workspace-metadata generations:
+    ;; filetype-scoped rules re-render when a buffer's filetype or the
+    ;; filetype settings change, not only when rules do.
+    proc generation {} {
+        return "$gen|[weft::config::generation]|[weft::ws::meta-generation]"
+    }
+
+    proc rule! {r} {
+        var rec $r
+        ;; Compile once; scanning uses the compiled object.
+        set! rec [put $rec compiled [Regex::compile [get $r pattern]]]
+        set! rules [put $rules [get $r name] $rec]
+        set! gen [+ $gen 1]
+
+        return [get $r name]
+    }
+
+    proc rule-names {} {
+        return [List::sort [Dict::keys $rules]]
+    }
+
+    ;; The producer update: drop the plumb layer, re-add every rule
+    ;; match with its typed presentation value (captures included as
+    ;; cap1..capN).  Scanning IS the range-query algebra (Q5
+    ;; convergence): a rule is [matches] over the document with the
+    ;; rule's precompiled regex; this sink's value-add is the typed
+    ;; presentations and filetype scoping, not the scan.
+    proc scan! {ctx} {
+        let store [get $ctx store]
+        let bid [get $ctx buffer]
+        let ft [get [weft::ws::buffer $bid] filetype]
+
+        foreach id [Lk::annot_by_layer $store "plumb"] {
+            Lk::annot_remove $store $id
+        }
+
+        foreach name [Dict::keys $rules] {
+            let r [get $rules $name]
+
+            ;; Rule scoping: a rule with a `filetypes` list applies
+            ;; only to those; without one it applies everywhere.
+            var applies 1
+
+            if [has? $r filetypes] {
+                if [not [has? [get $r filetypes] $ft]] {
+                    set! applies 0
+                }
+            }
+
+            if $applies {
+                let plan [weft::q::matches [weft::q::doc $bid] \
+                    [get $r compiled]]
+
+                foreach rec [get [weft::q::_records $plan -1] records] {
+                    let a [Lk::annot_add $store [get $rec start] \
+                        [get $rec end] "plumb" #{rule $name}]
+                    var v #{rule $name text [get $rec text]}
+                    var ci 0
+
+                    while [< $ci [len [get $rec caps]]] {
+                        set! ci [+ $ci 1]
+                        set! v [put $v "cap$ci" \
+                            [weft::q::cap-text $rec $ci]]
+                    }
+
+                    weft::ws::present! $store $a "plumb" $v
+                }
+            }
+        }
+
+        return ""
+    }
+
+    proc producer-def {} {
+        return #{name plumb layers (plumb)
+            update [lambda {ctx} { return [weft::plumb::scan! $ctx] }]
+            generation [lambda {} { return [weft::plumb::generation] }]}
+    }
+
+    ;; Span styling for the plumb layer (projected by the view layer).
+    proc style-of {rule_name} {
+        if [not [has? $rules $rule_name]] { return #{} }
+
+        let r [get $rules $rule_name]
+
+        if [has? $r style] { return [get $r style] }
+
+        return #{}
+    }
+
+    ;; LOOK dispatch: a presentation value arrives from a click (or a
+    ;; test); route to its rule's action with ctx.
+    proc dispatch! {value ctx} {
+        let name [get $value rule]
+
+        if [not [has? $rules $name]] {
+            return [weft::error::make invalid-args "unknown plumb rule $name"]
+        }
+
+        return [apply [get [get $rules $name] action] $value $ctx]
+    }
+
+    ;; ---- default rules ----
+    ;; file:line -- open the file in the acting pane at that line.
+    ;; Relative paths resolve against nothing yet (cwd is the host's);
+    ;; the resource layer owns real resolution later.
+    proc default-rules! {} {
+        ;; NB: the pattern is BRACED -- double quotes would run the
+        ;; regex brackets through command substitution.
+        ;;
+        ;; The file part must contain a dot or slash (the weft-mini
+        ;; heuristic): plain word:digits is NOT a plumb -- otherwise
+        ;; every 12:30 and 0:1 in prose lights up.  Real scoping
+        ;; (rules per filetype) arrives with rich config.
+        weft::plumb::rule! #{name file-line
+            pattern {([A-Za-z0-9_~-]*[./][A-Za-z0-9_./~-]*):([0-9]+)}
+            style #{fg (120 190 255) underline 1}
+            action [lambda {value ctx} {
+                let b [weft::ws::buffer-open! [get $value cap1] $ctx]
+
+                if [weft::error::error? $b] { return $b }
+
+                let pane [weft::ctx::field $ctx pane]
+                let vid [weft::ws::pane-show-buffer! $pane $b]
+                let doc [weft::ws::buffer-doc $b]
+                var ln [int [get $value cap2]]
+
+                if [< $ln 1] {
+                    set! ln 1
+                }
+
+                let last [Lk::doc_line_count $doc]
+
+                if [> $ln $last] {
+                    set! ln $last
+                }
+
+                weft::ws::view-goto! $vid [Lk::doc_line_start $doc [- $ln 1]]
+
+                return ""
+            }]}
+        return ""
+    }
+}

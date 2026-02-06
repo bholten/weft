@@ -1,0 +1,372 @@
+;; Buffer and pane management gates (docs/buffers.md): the resolver
+;; and its policies, show / only / close / transpose / pane-swap, the
+;; special-buffer lifecycles, and the rows.  Headless, fake editors.
+;;   weft --headless test/buffers-gates.lcl
+
+proc gate {name ok} {
+    if [not $ok] { error "GATE FAILED: $name" }
+    puts "ok: $name"
+}
+
+require "weft/host/test.lcl"
+
+weft::ws::init! [weft::testhost::editor-hooks]
+weft::config::put! data_dir "/data"
+weft::persist::reset!
+
+weft::testhost::fs-put! "/w/docs/qol.md" "qol"
+weft::testhost::fs-put! "/w/docs/plan.md" "plan"
+weft::testhost::fs-put! "/w/src/util.lcl" "util"
+weft::testhost::fs-put! "/w/notes/qol.txt" "notes"
+weft::testhost::fs-put! "/other/util.lcl" "other util"
+
+proc ev {code ctx} {
+    let r [weft::image::eval-in! user $code $ctx]
+    if [not [get $r ok]] { return [get $r error] }
+    return [get $r value]
+}
+
+proc err-kind {e} {
+    if [not [weft::error::error? $e]] { return "" }
+    let d [weft::error::data $e]
+    if [has? $d kind] { return [get $d kind] }
+    return ""
+}
+
+;; A workspace: qol.md in the root pane, opened the way the CLI
+;; would (cwd-relative names, canonical paths).
+let _c0 [weft::ctx::make #{}]
+let _qol [weft::ws::buffer-open! "/w/docs/qol.md" $_c0]
+let _plan [weft::ws::buffer-open! "/w/docs/plan.md" $_c0]
+let _util [weft::ws::buffer-open! "/w/src/util.lcl" $_c0]
+let _p1 [weft::ws::tree-init! [weft::ws::view-create! $_qol]]
+let _cx [weft::ctx::make [weft::ws::focused-ctx-fields]]
+
+;; ===================== resolution: exact =====================
+gate "exact: id resolves" \
+    [== $_qol [weft::ws::buffer-resolve $_qol exact $_cx]]
+gate "exact: name resolves" \
+    [== $_qol [weft::ws::buffer-resolve "/w/docs/qol.md" exact $_cx]]
+gate "exact: cwd-relative path resolves (ctx buffer's cwd is /w/docs)" \
+    [== $_plan [weft::ws::buffer-resolve "plan.md" exact $_cx]]
+gate "exact: basename prefix does NOT match" \
+    [== no-such-buffer [err-kind [weft::ws::buffer-resolve "qo" exact $_cx]]]
+gate "exact: unknown -> no-such-buffer" \
+    [== no-such-buffer [err-kind [weft::ws::buffer-resolve "nope" exact $_cx]]]
+gate "exact: unknown error carries the query" \
+    [== nope [get [weft::error::data \
+        [weft::ws::buffer-resolve "nope" exact $_cx]] query]]
+
+;; Duplicate NAMES: the same leaf spelling from two cwds -- two
+;; buffers, one display name, different resources.
+let _u2b [weft::ws::buffer-create! "/w/src/util.lcl" "/other/util.lcl" "dup"]
+let _amb [weft::ws::buffer-resolve "/w/src/util.lcl" exact $_cx]
+gate "exact: duplicate names -> ambiguous-buffer, never first-match" \
+    [== ambiguous-buffer [err-kind $_amb]]
+gate "ambiguity is a value: two candidates with id/name/path" \
+    [and [== 2 [len [get [weft::error::data $_amb] candidates]]] \
+         [has? [get [get [weft::error::data $_amb] candidates] 0] path]]
+gate "ambiguity message names the candidates" \
+    [>= [String::find [weft::error::message $_amb] "ambiguous buffer"] 0]
+gate "exact: the id still resolves a duplicate-named buffer" \
+    [== $_u2b [weft::ws::buffer-resolve $_u2b exact $_cx]]
+weft::ws::buffer-close! $_u2b 1
+
+;; ===================== resolution: fuzzy =====================
+gate "fuzzy: exact basename" \
+    [== $_util [weft::ws::buffer-resolve "util.lcl" fuzzy $_cx]]
+gate "fuzzy: unique basename prefix (show qol -> docs/qol.md)" \
+    [== $_qol [weft::ws::buffer-resolve "qol" fuzzy $_cx]]
+gate "fuzzy: unique component prefix" \
+    [== $_util [weft::ws::buffer-resolve "sr" fuzzy $_cx]]
+gate "fuzzy: substring never matches" \
+    [== no-such-buffer [err-kind [weft::ws::buffer-resolve "til" fuzzy $_cx]]]
+gate "fuzzy: ambiguous prefix -> structured candidates" \
+    [== ambiguous-buffer [err-kind [weft::ws::buffer-resolve "d" fuzzy $_cx]]]
+
+;; Stability is observable: a second buffer sharing the prefix turns
+;; a hit into an ambiguity.
+let _qn [weft::ws::buffer-open! "/w/notes/qol.txt" $_c0]
+let _amb2 [weft::ws::buffer-resolve "qol" fuzzy $_cx]
+gate "fuzzy: a new buffer sharing the prefix makes it ambiguous" \
+    [== ambiguous-buffer [err-kind $_amb2]]
+gate "fuzzy: exact basename still wins over prefix ambiguity" \
+    [== $_qol [weft::ws::buffer-resolve "qol.md" fuzzy $_cx]]
+gate "fuzzy: path-less buffers resolve by their name" \
+    [== [weft::ws::scratch-buffer!] \
+        [weft::ws::buffer-resolve "*scr" fuzzy $_cx]]
+weft::ws::buffer-close! [weft::ws::buffer-for-name "*scratch*"] 1
+weft::ws::buffer-close! $_qn 1
+
+;; ===================== show =====================
+weft::ws::view-restore! [weft::ws::pane-view $_p1] #{cursor 2}
+let _p2 [weft::ws::pane-split! $_p1 h $_plan]
+weft::ws::focus! $_p1
+let _cp1 [weft::ctx::make [weft::ws::focused-ctx-fields]]
+
+let _sh [ev {weft::show util} $_cp1]
+gate "show: result names pane, buffer and name" \
+    [and [== shown [get $_sh kind]] \
+         [and [== $_p1 [get $_sh pane]] \
+              [and [== $_util [get $_sh buffer]] \
+                   [== "/w/src/util.lcl" [get $_sh name]]]]]
+gate "show: the acting pane shows it" \
+    [== $_util [weft::ws::view-buffer [weft::ws::pane-view $_p1]]]
+gate "show: other panes untouched" \
+    [== $_plan [weft::ws::view-buffer [weft::ws::pane-view $_p2]]]
+ev {weft::show qol} [weft::ctx::make [weft::ws::focused-ctx-fields]]
+gate "show: the hidden buffer's editor state survives being shown again" \
+    [== 2 [get [weft::ws::view-snapshot [weft::ws::pane-view $_p1]] cursor]]
+gate "show: ambiguity returns the structured error" \
+    [== ambiguous-buffer [err-kind [ev {weft::show d} $_cp1]]]
+gate "show: acts in the ctx PANE, not the focused one" \
+    [== $_p2 [get [ev {weft::show util} \
+        [weft::ctx::make #{pane $_p2}]] pane]]
+gate "show: ...and that pane now shows it" \
+    [== $_util [weft::ws::view-buffer [weft::ws::pane-view $_p2]]]
+weft::ws::pane-show-buffer! $_p2 $_plan
+
+;; ===================== only =====================
+let _p3 [weft::ws::pane-split! $_p2 v $_util]
+let _p4 [weft::ws::pane-split! $_p1 v $_plan]
+gate "only: setup has four panes" [== 4 [len [weft::ws::panes]]]
+weft::ws::focus! $_p1
+let _on [ev {weft::only} [weft::ctx::make [weft::ws::focused-ctx-fields]]]
+gate "only: result counts the closed panes" \
+    [and [== only [get $_on kind]] [== 3 [get $_on closed]]]
+gate "only: one pane left" [== 1 [len [weft::ws::panes]]]
+gate "only: the held pane id survives with its view" \
+    [and [== $_p1 [weft::ws::focused-pane]] \
+         [== $_qol [weft::ws::view-buffer [weft::ws::pane-view $_p1]]]]
+gate "only: it is the root" [== $_p1 [weft::ws::tree-root]]
+gate "only: no buffer was lost" [== 3 [len [weft::ws::buffer-list]]]
+gate "only: on the root pane is a no-op" \
+    [== 0 [get [ev {weft::only} [weft::ctx::make \
+        [weft::ws::focused-ctx-fields]]] closed]]
+gate "only: session round-trips the collapsed tree" \
+    [and [== 1 [weft::session::save!]] [== 1 [weft::session::restore! #{}]]]
+gate "only: ...as one pane" [== 1 [len [weft::ws::panes]]]
+
+;; ===================== transpose / pane-swap =====================
+let _root_pane [weft::ws::focused-pane]
+let _tp [ev {weft::transpose} [weft::ctx::make [weft::ws::focused-ctx-fields]]]
+gate "transpose: root pane is a no-op with empty fields" \
+    [and [== transposed [get $_tp kind]] [empty? [get $_tp split]]]
+
+let _pb [weft::ws::pane-split! $_root_pane h $_plan]
+let _sid [get [weft::ws::node $_pb] parent]
+weft::ws::split-ratio-set! $_sid 0.3
+let _tp2 [ev {weft::transpose} [weft::ctx::make #{pane $_pb}]]
+gate "transpose: flips the parent split's axis" \
+    [and [== v [get $_tp2 axis]] [== v [get [weft::ws::node $_sid] axis]]]
+gate "transpose: names the split" [== $_sid [get $_tp2 split]]
+gate "transpose: ratio preserved" [== 0.3 [weft::ws::split-ratio $_sid]]
+ev {weft::transpose} [weft::ctx::make #{pane $_pb}]
+gate "transpose: flips back" [== h [get [weft::ws::node $_sid] axis]]
+
+weft::ws::focus! $_root_pane
+let _va [weft::ws::pane-view $_root_pane]
+let _vb [weft::ws::pane-view $_pb]
+let _sw [ev {weft::pane-swap} [weft::ctx::make [weft::ws::focused-ctx-fields]]]
+gate "pane-swap: views exchange" \
+    [and [== $_vb [weft::ws::pane-view $_root_pane]] \
+         [== $_va [weft::ws::pane-view $_pb]]]
+gate "pane-swap: focus stays" [== $_root_pane [weft::ws::focused-pane]]
+gate "pane-swap: result names both panes" \
+    [and [== $_root_pane [get $_sw pane]] [== $_pb [get $_sw with]]]
+ev {weft::pane-swap} [weft::ctx::make [weft::ws::focused-ctx-fields]]
+
+;; ===================== close =====================
+;; Layout: root pane shows qol (focused), _pb shows plan.  Make util
+;; dirty and show it in BOTH panes.
+Lk::doc_insert [weft::ws::buffer-doc $_util] 0 "!"
+weft::ws::pane-show-buffer! $_root_pane $_util
+weft::ws::pane-show-buffer! $_pb $_util
+weft::ws::focus! $_pb
+weft::ws::focus! $_root_pane
+
+let _cl1 [ev {weft::close uti} [weft::ctx::make [weft::ws::focused-ctx-fields]]]
+gate "close: fuzzy spelling is refused (exact policy)" \
+    [== no-such-buffer [err-kind $_cl1]]
+let _cl2 [ev {weft::close /w/src/util.lcl} \
+    [weft::ctx::make [weft::ws::focused-ctx-fields]]]
+gate "close: dirty is refused with code denied" \
+    [and [weft::error::error? $_cl2] [== denied [weft::error::code $_cl2]]]
+gate "close: refused BEFORE any pane moved" \
+    [and [== $_util [weft::ws::view-buffer [weft::ws::pane-view $_root_pane]]] \
+         [== $_util [weft::ws::view-buffer [weft::ws::pane-view $_pb]]]]
+gate "close: the refusal names the force spelling" \
+    [>= [String::find [weft::error::message $_cl2] "force"] 0]
+gate "closable? and close! agree" \
+    [== denied [weft::error::code [weft::ws::buffer-closable? $_util 0]]]
+
+let _cl3 [ev {weft::close /w/src/util.lcl force} \
+    [weft::ctx::make [weft::ws::focused-ctx-fields]]]
+gate "close: forced discards" \
+    [and [== closed [get $_cl3 kind]] [not [weft::ws::buffer? $_util]]]
+gate "close: result counts the retargeted panes" [== 2 [get $_cl3 panes]]
+gate "close: no pane closed" [== 2 [len [weft::ws::panes]]]
+;; MRU other buffer: focus history is (_root_pane _pb); both showed
+;; util, so the walk finds nothing and falls to *scratch*.
+gate "close: falls back to *scratch* when no other buffer is shown" \
+    [== [weft::ws::buffer-for-name "*scratch*"] \
+        [weft::ws::view-buffer [weft::ws::pane-view $_root_pane]]]
+
+;; MRU fallback when another buffer IS shown: qol in root (touched
+;; last), plan in _pb; close plan -> _pb falls back to qol.
+weft::ws::pane-show-buffer! $_root_pane $_qol
+weft::ws::pane-show-buffer! $_pb $_plan
+weft::ws::focus! $_pb
+weft::ws::focus! $_root_pane
+let _cl4 [ev {weft::close /w/docs/plan.md} \
+    [weft::ctx::make [weft::ws::focused-ctx-fields]]]
+gate "close: evacuates to the most recently active other buffer" \
+    [and [== closed [get $_cl4 kind]] \
+         [== $_qol [weft::ws::view-buffer [weft::ws::pane-view $_pb]]]]
+gate "close: the ctx buffer by default" \
+    [== $_qol [get [ev {weft::close} \
+        [weft::ctx::make [weft::ws::focused-ctx-fields]]] buffer]]
+gate "close: *scratch* remains after the last named buffer closes" \
+    [== [weft::ws::buffer-for-name "*scratch*"] \
+        [weft::ws::view-buffer [weft::ws::pane-view $_root_pane]]]
+gate "close: the only buffer refuses" \
+    [== denied [weft::error::code [ev {weft::close} \
+        [weft::ctx::make [weft::ws::focused-ctx-fields]]]]]
+
+;; ===================== special buffers =====================
+;; *lcl*: the session is the image, the buffer is a transcript.
+let _repl [weft::ws::buffer-create! "*lcl*" "" ""]
+let _tgt [weft::ws::buffer-open! "/w/docs/plan.md" $_c0]
+weft::ws::pane-show-buffer! $_pb $_repl
+ev {proc keepme {} { return 7 }} [weft::ctx::make #{buffer $_repl}]
+ev {weft::repl::attach /w/docs/plan.md} [weft::ctx::make #{buffer $_repl}]
+gate "attach: takes a NAME (exact policy)" [weft::repl::attached?]
+gate "attach: a prefix is refused under exact" \
+    [== no-such-buffer [err-kind [ev {weft::repl::attach pla} \
+        [weft::ctx::make #{buffer $_repl}]]]]
+let _clr [ev {weft::close *lcl*} [weft::ctx::make #{pane $_pb buffer $_repl}]]
+gate "*lcl*: closes like any buffer" [== closed [get $_clr kind]]
+gate "*lcl*: user:: definitions survive the transcript" \
+    [== 7 [ev {keepme} [weft::ctx::make #{}]]]
+gate "*lcl*: the attachment survives the transcript too" \
+    [weft::repl::attached?]
+ev {weft::close /w/docs/plan.md} [weft::ctx::make #{pane $_pb}]
+gate "attachment to a CLOSED target detaches lazily" \
+    [not [weft::repl::attached?]]
+
+;; *shell*: its cwd is buffer state -- closing forgets it.
+let _sh1 [weft::ws::buffer-create! "*shell*" "" ""]
+weft::ws::buffer-set-cwd! $_sh1 "/w/docs"
+weft::ws::pane-show-buffer! $_pb $_sh1
+ev {weft::close *shell*} [weft::ctx::make #{pane $_pb buffer $_sh1}]
+gate "*shell*: closed" [empty? [weft::ws::buffer-for-name "*shell*"]]
+let _sh2 [weft::ws::buffer-create! "*shell*" "" ""]
+gate "*shell*: a resummoned shell starts without the old cwd" \
+    [not [has? [weft::ws::buffer $_sh2] cwd]]
+weft::ws::buffer-close! $_sh2 1
+
+;; *output*: closing cancels runs streaming into it.
+let _out [weft::shell::output-buffer!]
+var _cancelled 0
+weft::tasks::register! "run-1" #{poll [lambda {} {
+        return [::weft::task::pending "run-1"]
+    }]
+    cancel [lambda {} { set! _cancelled 1 ; return "" }]
+    meta #{buffer $_out execution "x0"}}
+weft::ws::pane-show-buffer! $_pb $_out
+ev {weft::close *output*} [weft::ctx::make #{pane $_pb buffer $_out}]
+gate "*output*: close cancels the run streaming into it" [== 1 $_cancelled]
+gate "*output*: the next emitter recreates it" \
+    [not [== $_out [weft::shell::output-buffer!]]]
+
+;; ===================== rows and resource identity =====================
+let _rows [weft::buffers]
+gate "weft::buffers still emits" [== emitted [get $_rows kind]]
+let _otext [Lk::doc_text [weft::ws::buffer-doc [weft::shell::output-buffer!]]]
+gate "weft::buffers rows carry the id as the last column" \
+    [>= [String::find $_otext "  [weft::ws::buffer-for-name {*scratch*}]\n"] 0]
+gate "rows still qjump (presentation recorded)" \
+    [> [len ${weft::testhost::_presented}] 0]
+
+let _q2 [weft::ws::buffer-open! "/w/docs/qol.md" $_c0]
+gate "open: a spelling that canonicalizes to an open buffer returns it" \
+    [== $_q2 [weft::ws::buffer-open! "/w/docs/../docs/qol.md" $_c0]]
+
+;; The native bindings profile (loaded by boot via default.lcl) is
+;; data over the commands.
+var _bound ()
+foreach b [weft::config::bindings-list] {
+    set! _bound [List::push $_bound [get $b chord]]
+}
+gate "bindings profile binds the buffer commands" \
+    [and [has? $_bound "ctrl+1"] \
+         [and [has? $_bound "ctrl+shift+w"] \
+              [and [has? $_bound "ctrl+shift+b"] [has? $_bound "ctrl+shift+e"]]]]
+gate "bindings profile leaves ctrl+k alone" [not [has? $_bound "ctrl+k"]]
+
+gate "bindings profile binds new/split-new" \
+    [and [has? $_bound "ctrl+shift+n"] \
+         [and [has? $_bound "ctrl+alt+e"] [has? $_bound "ctrl+alt+d"]]]
+
+;; ===================== new / split-h / split-v =====================
+ev {weft::only} [weft::ctx::make [weft::ws::focused-ctx-fields]]
+let _np0 [weft::ws::focused-pane]
+let _nb0 [weft::ws::view-buffer [weft::ws::pane-view $_np0]]
+let _n1 [ev {weft::new} [weft::ctx::make #{pane $_np0}]]
+gate "new: creates *new* and shows it in the acting pane" \
+    [and [== new [get $_n1 kind]] \
+         [and [== "*new*" [get $_n1 name]] \
+              [== [get $_n1 buffer] [weft::ws::view-buffer [weft::ws::pane-view $_np0]]]]]
+gate "new: empty, path-less, clean" \
+    [and [== "" [Lk::doc_text [weft::ws::buffer-doc [get $_n1 buffer]]]] \
+         [and [== "" [get [weft::ws::buffer [get $_n1 buffer]] path]] \
+              [not [weft::ws::buffer-dirty? [get $_n1 buffer]]]]]
+gate "new: no split, pane unchanged" \
+    [and [== $_np0 [get $_n1 pane]] [== 1 [len [weft::ws::panes]]]]
+
+let _n2 [ev {weft::new v} [weft::ctx::make #{pane $_np0}]]
+gate "new v: splits stacked, the NEW pane shows the new buffer" \
+    [and [== v [get $_n2 axis]] \
+         [and [not [== $_np0 [get $_n2 pane]]] \
+              [== [get $_n2 buffer] \
+                  [weft::ws::view-buffer [weft::ws::pane-view [get $_n2 pane]]]]]]
+gate "new v: the old pane keeps *new*" \
+    [== [get $_n1 buffer] [weft::ws::view-buffer [weft::ws::pane-view $_np0]]]
+gate "new v: names uniquify -> *new-2*" [== "*new-2*" [get $_n2 name]]
+gate "new v: focus moved to the new pane" \
+    [== [get $_n2 pane] [weft::ws::focused-pane]]
+gate "new v: the split is stacked" \
+    [== v [get [weft::ws::node [get [weft::ws::node $_np0] parent]] axis]]
+
+let _n3 [ev {weft::new h notes} [weft::ctx::make #{pane $_np0}]]
+gate "new h NAME: side-by-side split named as asked" \
+    [and [== h [get $_n3 axis]] [== notes [get $_n3 name]]]
+let _n4 [ev {weft::new notes} [weft::ctx::make #{pane $_np0}]]
+gate "new NAME twice: notes-2 (no stars to keep)" [== notes-2 [get $_n4 name]]
+gate "new: the panes count is 3 (here / stacked / side-by-side)" \
+    [== 3 [len [weft::ws::panes]]]
+
+ev {weft::only} [weft::ctx::make #{pane $_np0}]
+let _s1 [ev {weft::split-h} [weft::ctx::make #{pane $_np0}]]
+gate "split-h alone: two views of the acting pane's buffer" \
+    [and [== split [get $_s1 kind]] \
+         [and [== [get $_n4 buffer] [get $_s1 buffer]] \
+              [and [== $_np0 [get $_s1 from]] \
+                   [== [get $_s1 buffer] \
+                       [weft::ws::view-buffer [weft::ws::pane-view [get $_s1 pane]]]]]]]
+gate "split-h alone: axis h" \
+    [== h [get [weft::ws::node [get [weft::ws::node $_np0] parent]] axis]]
+let _plan2 [weft::ws::buffer-open! "/w/docs/plan.md" $_c0]
+let _s2 [ev {weft::split-v plan} [weft::ctx::make #{pane $_np0}]]
+gate "split-v BUF: fuzzy like show -- plan -> docs/plan.md in the new pane" \
+    [and [== $_plan2 [get $_s2 buffer]] \
+         [== $_plan2 [weft::ws::view-buffer [weft::ws::pane-view [get $_s2 pane]]]]]
+gate "split-v BUF: the acting pane keeps its buffer" \
+    [== [get $_n4 buffer] [weft::ws::view-buffer [weft::ws::pane-view $_np0]]]
+gate "split-v unknown: structured no-such-buffer, no split made" \
+    [and [== no-such-buffer [err-kind [ev {weft::split-v nope} [weft::ctx::make #{pane $_np0}]]]] \
+         [== 3 [len [weft::ws::panes]]]]
+ev {weft::only} [weft::ctx::make #{pane $_np0}]
+
+puts ""
+puts "BUFFERS GATES PASSED"

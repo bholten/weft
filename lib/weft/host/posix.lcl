@@ -1,0 +1,221 @@
+;;; POSIX host capability bindings (plan section 4).
+;;;
+;;; The only place core weft's world touches lcl packages directly.
+;;; Which packages exist is the host binary's package matrix; the
+;;; weft_have_* globals it defines gate each registration, so a host
+;;; built without a package simply lacks the capability (invoke reports
+;;; `unsupported` -- it never half-works).
+
+if $weft_have_io {
+    weft::cap::register #{name "fs.read"
+        description "Read a file's entire contents as a string"
+        args "path" returns "string"
+        invoke [lambda {argd ctx} { return [Io::read_file [get $argd path]] }]}
+
+    weft::cap::register #{name "fs.write"
+        description "Write a string as a file's entire contents"
+        args "path text" returns "1"
+        invoke [lambda {argd ctx} {
+            Io::write_file [get $argd path] [get $argd text]
+            return 1
+        }]}
+
+    weft::cap::register #{name "env.get"
+        description "Read an environment variable (empty when unset)"
+        args "name" returns "string"
+        invoke [lambda {argd ctx} {
+            return [Io::getenv [get $argd name]]
+        }]}
+}
+
+;; Filesystem predicates, directories and the working directory live in
+;; lcl-posix (lcl 782fdc2 split them out so lcl-io could stay ANSI C).
+if $weft_have_posix {
+    weft::cap::register #{name "fs.exists?"
+        description "Whether a path exists"
+        args "path" returns "0/1"
+        invoke [lambda {argd ctx} { return [Posix::exists? [get $argd path]] }]}
+
+    weft::cap::register #{name "fs.mkdir"
+        description "Create a directory (existing is success)"
+        args "path" returns "1"
+        invoke [lambda {argd ctx} {
+            let p [get $argd path]
+
+            if [not [Posix::dir? $p]] {
+                Posix::mkdir $p
+            }
+
+            return 1
+        }]}
+
+    weft::cap::register #{name "fs.mtime"
+        description "A file's modification time (epoch seconds)"
+        args "path" returns "int"
+        invoke [lambda {argd ctx} {
+            return [Posix::file_mtime [get $argd path]]
+        }]}
+
+    weft::cap::register #{name "fs.file?"
+        description "Is the path a regular file?"
+        args "path" returns "bool"
+        invoke [lambda {argd ctx} {
+            return [Posix::file? [get $argd path]]
+        }]}
+
+    weft::cap::register #{name "fs.dir?"
+        description "Is the path a directory?"
+        args "path" returns "bool"
+        invoke [lambda {argd ctx} {
+            return [Posix::dir? [get $argd path]]
+        }]}
+
+    weft::cap::register #{name "fs.cwd"
+        description "The host process working directory"
+        args "" returns "path"
+        invoke [lambda {argd ctx} {
+            return [Posix::getcwd]
+        }]}
+}
+
+;; Process capabilities (P2 shell execution).  Handles are opaque
+;; runtime references: ephemeral by the state rules, never serialized.
+;; read is non-blocking (timeout 0); status checks use alive? -- for
+;; lcl-process, wait's timeout 0 means block forever, so reap with a
+;; 1ms wait only after alive? says the process is gone.
+if $weft_have_process {
+    weft::cap::register #{name "process.spawn"
+        description "Spawn a process (argv list); stderr merged into stdout unless merge 0"
+        args "argv ?cwd? ?merge?" returns "handle"
+        invoke [lambda {argd ctx} {
+            var opts #{merge 1}
+            if [has? $argd cwd] { set! opts [put $opts cwd [get $argd cwd]] }
+            if [has? $argd merge] { set! opts [put $opts merge [get $argd merge]] }
+            return [Process::spawn [get $argd argv] $opts]
+        }]}
+
+    weft::cap::register #{name "process.read"
+        description "Non-blocking read of available process output (stderr 1 reads the error stream of an unmerged spawn)"
+        args "proc ?stderr?" returns "string"
+        invoke [lambda {argd ctx} {
+            var opts #{timeout 0}
+            if [has? $argd stderr] { set! opts [put $opts stderr [get $argd stderr]] }
+            return [Process::read [get $argd proc] $opts]
+        }]}
+
+    ;; stdin: the write BLOCKS when the pipe is full, so callers feed
+    ;; bounded chunks per frame and drain stdout between them (the
+    ;; filter module does; see docs/commands.md stage D).
+    weft::cap::register #{name "process.write"
+        description "Write text to the process's stdin (blocking; returns bytes written)"
+        args "proc text" returns "int"
+        invoke [lambda {argd ctx} {
+            return [Process::send [get $argd proc] [get $argd text]]
+        }]}
+
+    weft::cap::register #{name "process.close-stdin"
+        description "Half-close the process's stdin (EOF to the child)"
+        args "proc" returns "1"
+        invoke [lambda {argd ctx} {
+            Process::close-stdin [get $argd proc]
+            return 1
+        }]}
+
+    weft::cap::register #{name "process.alive?"
+        description "Whether the process is still running"
+        args "proc" returns "0/1"
+        invoke [lambda {argd ctx} {
+            return [Process::alive? [get $argd proc]]
+        }]}
+
+    weft::cap::register #{name "process.reap"
+        description "Collect exit status of a finished process"
+        args "proc" returns "dict {exited status}"
+        invoke [lambda {argd ctx} {
+            return [Process::wait [get $argd proc] #{timeout 1}]
+        }]}
+
+    weft::cap::register #{name "process.kill"
+        description "Terminate a process (SIGTERM)"
+        args "proc" returns "1"
+        invoke [lambda {argd ctx} {
+            Process::kill [get $argd proc]
+            return 1
+        }]}
+
+    weft::cap::register #{name "process.close"
+        description "Release a process handle"
+        args "proc" returns "1"
+        invoke [lambda {argd ctx} {
+            Process::close [get $argd proc]
+            return 1
+        }]}
+}
+
+if $weft_have_time {
+    weft::cap::register #{name "time.now"
+        description "Wall-clock time in seconds since the epoch"
+        args "" returns "int"
+        invoke [lambda {argd ctx} { return [Time::time] }]}
+}
+
+;; id.new works on every host: monotonic counter, time-seeded when the
+;; time package exists so ids differ across runs.
+var _weft_id_counter 0
+var _weft_id_seed "s"
+
+if $weft_have_time {
+    set! _weft_id_seed [Time::time]
+}
+
+weft::cap::register #{name "id.new"
+    description "A fresh identifier, unique within and across sessions"
+    args "" returns "string"
+    invoke [lambda {argd ctx} {
+        set! _weft_id_counter [+ $_weft_id_counter 1]
+        return "w$_weft_id_seed-$_weft_id_counter"
+    }]}
+
+;; Tree-sitter capabilities (P4).  Sessions are opaque runtime
+;; handles, one per (buffer, language): the host keeps parser + query
+;; + last tree so successive spans calls reuse tree-sitter's internal
+;; incrementality.  Unknown languages fail `unsupported` (the grammar
+;; set is a build-time fact of this host, like the package matrix).
+if $weft_have_ts {
+    weft::cap::register #{name "ts.langs"
+        description "Language grammars compiled into this host"
+        args "" returns "list of names"
+        invoke [lambda {argd ctx} { return [Ts::langs] }]}
+
+    weft::cap::register #{name "ts.open"
+        description "Open a parse session for a language"
+        args "lang" returns "handle"
+        invoke [lambda {argd ctx} {
+            if [not [has? [Ts::langs] [get $argd lang]]] {
+                return [::weft::task::failed [::weft::error::make unsupported \
+                    "no grammar for language '[get $argd lang]' in this host"]]
+            }
+            return [Ts::open [get $argd lang]]
+        }]}
+
+    weft::cap::register #{name "ts.edit"
+        description "Report document deltas to a session (incremental)"
+        args "session edits" returns "count"
+        invoke [lambda {argd ctx} {
+            return [Ts::edit [get $argd session] [get $argd edits]]
+        }]}
+
+    weft::cap::register #{name "ts.spans"
+        description "Parse text in a session; highlight capture spans"
+        args "session text" returns "list of {start end capture}"
+        invoke [lambda {argd ctx} {
+            return [Ts::spans [get $argd session] [get $argd text]]
+        }]}
+
+    weft::cap::register #{name "ts.close"
+        description "Release a parse session's resources"
+        args "session" returns "1"
+        invoke [lambda {argd ctx} {
+            return [Ts::close [get $argd session]]
+        }]}
+}

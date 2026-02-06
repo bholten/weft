@@ -1,0 +1,247 @@
+;;; weft::ts -- the tree-sitter highlight producer (plan P4).
+;;;
+;;; A pure capability consumer: the host's ts.* capabilities do the
+;;; parsing; this module owns everything the legacy C host wrongly
+;;; owned -- session lifecycle per buffer, the capture->style palette
+;;; (config data, user-overridable), and the annotations themselves.
+;;;
+;;; One session per (buffer, language).  The producer resolves the
+;;; buffer's language from its filetype via config
+;;; (`weft::config::filetype! ".lcl" #{lang lcl}`); when the filetype
+;;; or mapping changes, the old session is closed and a fresh one
+;;; opened -- the generation token (config + workspace metadata)
+;;; makes that swap happen live, no edit needed.  Buffer close releases
+;;; the session through producer detach.
+;;;
+;;; Spans land on the `ts` layer with meta #{capture "keyword"}; the
+;;; view layer projects them through style-of.  Producer errors (no
+;;; grammar, parse failure) park as inspectable status, never crashed
+;;; frames.
+
+namespace weft::ts {
+
+    var sessions #{}    ;; buffer-id -> #{handle <h> lang <name>
+                        ;;   doc <h> sub <id>}
+    var spanlists #{}   ;; buffer-id -> styled spans, sorted by start
+    var pending #{}     ;; buffer-id -> deltas since the last scan
+
+    ;; Doc-subscription bridge: every committed change lands here (in
+    ;; order, sequential coordinates -- lk's delta contract matches
+    ;; ts_tree_edit's exactly).  The subscription lives as long as
+    ;; the session, so the host's ts.edit contract (report EVERY
+    ;; change between parses) holds by construction.
+    proc _note-deltas! {bid deltas} {
+        var got ()
+
+        if [has? $pending $bid] {
+            set! got [get $pending $bid]
+        }
+
+        foreach d $deltas {
+            set! got [List::push $got $d]
+        }
+
+        set! pending [put $pending $bid $got]
+
+        return ""
+    }
+
+    ;; ---- palette: capture name -> style ----
+    ;; Ported from the legacy scheme (VS-Code-ish, on lk's dark
+    ;; theme).  Lookup falls back by dotted prefix: keyword.repeat ->
+    ;; keyword.  Override per capture with style!.
+
+    var palette #{
+        "comment"             #{fg (106 153 85)}
+        "string"              #{fg (206 145 120)}
+        "string.special"      #{fg (215 186 125)}
+        "keyword"             #{fg (197 134 192)}
+        "function"            #{fg (220 220 170)}
+        "method"              #{fg (220 220 170)}
+        "variable"            #{fg (156 220 254)}
+        "variable.builtin"    #{fg (86 156 214)}
+        "parameter"           #{fg (156 220 254)}
+        "constant"            #{fg (79 193 255)}
+        "constant.builtin"    #{fg (86 156 214)}
+        "number"              #{fg (181 206 168)}
+        "boolean"             #{fg (86 156 214)}
+        "type"                #{fg (78 201 176)}
+        "operator"            #{fg (212 212 212)}
+        "punctuation"         #{fg (140 140 140)}
+        "punctuation.bracket" #{fg (140 140 140)}
+        "property"            #{fg (156 220 254)}
+        "attribute"           #{fg (156 220 254)}
+        "namespace"           #{fg (78 201 176)}
+        "tag"                 #{fg (86 156 214)}
+        "label"               #{fg (156 220 254)}
+        "escape"              #{fg (215 186 125)}
+    }
+
+    proc style! {capture style} {
+        set! palette [put $palette $capture $style]
+        return $capture
+    }
+
+    proc style-of {capture} {
+        var name $capture
+        var going 1
+
+        while $going {
+            if [has? $palette $name] { return [get $palette $name] }
+
+            let parts [String::split $name "."]
+
+            if [< [len $parts] 2] { set! going 0 } else {
+                set! name [String::join \
+                    [List::slice $parts 0 [- [len $parts] 1]] "."]
+            }
+        }
+
+        return #{}
+    }
+
+    ;; ---- language resolution ----
+
+    proc lang-for {ft} {
+        return [weft::config::filetype-value $ft lang ""]
+    }
+
+    ;; ---- session lifecycle ----
+
+    proc session-count {} {
+        return [len [Dict::keys $sessions]]
+    }
+
+    proc _close! {bid} {
+        if [has? $sessions $bid] {
+            let s [get $sessions $bid]
+            Lk::doc_unsubscribe [get $s doc] [get $s sub]
+            weft::cap::invoke "ts.close" #{session [get $s handle]} #{}
+            set! sessions [del $sessions $bid]
+        }
+
+        if [has? $spanlists $bid] {
+            set! spanlists [del $spanlists $bid]
+        }
+
+        if [has? $pending $bid] {
+            set! pending [del $pending $bid]
+        }
+
+        return ""
+    }
+
+    ;; The styled projection list, rebuilt at scan time (once per
+    ;; change) rather than per frame: styled span dicts sorted by
+    ;; start, ready for the view layer.  Offsets are valid for the
+    ;; scanned revision -- any edit re-runs the producer.
+    proc spans-for {bid} {
+        if [not [has? $spanlists $bid]] { return () }
+
+        return [get $spanlists $bid]
+    }
+
+    proc _drop-layer! {store} {
+        foreach id [Lk::annot_by_layer $store "ts"] {
+            Lk::annot_remove $store $id
+        }
+
+        return ""
+    }
+
+    ;; ---- the producer ----
+
+    proc scan! {ctx} {
+        let bid [get $ctx buffer]
+        let store [get $ctx store]
+        let ft [get [weft::ws::buffer $bid] filetype]
+        let lang [weft::ts::lang-for $ft]
+
+        ;; Filetype or mapping changed: the old session's grammar no
+        ;; longer applies -- clean stop, fresh start.
+        if [has? $sessions $bid] {
+            if [not [== $lang [get [get $sessions $bid] lang]]] {
+                weft::ts::_close! $bid
+            }
+        }
+
+        if [empty? $lang] {
+            weft::ts::_drop-layer! $store
+
+            if [has? $spanlists $bid] {
+                set! spanlists [del $spanlists $bid]
+            }
+
+            return ""
+        }
+
+        if [not [has? $sessions $bid]] {
+            let t [weft::cap::invoke "ts.open" #{lang $lang} #{}]
+
+            if [not [== [weft::task::state $t] succeeded]] {
+                error [weft::error::message [weft::task::failure $t]]
+            }
+
+            ;; Subscribe BEFORE the first parse: from here on, no
+            ;; document change can slip between parses unreported.
+            let doc [get $ctx doc]
+            let sub [Lk::doc_subscribe $doc [lambda {deltas} {
+                return [weft::ts::_note-deltas! $bid $deltas]
+            }]]
+
+            set! sessions [put $sessions $bid \
+                #{handle [weft::task::result $t] lang $lang
+                  doc $doc sub $sub}]
+        }
+
+        ;; Drain deltas into the session's tree; the parse below then
+        ;; reuses it and re-lexes only the changed regions.
+        if [has? $pending $bid] {
+            let edits [get $pending $bid]
+            set! pending [del $pending $bid]
+            weft::cap::invoke "ts.edit" \
+                #{session [get [get $sessions $bid] handle]
+                  edits $edits} #{}
+        }
+
+        let t2 [weft::cap::invoke "ts.spans"
+            #{session [get [get $sessions $bid] handle]
+              text [Lk::doc_text [get $ctx doc]]} #{}]
+
+        if [not [== [weft::task::state $t2] succeeded]] {
+            error [weft::error::message [weft::task::failure $t2]]
+        }
+
+        weft::ts::_drop-layer! $store
+
+        var styled ()
+
+        foreach sp [weft::task::result $t2] {
+            Lk::annot_add $store [get $sp start] [get $sp end] "ts" \
+                #{capture [get $sp capture]}
+
+            let st [weft::ts::style-of [get $sp capture]]
+
+            if [> [len [Dict::keys $st]] 0] {
+                set! styled [List::push $styled [Dict::merge \
+                    #{start [get $sp start] end [get $sp end]} $st]]
+            }
+        }
+        set! spanlists [put $spanlists $bid $styled]
+        return ""
+    }
+
+    proc release! {ctx} {
+        weft::ts::_close! [get $ctx buffer]
+        return ""
+    }
+
+    proc producer-def {} {
+        return #{name ts layers (ts)
+            update [lambda {ctx} { return [weft::ts::scan! $ctx] }]
+            stop [lambda {ctx} { return [weft::ts::release! $ctx] }]
+            generation [lambda {} {
+                return "[weft::config::generation]|[weft::ws::meta-generation]"
+            }]}
+    }
+}

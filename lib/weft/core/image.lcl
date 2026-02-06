@@ -1,0 +1,197 @@
+;;; weft::image -- the live-image evaluation model (plan section 13.7).
+;;;
+;;; One interpreter is the image; namespaces are the packages.  Every
+;;; evaluation names a CURRENT NAMESPACE (REPL/EXECUTE default: user):
+;;; evaluation scope is the whole image -- reads reach everything --
+;;; while let/var/proc land in the current namespace, so interactive
+;;; definitions are enumerable ([Ns::keys $user]) and, once lcl grows a
+;;; namespace-clearing primitive, resettable.
+;;;
+;;; Every evaluation leaves an execution record in a bounded log:
+;;;   #{id .. ns .. source .. ok 0/1 value/error .. buffer .. time ..}
+;;; Provenance is a property of execution -- the inspector reads this,
+;;; and replaying successful definitions is the poor-man's image-resume
+;;; until real image dumping exists.
+
+;; Top-level cells for the eval trampoline: the constructed program
+;; references these bare, so they must live at global scope, not
+;; inside the weft::image namespace.
+var _wimg_code ""
+var _wimg_result ""
+var _wimg_file "*image*"
+var _wimg_line 1
+
+;; The user package exists from boot.
+namespace user {}
+
+namespace weft::image {
+
+    var log ()
+    var log_cap 200
+
+    ;; The ctx of the RUNNING evaluation, dynamic-extent style: set for
+    ;; the duration of eval-in!, empty outside one.  This is not
+    ;; ambient app state -- it is the execution's own ctx, flowing
+    ;; explicitly from the invoker through the record; code the image
+    ;; is evaluating may read it (weft::transform::run does).
+    var _current_ctx #{}
+
+    proc ctx {} {
+        return $_current_ctx
+    }
+
+    proc _ns-name-ok? {ns} {
+        if $weft_have_regex {
+            return [Regex::match {^[A-Za-z_][A-Za-z0-9_]*$} $ns]
+        }
+
+        return [not [empty? $ns]]
+    }
+
+    proc _now {} {
+        let t [weft::cap::invoke "time.now" #{} #{}]
+
+        if [== [weft::task::state $t] succeeded] {
+            return [weft::task::result $t]
+        }
+
+        return 0
+    }
+
+    proc _record! {rec} {
+        set! log [List::push $log $rec]
+
+        if [> [len $log] $log_cap] {
+            set! log [List::slice $log [- [len $log] $log_cap] [len $log]]
+        }
+
+        return [get $rec id]
+    }
+
+    ;; Park an evaluation's value for the record.  Namespace values are
+    ;; kept as their rendering (`<namespace weft::image>`): a namespace
+    ;; block evaluates to the namespace itself, and holding a live
+    ;; `weft`/`weft::image` inside this module's own cells is a
+    ;; reference cycle lcl now refuses (f395513) -- and the record only
+    ;; ever needed the name.
+    proc _capture! {v} {
+        var _cap_r ""
+        var _cap_e ""
+
+        if [or [== [type $v] namespace] \
+               [not [== 0 [catch { set! _wimg_result $v } _cap_r _cap_e]]]] {
+            ;; A namespace, or a container reaching one (`list $weft`):
+            ;; the record keeps the rendering.
+            set! _wimg_result [repr $v]
+        }
+
+        return $v
+    }
+
+    ;; A ctx may carry `source #{name N line L}`: the buffer (its path
+    ;; when it has one, else its name -- `*scratch*`) and the 1-based
+    ;; line the fragment starts on.  eval-in! evaluates with lcl's
+    ;; `eval_at`, so procs defined from a buffer get Proc::origin =
+    ;; that buffer and line, error locations read `*scratch*:3`, a
+    ;; `./` require resolves against a file-backed buffer's directory,
+    ;; and Doc (weft::describe) finds their docstrings by line once
+    ;; the buffer text is registered.  ctx `buffer` is NOT the source:
+    ;; it is the lens/operand (an attached REPL evaluates *lcl* text
+    ;; against another buffer), so producers stamp `source` explicitly
+    ;; and anything without one is `*image*`.
+    proc source-of {buffer pos} {
+        let b [weft::ws::buffer $buffer]
+        var name [get $b path]
+
+        if [empty? $name] { set! name [get $b name] }
+
+        let doc [weft::ws::buffer-doc $buffer]
+        let line [+ 1 [Lk::doc_pos_to_line $doc $pos]]
+
+        return #{name $name line $line}
+    }
+
+    proc _source-fields {ctx} {
+        let src [weft::ctx::field $ctx source]
+
+        if [and [dict? $src] [has? $src name]] {
+            var line 1
+
+            if [has? $src line] { set! line [get $src line] }
+
+            return #{name [get $src name] line $line}
+        }
+
+        return #{name "*image*" line 1}
+    }
+
+    ;; Evaluate `code` with `ns` as the current namespace.  Returns
+    ;;   #{ok 1 value <v> id <record-id>}
+    ;; | #{ok 0 error <weft-error> id <record-id>}
+    ;; and appends the execution record either way (with `source`).
+    proc eval-in! {ns code ctx} {
+        let id [weft::ctx::next-execution]
+        let src [weft::image::_source-fields $ctx]
+
+        if [not [weft::image::_ns-name-ok? $ns]] {
+            let err [weft::error::make invalid-args "bad namespace name '$ns'"]
+            weft::image::_record! #{id $id ns $ns source $code ok 0
+                error $err buffer [weft::ctx::field $ctx buffer]
+                time [weft::image::_now]}
+
+            return #{ok 0 error $err id $id}
+        }
+
+        set! _wimg_code $code
+        set! _wimg_file [get $src name]
+        set! _wimg_line [get $src line]
+        set! _current_ctx $ctx
+        var r ""
+        var e ""
+        let prog "namespace $ns { weft::image::_capture! \[eval_at \$_wimg_code \$_wimg_file \$_wimg_line\] }"
+
+        if [== 0 [catch { eval $prog } r e]] {
+            set! _current_ctx #{}
+            weft::image::_record! #{id $id ns $ns source $code ok 1
+                value $_wimg_result origin $src
+                buffer [weft::ctx::field $ctx buffer]
+                time [weft::image::_now]}
+
+            return #{ok 1 value $_wimg_result id $id}
+        }
+
+        set! _current_ctx #{}
+        let err [weft::error::from-caught $e]
+
+        weft::image::_record! #{id $id ns $ns source $code ok 0
+            error $err origin $src buffer [weft::ctx::field $ctx buffer]
+            time [weft::image::_now]}
+
+        return #{ok 0 error $err id $id}
+    }
+
+    proc records {} {
+        return $log
+    }
+
+    proc clear-log! {} {
+        set! log ()
+        return 1
+    }
+
+    proc user-defs {} {
+        return [List::sort [Ns::keys $user]]
+    }
+
+    ;; Reset the user package in place (Ns::clear).  Definitions go;
+    ;; the execution log survives -- history outlives state, so a
+    ;; reset is itself a recorded execution.
+    proc reset-user! {} {
+        let n [len [Ns::keys $user]]
+        Ns::clear $user
+        weft::image::_record! #{id [weft::ctx::next-execution] ns user
+            source "<reset-user>" ok 1 value "cleared $n definitions"
+            buffer "" time [weft::image::_now]}
+        return $n
+    }
+}

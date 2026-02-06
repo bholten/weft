@@ -1,0 +1,202 @@
+;; P1 acceptance gates (plan section 11): the workspace kernel, run
+;; headless against the test host's fake capabilities and fake editors.
+;;   weft --headless test/p1-gates.lcl
+
+proc gate {name ok} {
+    if [not $ok] { error "GATE FAILED: $name" }
+    puts "ok: $name"
+}
+
+require "weft/host/test.lcl"
+
+weft::ws::init! [weft::testhost::editor-hooks]
+weft::testhost::fs-put! "/t/a.txt" "hello weft"
+
+;; ---- ctx discipline ----
+let _c1 [weft::ctx::make #{buffer b1}]
+let _c2 [weft::ctx::make #{buffer b1}]
+gate "ctx carries fields" [== [weft::ctx::field $_c1 buffer] b1]
+gate "ctx execution ids are fresh" \
+    [not [== [get $_c1 execution] [get $_c2 execution]]]
+gate "ctx missing field reads empty" \
+    [empty? [weft::ctx::field $_c1 view]]
+
+;; ---- gate: one file, one view ----
+let _ctx [weft::ctx::make #{}]
+let _b [weft::ws::buffer-open! "/t/a.txt" $_ctx]
+gate "open returns a buffer id" [not [weft::error::error? $_b]]
+gate "open reads through fs capability" \
+    [== [Lk::doc_text [weft::ws::buffer-doc $_b]] "hello weft"]
+gate "filetype derived from path" \
+    [== [get [weft::ws::buffer $_b] filetype] ".txt"]
+gate "freshly opened buffer is clean" [not [weft::ws::buffer-dirty? $_b]]
+
+;; A buffer with no file behind it takes its NAME as the filetype key,
+;; so the machine buffers (*lcl*, *scratch*) configure exactly like an
+;; extension does -- one mapping mechanism, not two.  A path always
+;; wins, and a path without an extension still has no filetype.
+let _fb [weft::ws::buffer-create! "*lcl*" "" ""]
+gate "path-less buffer takes its name as filetype" \
+    [== [get [weft::ws::buffer $_fb] filetype] "*lcl*"]
+weft::config::filetype! "*lcl*" #{lang lcl}
+gate "buffer-name filetype resolves config like an extension" \
+    [== lcl [weft::config::filetype-value \
+        [get [weft::ws::buffer $_fb] filetype] lang ""]]
+let _fb2 [weft::ws::buffer-create! "noext" "/t/Makefile" ""]
+gate "a path always beats the name" \
+    [== [get [weft::ws::buffer $_fb2] filetype] ""]
+weft::ws::buffer-close! $_fb 1
+weft::ws::buffer-close! $_fb2 1
+
+let _v [weft::ws::view-create! $_b]
+let _p [weft::ws::tree-init! $_v]
+gate "one pane after tree-init" [== 1 [len [weft::ws::panes]]]
+gate "tree-init focuses the pane" [== [weft::ws::focused-pane] $_p]
+gate "focused ctx names buffer and view" \
+    [== [get [weft::ws::focused-ctx-fields] buffer] $_b]
+
+;; ---- resource identity: same path, same buffer ----
+gate "reopening a path returns the same buffer" \
+    [== [weft::ws::buffer-open! "/t/a.txt" $_ctx] $_b]
+
+;; ---- dirty tracking and save/reload ----
+Lk::doc_insert [weft::ws::buffer-doc $_b] 5 " there"
+gate "edit marks buffer dirty" [weft::ws::buffer-dirty? $_b]
+
+let _sv [weft::ws::buffer-save! $_b $_ctx]
+gate "save succeeds" [not [weft::error::error? $_sv]]
+gate "save clears dirty" [not [weft::ws::buffer-dirty? $_b]]
+gate "save round-trips through fs capability" \
+    [== [weft::testhost::fs-get "/t/a.txt"] "hello there weft"]
+
+;; ---- the one path resolve point (plan section 5) ----
+gate "normalize collapses // . and .." \
+    [== "/t/a.txt" [weft::ws::path-normalize "/t//x/../a.txt/."]]
+gate "normalize keeps leading .. on relative paths" \
+    [== "../a" [weft::ws::path-normalize "./../a"]]
+gate "normalize of an empty relative path is ." \
+    [== "." [weft::ws::path-normalize "x/.."]]
+gate "relative open resolves against the ctx buffer's cwd" \
+    [== $_b [weft::ws::buffer-open! "../t/a.txt" [weft::ctx::make #{buffer $_b}]]]
+gate "an unnormalized spelling is the same buffer" \
+    [== $_b [weft::ws::buffer-open! "/t/./a.txt" $_ctx]]
+gate "the buffer's path is the resolved spelling" \
+    [== "/t/a.txt" [get [weft::ws::buffer $_b] path]]
+let _nb [weft::ws::buffer-open! "sub/../new.txt" [weft::ctx::make #{buffer $_b}]]
+gate "a new file created relatively is bound to a resolved path" \
+    [== "/t/new.txt" [get [weft::ws::buffer $_nb] path]]
+weft::ws::buffer-close! $_nb 1
+
+;; ---- gate: one buffer, two independent views ----
+let _p2 [weft::ws::pane-split! $_p h $_b]
+gate "split adds a pane" [== 2 [len [weft::ws::panes]]]
+gate "split focuses the new pane" [== [weft::ws::focused-pane] $_p2]
+gate "two views share the buffer" \
+    [== 2 [len [weft::ws::views-of-buffer $_b]]]
+
+let _va [weft::ws::pane-view $_p]
+let _vb [weft::ws::pane-view $_p2]
+let _eda [weft::ws::view-editor $_va]
+let _edb [weft::ws::view-editor $_vb]
+gate "views have distinct editors" [not [== $_eda $_edb]]
+
+weft::testhost::editor-cursor-set! $_eda 3
+weft::testhost::editor-cursor-set! $_edb 7
+gate "cursors are independent per view" \
+    [and [== 3 [weft::testhost::editor-cursor $_eda]] \
+         [== 7 [weft::testhost::editor-cursor $_edb]]]
+
+;; ---- gate: view moves without losing editor state ----
+weft::ws::pane-swap-views! $_p $_p2
+gate "swap moves views, not editors" \
+    [and [== [weft::ws::pane-view $_p] $_vb] \
+         [== [weft::ws::view-editor $_vb] $_edb]]
+gate "editor state survives the move" \
+    [== 7 [weft::testhost::editor-cursor $_edb]]
+weft::ws::pane-swap-views! $_p $_p2
+
+;; ---- gate: ratios survive tree updates ----
+let _s1 [get [weft::ws::node $_p] parent]
+weft::ws::split-ratio-set! $_s1 0.3
+let _p3 [weft::ws::pane-split! $_p2 v $_b]
+gate "second split adds a third pane" [== 3 [len [weft::ws::panes]]]
+gate "ratio survives a split elsewhere" \
+    [== 0.3 [weft::ws::split-ratio $_s1]]
+
+let _cl [weft::ws::pane-close! $_p3]
+gate "pane close succeeds" [not [weft::error::error? $_cl]]
+gate "ratio survives a collapse elsewhere" \
+    [== 0.3 [weft::ws::split-ratio $_s1]]
+gate "collapse leaves two panes" [== 2 [len [weft::ws::panes]]]
+gate "ratio clamps to sane range" \
+    [== 0.95 [weft::ws::split-ratio-set! $_s1 2.0]]
+
+;; ---- gate: closing a pane never loses a dirty buffer ----
+let _b2 [weft::ws::buffer-create! "scratch" "" ";; notes"]
+let _v2 [weft::ws::view-create! $_b2]
+weft::ws::pane-set-view! $_p2 $_v2
+weft::ws::view-close! $_vb
+Lk::doc_insert [weft::ws::buffer-doc $_b2] 0 "!"
+gate "scratch edit marks dirty" [weft::ws::buffer-dirty? $_b2]
+
+let _ed2 [weft::ws::view-editor $_v2]
+weft::testhost::editor-cursor-set! $_ed2 4
+let _cl2 [weft::ws::pane-close! $_p2]
+gate "closing the pane succeeds" [not [weft::error::error? $_cl2]]
+gate "view is destroyed with its pane" \
+    [== 0 [len [weft::ws::views-of-buffer $_b2]]]
+gate "fake editor was freed" [not [weft::testhost::editor-alive? $_ed2]]
+gate "dirty buffer survives pane close" \
+    [and [weft::ws::buffer? $_b2] [weft::ws::buffer-dirty? $_b2]]
+
+;; ---- cursor memory: last-view snapshot restores ----
+let _v3 [weft::ws::view-create! $_b2]
+gate "new view restores last-view cursor" \
+    [== 4 [weft::testhost::editor-cursor [weft::ws::view-editor $_v3]]]
+weft::ws::view-close! $_v3
+
+;; ---- last pane is protected ----
+gate "closing the last pane is refused" \
+    [== denied [weft::error::code [weft::ws::pane-close! $_p]]]
+
+;; ---- buffer close policy ----
+gate "closing a dirty buffer is refused" \
+    [== denied [weft::error::code [weft::ws::buffer-close! $_b2 0]]]
+gate "forced close discards the buffer" \
+    [and [== 1 [weft::ws::buffer-close! $_b2 1]] \
+         [not [weft::ws::buffer? $_b2]]]
+
+;; ---- registry summary for the buffer menu ----
+let _bl [weft::ws::buffer-list]
+gate "buffer-list reflects the registry" [== 1 [len $_bl]]
+gate "buffer-list rows carry view counts" \
+    [== 1 [get [get $_bl 0] views]]
+
+;; ---- open of a not-yet-existing path ----
+let _b3 [weft::ws::buffer-open! "/t/new.txt" $_ctx]
+gate "opening a missing path makes an empty bound buffer" \
+    [and [not [weft::error::error? $_b3]] \
+         [== "" [Lk::doc_text [weft::ws::buffer-doc $_b3]]]]
+gate "missing-path buffer is clean until edited" \
+    [not [weft::ws::buffer-dirty? $_b3]]
+
+;; ---- gate: undo-to-saved reads clean (lk savepoint API) ----
+let _b4 [weft::ws::buffer-create! "sp" "/t/sp.txt" "abc"]
+let _d4 [weft::ws::buffer-doc $_b4]
+let _h4 [get [weft::ws::buffer $_b4] hist]
+Lk::doc_insert $_d4 3 "def"
+weft::ws::buffer-save! $_b4 $_ctx
+Lk::doc_insert $_d4 6 "ghi"
+gate "edit after save is dirty" [weft::ws::buffer-dirty? $_b4]
+Lk::history_undo $_h4 $_d4
+gate "undo back to saved reads clean" [not [weft::ws::buffer-dirty? $_b4]]
+Lk::history_redo $_h4 $_d4
+gate "redo past saved is dirty again" [weft::ws::buffer-dirty? $_b4]
+Lk::history_undo $_h4 $_d4
+Lk::history_undo $_h4 $_d4
+Lk::doc_insert $_d4 0 "X"
+gate "editing below the savepoint stays dirty forever" \
+    [weft::ws::buffer-dirty? $_b4]
+
+puts ""
+puts "P1 GATES PASSED"

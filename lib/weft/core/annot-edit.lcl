@@ -1,0 +1,389 @@
+;;; weft::annot -- the annotation editor: annotations as editable text
+;;; blocks (plan P3, legacy design interrogated).
+;;;
+;;; edit-at opens a SESSION over the ctx range (the attached buffer's
+;;; selection via the REPL, or the executing buffer): the annotations
+;;; in range render as blocks in the *annot-edit* buffer --
+;;;
+;;;   {id 3 layer "notes"
+;;;     note:text "check this"}
+;;;
+;;; Edit a block's metadata, delete a block to remove the annotation,
+;;; add a block with `id new` to create one over the session's range.
+;;; Positions stay implicit: existing annotations keep their spans, new
+;;; ones take the scope -- the selection was the intent.
+;;;
+;;; apply-edit re-reads the session buffer, diffs blocks against the
+;;; opening snapshot, and commits; it refuses when the TARGET buffer
+;;; changed since the session opened (staleness), like transforms.
+;;; Producer-owned layers (plumb today) are DERIVED state: hidden from
+;;; the session, since the next rescan would clobber any edit.
+;;;
+;;; v1 caveats (recorded): block values must not contain braces or
+;;; escaped quotes; edited annotations are re-added (fresh ids) at
+;;; their original spans.
+
+namespace weft::annot {
+
+    var session #{}
+
+    ;; ---- authored styling: the `style:` metadata convention ----
+    ;; An annotation on any AUTHORED layer (not producer-owned) shows
+    ;; in the editor when its metadata carries `style:fg`, `style:bg`
+    ;; or `style:underline`.  Values are text, because the annotation
+    ;; editor and the persisted form are text: "255 200 100", "#ffc864",
+    ;; or a named color; underline is any non-empty value but "0".
+    ;; The legacy C-weft used exactly these keys, so old muscle memory
+    ;; carries over.
+    var _named #{red (220 80 80) green (120 200 120) blue (100 150 240)
+        yellow (230 210 100) cyan (100 210 220) magenta (220 120 220)
+        orange (240 160 70) white (235 235 235) black (20 20 20)
+        gray (150 150 150) grey (150 150 150)}
+
+    proc _hex2 {s} {
+        var v 0
+        var i 0
+
+        while [< $i [String::length $s]] {
+            let c [String::lower [String::index $s $i]]
+            let d [String::find "0123456789abcdef" $c]
+
+            if [< $d 0] { return -1 }
+
+            set! v [+ [* $v 16] $d]
+            set! i [+ $i 1]
+        }
+
+        return $v
+    }
+
+    ;; Parse a color spec into (r g b), or () when it does not parse.
+    proc parse-color {spec} {
+        if [list? $spec] {
+            if [== 3 [len $spec]] { return $spec }
+            return ()
+        }
+
+        let s [String::trim [String::from $spec]]
+
+        if [empty? $s] { return () }
+
+        if [has? $_named $s] { return [get $_named $s] }
+
+        if [and [== 0 [String::find $s "#"]] [== 7 [String::length $s]]] {
+            let r [weft::annot::_hex2 [String::range $s 1 3]]
+            let g [weft::annot::_hex2 [String::range $s 3 5]]
+            let b [weft::annot::_hex2 [String::range $s 5 7]]
+
+            if [or [< $r 0] [or [< $g 0] [< $b 0]]] { return () }
+
+            return [list $r $g $b]
+        }
+
+        var out ()
+
+        foreach w [String::split $s " "] {
+            if [empty? $w] { continue }
+
+            var iv ""
+            var ie ""
+
+            if [not [== 0 [catch { int $w } iv ie]]] { return () }
+
+            set! out [List::push $out $iv]
+        }
+
+        if [== 3 [len $out]] { return $out }
+
+        return ()
+    }
+
+    ;; The span style an annotation's metadata asks for: a dict for
+    ;; Lk::editor_set_spans (fg/bg/underline), or #{} when the
+    ;; metadata carries no style: keys.
+    proc style-of {meta} {
+        var st #{}
+
+        if [has? $meta "style:fg"] {
+            let c [weft::annot::parse-color [get $meta "style:fg"]]
+            if [not [empty? $c]] { set! st [put $st fg $c] }
+        }
+
+        if [has? $meta "style:bg"] {
+            let c [weft::annot::parse-color [get $meta "style:bg"]]
+            if [not [empty? $c]] { set! st [put $st bg $c] }
+        }
+
+        if [has? $meta "style:underline"] {
+            let u [String::from [get $meta "style:underline"]]
+            if [and [not [empty? $u]] [not [== $u "0"]]] {
+                set! st [put $st underline 1]
+            }
+        }
+
+        return $st
+    }
+
+    proc pending? {} {
+        return [> [len [Dict::keys $session]] 0]
+    }
+
+    proc session-buffer {} {
+        if [not [weft::annot::pending?]] { return "" }
+
+        return [get $session edit_buffer]
+    }
+
+    ;; Layers owned by producers attached to the buffer -- hidden.
+    proc _derived-layers {bid} {
+        var out ()
+
+        foreach name [weft::producer::names] {
+            if [weft::producer::attached? $bid $name] {
+                foreach l [get [weft::producer::describe $name] layers] {
+                    set! out [List::push $out $l]
+                }
+            }
+        }
+
+        return $out
+    }
+
+    proc _block-for {store id} {
+        var b "{id $id layer \"[Lk::annot_layer $store $id]\""
+        let meta [Lk::annot_meta_all $store $id]
+
+        foreach k [List::sort [Dict::keys $meta]] {
+            set! b "$b\n  $k \"[get $meta $k]\""
+        }
+
+        return "$b}"
+    }
+
+    ;; Open a session over the ctx range (whole buffer when ctx has no
+    ;; range).  Returns a human line; the session buffer is created or
+    ;; refilled.
+    proc edit-at {*rest} {
+        var ctx [weft::image::ctx]
+
+        if [== 1 [len $rest]] {
+            set! ctx [get $rest 0]
+        }
+
+        let bid [weft::ctx::field $ctx buffer]
+
+        if [not [weft::ws::buffer? $bid]] {
+            return [weft::error::make invalid-args
+                "edit-at: no buffer in ctx (attach the repl, or execute in the target)"]
+        }
+
+        let doc [weft::ws::buffer-doc $bid]
+        let store [weft::ws::buffer-store $bid]
+        var start 0
+        var end [Lk::doc_len $doc]
+
+        if [and [has? $ctx start] [has? $ctx end]] {
+            set! start [get $ctx start]
+            set! end [get $ctx end]
+        }
+
+        let hidden [weft::annot::_derived-layers $bid]
+        var snapshot #{}
+        var blocks ""
+
+        foreach id [Lk::annot_in_range $store $start $end] {
+            if [not [has? $hidden [Lk::annot_layer $store $id]]] {
+                set! snapshot [put $snapshot "$id" #{layer
+                    [Lk::annot_layer $store $id]
+                    meta [Lk::annot_meta_all $store $id]}]
+                set! blocks "$blocks[weft::annot::_block-for $store $id]\n\n"
+            }
+        }
+
+        if [empty? $blocks] {
+            set! blocks ";; no annotations in range -- add one below\n\n"
+        }
+
+        var hdr ";; annotation editor -- [get [weft::ws::buffer $bid] name] ($bid)\n"
+        set! hdr "$hdr;; scope: \[$start, $end)   hidden layers: [String::join $hidden " "]\n"
+        set! hdr "$hdr;; edit metadata; delete a block to remove; add with id new.\n"
+        set! hdr "$hdr\[weft::annot::apply-edit\]   \[weft::annot::cancel-edit\]\n\n"
+
+        var eb [weft::ws::buffer-for-name "*annot-edit*"]
+
+        if [empty? $eb] {
+            set! eb [weft::ws::buffer-create! "*annot-edit*" "" ""]
+        }
+
+        let edoc [weft::ws::buffer-doc $eb]
+
+        Lk::doc_transact $edoc {
+            if [> [Lk::doc_len $edoc] 0] {
+                Lk::doc_delete $edoc 0 [Lk::doc_len $edoc]
+            }
+
+            Lk::doc_insert $edoc 0 "$hdr$blocks"
+        }
+
+        set! session #{buffer $bid start $start end $end
+            base_rev [Lk::doc_revision $doc]
+            edit_buffer $eb snapshot $snapshot}
+
+        return "editing [len [Dict::keys $snapshot]] annotation(s) in \[$start, $end) -> *annot-edit*"
+    }
+
+    ;; Brace-balanced top-level blocks of the session text, parsed to
+    ;; dicts via the image (a block IS dict-constructor arguments).
+    proc _parse-blocks {text} {
+        var out ()
+        let n [String::length $text]
+        var i 0
+        var depth 0
+        var bstart 0
+
+        while [< $i $n] {
+            let c [String::index $text $i]
+
+            if [== $c "{"] {
+                if [== $depth 0] {
+                    set! bstart [+ $i 1]
+                }
+
+                set! depth [+ $depth 1]
+            }
+
+            if [== $c "}"] {
+                set! depth [- $depth 1]
+
+                if [== $depth 0] {
+                    let content [String::replace
+                        [String::range $text $bstart $i] "\n" " "]
+                    var d ""
+                    var e ""
+
+                    if [== 0 [catch { eval "dict $content" } d e]] {
+                        if [and [dict? $d] [has? $d id] [has? $d layer]] {
+                            set! out [List::push $out $d]
+                        }
+                    }
+                }
+            }
+
+            set! i [+ $i 1]
+        }
+
+        return $out
+    }
+
+    proc _meta-of {block} {
+        var m [del [del $block id] layer]
+        return $m
+    }
+
+    ;; Structural dict equality, key-order independent.
+    proc _meta-eq? {a b} {
+        let ka [List::sort [Dict::keys $a]]
+
+        if [not [== $ka [List::sort [Dict::keys $b]]]] { return 0 }
+
+        var same 1
+
+        foreach k $ka {
+            if [not [== [get $a $k] [get $b $k]]] { set! same 0 }
+        }
+
+        return $same
+    }
+
+    ;; Commit the session: diff the edited blocks against the snapshot.
+    proc apply-edit {} {
+        if [not [weft::annot::pending?]] {
+            return "no annotation session"
+        }
+
+        let bid [get $session buffer]
+
+        if [not [weft::ws::buffer? $bid]] {
+            set! session #{}
+            return [weft::error::make cancelled "target buffer closed"]
+        }
+
+        let doc [weft::ws::buffer-doc $bid]
+
+        if [not [== [Lk::doc_revision $doc] [get $session base_rev]]] {
+            set! session #{}
+            return [weft::error::make cancelled
+                "stale session: the target changed since edit-at (cancelled)"]
+        }
+
+        if [not [weft::ws::buffer? [get $session edit_buffer]]] {
+            set! session #{}
+            return [weft::error::make cancelled "session buffer closed"]
+        }
+
+        let store [weft::ws::buffer-store $bid]
+        let blocks [weft::annot::_parse-blocks
+            [Lk::doc_text [weft::ws::buffer-doc [get $session edit_buffer]]]]
+        let snapshot [get $session snapshot]
+
+        var kept #{}
+        var added 0
+        var changed 0
+
+        foreach blk $blocks {
+            let id "[get $blk id]"
+
+            if [== $id new] {
+                var r ""
+                var e ""
+                catch { Lk::annot_layer_register $store [get $blk layer] } r e
+                Lk::annot_add $store [get $session start] \
+                    [get $session end] [get $blk layer] \
+                    [weft::annot::_meta-of $blk]
+                set! added [+ $added 1]
+            } else {
+                if [has? $snapshot $id] {
+                    set! kept [put $kept $id 1]
+                    let orig [get $snapshot $id]
+
+                    if [not [and [== [get $blk layer] [get $orig layer]]
+                        [weft::annot::_meta-eq?
+                                     [weft::annot::_meta-of $blk]
+                                     [get $orig meta]]]] {
+                        ;; re-add at the original span with new content
+                        let sp [Lk::annot_span $store [int $id]]
+                        var r2 ""
+                        var e2 ""
+                        catch { Lk::annot_layer_register $store \
+                            [get $blk layer] } r2 e2
+                        Lk::annot_remove $store [int $id]
+                        Lk::annot_add $store [get $sp 0] [get $sp 1] \
+                            [get $blk layer] [weft::annot::_meta-of $blk]
+                        set! changed [+ $changed 1]
+                    }
+                }
+            }
+        }
+
+        var removed 0
+
+        foreach id [Dict::keys $snapshot] {
+            if [not [has? $kept $id]] {
+                Lk::annot_remove $store [int $id]
+                set! removed [+ $removed 1]
+            }
+        }
+
+        set! session #{}
+
+        return "annotations: $added added, $changed changed, $removed removed"
+    }
+
+    proc cancel-edit {} {
+        if [not [weft::annot::pending?]] { return "no annotation session" }
+
+        set! session #{}
+
+        return "annotation edit cancelled"
+    }
+}

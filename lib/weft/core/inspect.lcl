@@ -1,0 +1,174 @@
+;;; weft::inspect -- the registries, rendered (plan P3).
+;;;
+;;; Everything in weft is inspectable state: annotations carry their
+;;; metadata, producers their status, executions their records, the
+;;; user package its definitions, capabilities and transforms their
+;;; descriptors.  The inspector is therefore mostly free: report is a
+;;; PURE READER over the registries returning text, and the text is
+;;; Acme-style -- the bracketed affordances at the bottom middle-click
+;;; straight back into the image.
+
+namespace weft::inspect {
+
+    proc _first-line {s max} {
+        var line [get [String::split $s "\n"] 0]
+
+        if [> [String::length $line] $max] {
+            set! line "[String::range $line 0 $max]..."
+        }
+
+        return $line
+    }
+
+    proc _annots-at {bid pos} {
+        let store [weft::ws::buffer-store $bid]
+        var out ""
+
+        foreach id [Lk::annot_at $store $pos] {
+            let sp [Lk::annot_span $store $id]
+            var meta ""
+
+            foreach k [Dict::keys [Lk::annot_meta_all $store $id]] {
+                set! meta "$meta $k=[Lk::annot_meta $store $id $k]"
+            }
+
+            set! out "$out  #$id \[[get $sp 0], [get $sp 1]) layer=[Lk::annot_layer $store $id]$meta\n"
+        }
+
+        if [empty? $out] {
+            set! out "  (none)\n"
+        }
+
+        return $out
+    }
+
+    proc _producers {bid} {
+        var out ""
+
+        foreach name [weft::producer::names] {
+            if [weft::producer::attached? $bid $name] {
+                let st [weft::producer::status $bid $name]
+                var line "  $name: [get $st state]"
+
+                if [== [get $st state] error] {
+                    set! line "$line -- [weft::error::message [get $st error]]"
+                }
+
+                set! out "$out$line\n"
+            }
+        }
+
+        if [empty? $out] {
+            set! out "  (none attached)\n"
+        }
+
+        return $out
+    }
+
+    proc _recent-executions {n} {
+        let recs [weft::image::records]
+        var start [- [len $recs] $n]
+
+        if [< $start 0] {
+            set! start 0
+        }
+
+        var out ""
+
+        foreach rec [List::slice $recs $start [len $recs]] {
+            var mark "=>"
+
+            if [not [get $rec ok]] {
+                set! mark "!!"
+            }
+
+            set! out "$out  [get $rec id] [get $rec ns] $mark [weft::inspect::_first-line [get $rec source] 48]\n"
+        }
+
+        if [empty? $out] {
+            set! out "  (none)\n"
+        }
+
+        return $out
+    }
+
+    ;; The report.  ctx: #{buffer <id> pos <byte>}.
+    proc report {ctx} {
+        let bid [weft::ctx::field $ctx buffer]
+
+        if [not [weft::ws::buffer? $bid]] {
+            return ";; inspect: no buffer in ctx\n"
+        }
+
+        let b [weft::ws::buffer $bid]
+        let doc [get $b doc]
+        var pos 0
+
+        if [has? $ctx pos] {
+            set! pos [get $ctx pos]
+        }
+
+        let line [+ 1 [Lk::doc_pos_to_line $doc $pos]]
+        let col [Lk::doc_char_col $doc $pos]
+        var dirty clean
+
+        if [weft::ws::buffer-dirty? $bid] {
+            set! dirty dirty
+        }
+
+        var out ";; inspect @ [get $b name] pos $pos (line $line:$col)\n"
+        set! out "$out;; buffer $bid  path=\"[get $b path]\"  filetype=\"[get $b filetype]\"  $dirty  rev [Lk::doc_revision $doc]  views [len [weft::ws::views-of-buffer $bid]]\n"
+
+        set! out "$out\nannotations @ $pos:\n[weft::inspect::_annots-at $bid $pos]"
+        set! out "$out\nproducers:\n[weft::inspect::_producers $bid]"
+
+        ;; Persistence: how the last load resolved, parked orphans,
+        ;; and any parked failure -- all inspectable state (P5).
+        let rep [weft::persist::load-report $bid]
+        let orph [len [weft::persist::orphans $bid]]
+
+        if [or [> [len [Dict::keys $rep]] 0] [> $orph 0]] {
+            set! out "$out\npersistence:\n"
+
+            if [> [len [Dict::keys $rep]] 0] {
+                set! out "$out  restored: [get $rep ok] exact/ok, [get $rep fuzzy] fuzzy, [get $rep orphaned] newly orphaned\n"
+            }
+
+            if [> $orph 0] {
+                set! out "$out  $orph orphan(s) parked -- \[weft::orphans\]\n"
+            }
+        }
+
+        if [not [empty? [weft::persist::last-error]]] {
+            set! out "$out\npersistence error: [get [weft::persist::last-error] message]\n"
+        }
+
+        set! out "$out\npending:\n"
+
+        if [weft::transform::pending?] {
+            set! out "$out  transform: [get [weft::transform::pending-plan] transform] -> see *diff*\n"
+        }
+
+        foreach tid [weft::tasks::pending-ids] {
+            set! out "$out  task: $tid\n"
+        }
+
+        if [and [not [weft::transform::pending?]]
+                [== 0 [len [weft::tasks::pending-ids]]]] {
+            set! out "$out  (nothing)\n"
+        }
+
+        set! out "$out\nrepl: [weft::repl::target]\n"
+
+        let defs [weft::image::user-defs]
+
+        set! out "$out\nimage: [len $defs] user definition(s): [String::join $defs " "]\n"
+        set! out "$out\nrecent executions:\n[weft::inspect::_recent-executions 5]"
+
+        set! out "$out\ntransforms: [String::join [weft::transform::names] " "]\nplumb rules: [String::join [weft::plumb::rule-names] " "]\ncapabilities: [String::join [weft::cap::names] " "]\n"
+
+        set! out "$out\n;; \[weft::image::records\]  \[weft::image::user-defs\]  \[weft::transform::names\]  \[weft::buffers\]\n"
+
+        return $out
+    }
+}

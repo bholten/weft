@@ -1,0 +1,613 @@
+;;; weft::cmd -- structured command resolution (command pipeline,
+;;; stage A).  Interactive text is CLASSIFIED before anything runs:
+;;; resolution chooses the language in which the rest of the command
+;;; line is interpreted.
+;;;
+;;;   text -> Lex::commands (the real reader; nothing evaluates)
+;;;        -> route: lcl | semantic | shell | argv | error | none
+;;;
+;;; The ladder:
+;;;   1. head is dynamic ($x, [x]...), ::-qualified, or a namespace
+;;;      form -> LCL (the image, exactly as before)
+;;;   2. head names a CALLABLE in the interactive environment --
+;;;      user:: definitions first, then globals.  Namespaces are
+;;;      values, not callables, so `time`/`String` fall through to
+;;;      external resolution; deliberate shadowing (proc user::git)
+;;;      wins immediately and live.
+;;;   3. head is a semantic command (weft state, not a process: cd)
+;;;   4. the raw text carries unmistakable unquoted shell structure
+;;;      (| & < > ` $( -- or several statements) -> SHELL: the whole
+;;;      string handed to the shell provider verbatim.  Weft parses
+;;;      no shell grammar; it selects a provider.
+;;;   5. head resolves on PATH -> ARGV: literal argv from the lexed
+;;;      words -- no substitution, no glob.  A dynamic word here is
+;;;      an error with a hint, not a silent literal.
+;;;   6. -> command-not-found
+;;;
+;;; Every process-backed execution leaves a run record (a semantic
+;;; wrapper over the task machinery -- no second lifecycle) and, at
+;;; exit, a root `cmd` annotation over its *output* region carrying
+;;; the invocation context -- cwd above all -- so generic recognizers
+;;; (stage C) can resolve relative paths with zero command-specific
+;;; knowledge.  `explain` shows the resolution for a line WITHOUT
+;;; running it: context-sensitive live dispatch minus inspectability
+;;; would contradict the design.
+
+namespace weft::cmd {
+
+    var runs #{}
+    var _seq 0
+    var _semantics #{}
+
+    ;; ---- environment probes ----
+
+    ;; Does `name` resolve to a callable in the interactive
+    ;; environment?  getvar reads this proc's own frame too, but a
+    ;; collision would have to name a LOCAL holding a proc value --
+    ;; locals here hold strings, and proc? filters them out.
+    proc _callable? {name} {
+        var _cbl_v ""
+        var _cbl_e ""
+
+        if [== 0 [catch { getvar "user::$name" } _cbl_v _cbl_e]] {
+            if [proc? $_cbl_v] { return 1 }
+        }
+
+        if [== 0 [catch { getvar $name } _cbl_v _cbl_e]] {
+            return [proc? $_cbl_v]
+        }
+
+        return 0
+    }
+
+    ;; PATH resolution through capabilities: never runs anything.
+    ;; A head containing / is taken as a direct path.
+    proc which {name} {
+        if [>= [String::find $name "/"] 0] {
+            let t [weft::cap::invoke "fs.file?" #{path $name} #{}]
+
+            if [and [== [weft::task::state $t] succeeded] \
+                    [weft::task::result $t]] {
+                return $name
+            }
+
+            return ""
+        }
+
+        let pt [weft::cap::invoke "env.get" #{name {PATH}} #{}]
+
+        if [not [== [weft::task::state $pt] succeeded]] { return "" }
+
+        foreach dir [String::split [weft::task::result $pt] ":"] {
+            if [not [empty? $dir]] {
+                let p "$dir/$name"
+                let ft [weft::cap::invoke "fs.file?" #{path $p} #{}]
+
+                if [and [== [weft::task::state $ft] succeeded] \
+                        [weft::task::result $ft]] {
+                    return $p
+                }
+            }
+        }
+
+        return ""
+    }
+
+    ;; Unmistakable shell operators, unquoted and unbraced: | & < >
+    ;; backtick and $( -- deliberately NOT * or ? (programs interpret
+    ;; wildcards themselves; ARGV passes them literally, which is
+    ;; usually what the program wants).  A tiny character walk that
+    ;; respects lcl grouping so `echo {|}` stays structured.
+    proc _shell-ops? {text} {
+        var i 0
+        var depth 0
+        var inq 0
+        let n [String::length $text]
+
+        while [< $i $n] {
+            let c [String::index $text $i]
+
+            if [== $c "\\"] {
+                set! i [+ $i 2]
+                continue
+            }
+
+            if $inq {
+                if [== $c "\""] { set! inq 0 }
+                set! i [+ $i 1]
+                continue
+            }
+
+            if [== $c "\""] { set! inq 1 }
+            if [== $c "\{"] { set! depth [+ $depth 1] }
+            if [== $c "\}"] { set! depth [- $depth 1] }
+
+            if [== $depth 0] {
+                if [or [== $c "|"] [== $c "&"] \
+                       [== $c "<"] [== $c ">"] [== $c "`"]] {
+                    return 1
+                }
+
+                if [and [== $c "$"] [< [+ $i 1] $n]] {
+                    if [== [String::index $text [+ $i 1]] "("] {
+                        return 1
+                    }
+                }
+            }
+
+            set! i [+ $i 1]
+        }
+
+        return 0
+    }
+
+    ;; The executing buffer's cwd, defensively (direct execute! calls
+    ;; carry test ctxs whose buffer may not exist).
+    proc ctx-cwd {ctx} {
+        let bid [weft::ctx::field $ctx buffer]
+
+        if [and [not [empty? $bid]] [weft::ws::buffer? $bid]] {
+            return [weft::ws::buffer-cwd $bid]
+        }
+
+        let t [weft::cap::invoke "fs.cwd" #{} #{}]
+
+        if [== [weft::task::state $t] succeeded] {
+            return [weft::task::result $t]
+        }
+
+        return ""
+    }
+
+    ;; ---- the operand (stage D2, docs/commands.md "Operands") ----
+    ;;
+    ;; A command may be given an OPERAND: a selected range that stays
+    ;; structurally separate from the command text until the route's
+    ;; adapter hands it over -- an argv element, the shell's $1, a
+    ;; semantic command's target, a value in ctx for lcl.  No textual
+    ;; splicing, so quoting never enters it.
+    ;;
+    ;;   #{kind text text "..." buffer <bid> start <n> end <n>
+    ;;     ?location #{kind file|fileline|url path|url ?line}}
+    ;;
+    ;; An explicit ctx `operand` wins (cross-pane: the program in one
+    ;; view, the operand in another).  Otherwise the ctx's own
+    ;; buffer + start/end (a binding's or an attached REPL's live
+    ;; selection, a gesture outside the selection) is the operand.
+    ;; A verified `loc` annotation covering the range enriches it.
+
+    proc _location-of {bid start end} {
+        if [not [weft::ws::buffer? $bid]] { return #{} }
+
+        let store [weft::ws::buffer-store $bid]
+        var best #{}
+
+        foreach id [Lk::annot_in_range $store $start $end "loc"] {
+            let sp [Lk::annot_span $store $id]
+
+            if [and [<= [get $sp 0] $start] [>= [get $sp 1] $end]] {
+                set! best [Lk::annot_meta_all $store $id]
+            }
+        }
+
+        return $best
+    }
+
+    proc operand-from-range {bid start end} {
+        if [not [weft::ws::buffer? $bid]] { return #{} }
+
+        let doc [weft::ws::buffer-doc $bid]
+
+        if [or [< $start 0] [or [> $end [Lk::doc_len $doc]] \
+                [> $start $end]]] {
+            return #{}
+        }
+
+        var op #{kind text text [String::range [Lk::doc_text $doc] $start $end]
+            buffer $bid start $start end $end}
+        let loc [weft::cmd::_location-of $bid $start $end]
+
+        if [> [len [Dict::keys $loc]] 0] {
+            set! op [put $op location $loc]
+        }
+
+        return $op
+    }
+
+    proc operand-of {ctx} {
+        if [has? $ctx operand] {
+            let o [get $ctx operand]
+
+            if [and [dict? $o] [has? $o kind]] { return $o }
+
+            return #{}
+        }
+
+        if [and [has? $ctx start] [has? $ctx end]] {
+            return [weft::cmd::operand-from-range \
+                [weft::ctx::field $ctx buffer] [get $ctx start] [get $ctx end]]
+        }
+
+        return #{}
+    }
+
+    ;; The operand's text ("" when none) -- what `weft::operand`
+    ;; hands an lcl command.
+    proc operand-text {ctx} {
+        let o [weft::cmd::operand-of $ctx]
+
+        if [has? $o text] { return [get $o text] }
+
+        return ""
+    }
+
+    ;; Does the shell text already place $1/$@ itself?  Then the
+    ;; adapter passes the operand silently instead of appending "$@".
+    proc _mentions-positional? {text} {
+        return [or [>= [String::find $text {$1}] 0] \
+                   [>= [String::find $text {$@}] 0]]
+    }
+
+    ;; ---- resolution ----
+
+    proc _plan {route reason text ctx} {
+        var p #{route $route reason $reason text $text
+            cwd [weft::cmd::ctx-cwd $ctx]}
+        let o [weft::cmd::operand-of $ctx]
+
+        if [has? $o kind] { set! p [put $p operand $o] }
+
+        return $p
+    }
+
+    ;; Build literal argv from the first statement's words.  Returns
+    ;; #{ok 1 argv (...)} or #{ok 0 word <n>} naming the offending
+    ;; dynamic word.
+    proc _argv {words} {
+        var argv ()
+        var wi 0
+
+        foreach w $words {
+            if [get $w dynamic] { return #{ok 0 word $wi} }
+            set! argv [List::push $argv [get $w text]]
+            set! wi [+ $wi 1]
+        }
+
+        return #{ok 1 argv $argv}
+    }
+
+    ;; Classify `text` without running any of it.
+    proc resolve {text ctx} {
+        var stmts ()
+        var _lex_e ""
+
+        ;; Stage D: a LEADING | < > is a filter spelling (docs/commands.md
+        ;; "Filters") -- claimed before the shell-operator walk, which
+        ;; would otherwise hand `|sort` to sh -c as a syntax error.
+        if [not [empty? $text]] {
+            let c0 [String::index $text 0]
+
+            if [or [== $c0 "|"] [or [== $c0 "<"] [== $c0 ">"]]] {
+                let body [String::trim [String::range $text 1 \
+                    [String::length $text]]]
+                var mode {pipe}
+
+                if [== $c0 "<"] { set! mode {insert} }
+                if [== $c0 ">"] { set! mode {send} }
+
+                if [empty? $body] {
+                    return [put [weft::cmd::_plan {error} {empty filter} \
+                        $text $ctx] error [weft::error::make invalid-args \
+                        "filter: nothing after '$c0' (|cmd <cmd >cmd)"]]
+                }
+
+                let b0 [String::index $body 0]
+
+                if [or [== $b0 "|"] [or [== $b0 "<"] [== $b0 ">"]]] {
+                    return [put [weft::cmd::_plan {error} {malformed filter} \
+                        $text $ctx] error [weft::error::make invalid-args \
+                        "filter: '$c0$b0' is not a filter spelling; sh \{$text\} forces the shell"]]
+                }
+
+                return [put [put [weft::cmd::_plan {filter} \
+                    "filter $mode: selection through sh -c" $text $ctx] \
+                    mode $mode] command $body]
+            }
+        }
+
+        if [not [== 0 [catch { Lex::commands $text } stmts _lex_e]]] {
+            ;; Not lcl-shaped at all (unbalanced quote/brace):
+            ;; today's behavior -- hand the raw string to the shell.
+            return [put [weft::cmd::_plan {shell} \
+                "not lcl-shaped ($_lex_e)" $text $ctx] shell_input $text]
+        }
+
+        if [== [len $stmts] 0] {
+            return [weft::cmd::_plan {none} {empty} $text $ctx]
+        }
+
+        let words [get [get $stmts 0] words]
+
+        if [== [len $words] 0] {
+            return [weft::cmd::_plan {none} {empty} $text $ctx]
+        }
+
+        let head [get $words 0]
+
+        if [get $head dynamic] {
+            return [weft::cmd::_plan {lcl} {dynamic head} $text $ctx]
+        }
+
+        let ht [get $head text]
+
+        if [or [>= [String::find $ht {::}] 0] [== $ht {namespace}]] {
+            return [put [weft::cmd::_plan {lcl} {qualified} $text $ctx] \
+                head $ht]
+        }
+
+        if [weft::cmd::_callable? $ht] {
+            return [put [weft::cmd::_plan {lcl} \
+                {lcl command in interactive environment} $text $ctx] \
+                head $ht]
+        }
+
+        if [and [has? $_semantics $ht] [== [len $stmts] 1]] {
+            let a [weft::cmd::_argv $words]
+
+            if [get $a ok] {
+                var p [weft::cmd::_plan {semantic} \
+                    "weft semantic command" $text $ctx]
+                set! p [put $p head $ht]
+                set! p [put $p argv [get $a argv]]
+                set! p [put $p handler [get $_semantics $ht]]
+                return $p
+            }
+        }
+
+        if [weft::cmd::_shell-ops? $text] {
+            return [put [put [weft::cmd::_plan {shell} \
+                {unquoted shell operator} $text $ctx] \
+                shell_input $text] head $ht]
+        }
+
+        if [> [len $stmts] 1] {
+            return [put [put [weft::cmd::_plan {shell} \
+                {several statements, external head} $text $ctx] \
+                shell_input $text] head $ht]
+        }
+
+        let exe [weft::cmd::which $ht]
+
+        if [empty? $exe] {
+            let err [weft::error::make invalid-args \
+                "$ht: command not found (not an lcl command, not on PATH; sh \{...\} forces the shell)"]
+            return [put [weft::cmd::_plan {error} {unresolved head} \
+                $text $ctx] error $err]
+        }
+
+        let a [weft::cmd::_argv $words]
+
+        if [not [get $a ok]] {
+            let err [weft::error::make invalid-args \
+                "external command argument [get $a word] is dynamic; external argv is literal -- brace it, or use sh \{...\}"]
+            return [put [weft::cmd::_plan {error} {dynamic argument} \
+                $text $ctx] error $err]
+        }
+
+        var p [weft::cmd::_plan {argv} {external executable} $text $ctx]
+        set! p [put $p head $ht]
+        set! p [put $p exe $exe]
+        set! p [put $p argv [get $a argv]]
+        return $p
+    }
+
+    ;; ---- semantic commands (weft state, not processes) ----
+
+    proc semantic! {name handler} {
+        set! _semantics [put $_semantics $name $handler]
+        return $name
+    }
+
+    proc _cd! {plan ctx} {
+        let bid [weft::ctx::field $ctx buffer]
+
+        if [or [empty? $bid] [not [weft::ws::buffer? $bid]]] {
+            return [weft::task::failed [weft::error::make invalid-args \
+                {cd: no buffer in ctx}]]
+        }
+
+        let argv [get $plan argv]
+        var target ""
+
+        if [> [len $argv] 1] {
+            set! target [get $argv 1]
+        } else {
+        if [has? $plan operand] {
+            ;; `cd` + a selected path: the operand is the target.  A
+            ;; verified location prefers its resolved path.
+            let o [get $plan operand]
+            set! target [String::trim [get $o text]]
+
+            if [has? $o location] {
+                if [has? [get $o location] path] {
+                    set! target [get [get $o location] path]
+                }
+            }
+        } else {
+            let ht [weft::cap::invoke "env.get" #{name {HOME}} #{}]
+
+            if [== [weft::task::state $ht] succeeded] {
+                set! target [weft::task::result $ht]
+            }
+        }
+        }
+
+        if [empty? $target] {
+            return [weft::task::failed [weft::error::make invalid-args \
+                {cd: no target directory}]]
+        }
+
+        if [not [== [String::index $target 0] "/"]] {
+            set! target "[get $plan cwd]/$target"
+        }
+
+        let dt [weft::cap::invoke "fs.dir?" #{path $target} #{}]
+
+        if [not [and [== [weft::task::state $dt] succeeded] \
+                     [weft::task::result $dt]]] {
+            return [weft::task::failed [weft::error::make invalid-args \
+                "cd: not a directory: $target"]]
+        }
+
+        weft::ws::buffer-set-cwd! $bid $target
+        return [weft::task::done "cwd: $target"]
+    }
+
+    ;; ---- run records: semantic provenance over the task registry ----
+
+    ;; fields: form provider cwd argv buffer task start
+    proc run-start! {fields} {
+        set! _seq [+ $_seq 1]
+        let rid "run-$_seq"
+        set! runs [put $runs $rid [Dict::merge $fields \
+            #{id $rid state {running} exit ""}]]
+        return $rid
+    }
+
+    proc run-grew! {rid} {
+        if [not [has? $runs $rid]] { return "" }
+
+        let r [get $runs $rid]
+        let doc [weft::ws::buffer-doc [get $r buffer]]
+        set! runs [put $runs $rid [put $r end [Lk::doc_len $doc]]]
+        return ""
+    }
+
+    ;; Close the run: final state, exit status, and the root `cmd`
+    ;; annotation over the whole output region (echo line through
+    ;; footer).  Concurrent runs interleave appends in *output*; the
+    ;; region is the run's span of the stream, not a guarantee of
+    ;; exclusivity.
+    proc run-exit! {rid status state} {
+        if [not [has? $runs $rid]] { return "" }
+
+        var r [get $runs $rid]
+        let bid [get $r buffer]
+        let doc [weft::ws::buffer-doc $bid]
+        set! r [put $r end [Lk::doc_len $doc]]
+        set! r [put $r exit $status]
+        set! r [put $r state $state]
+        set! runs [put $runs $rid $r]
+
+        ;; End the region BEFORE the footer's final newline: lk end
+        ;; anchors are RIGHT-biased, so a span closed at the buffer
+        ;; tail would grow over the NEXT run's output.
+        var aend [get $r end]
+
+        if [> $aend [get $r start]] { set! aend [- $aend 1] }
+
+        Lk::annot_add [weft::ws::buffer-store $bid] [get $r start] \
+            $aend "cmd" #{run $rid cwd [get $r cwd]
+                form [get $r form] provider [get $r provider]
+                status $status}
+        return ""
+    }
+
+    proc run {rid} {
+        if [has? $runs $rid] { return [get $runs $rid] }
+
+        return #{}
+    }
+
+    proc run-list {} {
+        return [Dict::keys $runs]
+    }
+
+    ;; ---- explain: resolution without execution ----
+
+    proc explain {*rest} {
+        var text ""
+
+        if [> [len $rest] 0] { set! text [get $rest 0] }
+
+        set! text [String::trim $text]
+
+        if [empty? $text] { return {explain: nothing to resolve} }
+
+        let ctx [weft::image::ctx]
+        let plan [weft::cmd::resolve $text $ctx]
+        let route [get $plan route]
+        var lines "resolution: $route -- [get $plan reason]"
+
+        if [has? $plan head] {
+            set! lines "$lines\nhead:       [get $plan head]"
+        }
+
+        if [== $route argv] {
+            set! lines "$lines\nexecutable: [get $plan exe]"
+            set! lines "$lines\nargv:       [get $plan argv]"
+        }
+
+        if [== $route shell] {
+            set! lines "$lines\nshell:      /bin/sh -c <text verbatim>"
+        }
+
+        if [has? $plan operand] {
+            let o [get $plan operand]
+            var ot [get $o text]
+
+            if [> [String::length $ot] 40] {
+                set! ot "[String::range $ot 0 40]..."
+            }
+
+            set! lines "$lines\noperand:    [repr $ot] (buffer [get $o buffer] [get $o start]..[get $o end])"
+
+            if [has? $o location] {
+                set! lines "$lines\nlocation:   [get $o location]"
+            }
+        }
+
+        if [== $route filter] {
+            set! lines "$lines\nmode:       [get $plan mode]"
+            set! lines "$lines\nfilter:     /bin/sh -c [get $plan command]"
+        }
+
+        if [== $route error] {
+            set! lines "$lines\nerror:      [weft::error::message [get $plan error]]"
+        }
+
+        if [or [== $route argv] [or [== $route shell] \
+                [or [== $route semantic] [== $route filter]]]] {
+            set! lines "$lines\ncwd:        [get $plan cwd]"
+        }
+
+        return $lines
+    }
+
+    weft::cmd::semantic! {cd} [lambda {plan ctx} {
+        return [weft::cmd::_cd! $plan $ctx]
+    }]
+
+    ;; The explicit shell spelling: `sh {grep foo *.c | sort}` forces
+    ;; the shell provider on the braced text (the braces keep lcl from
+    ;; touching it).  Semantic, not PATH-resolved: bare /bin/sh would
+    ;; read its first argument as a script FILE, not a pipeline.
+    weft::cmd::semantic! {sh} [lambda {plan ctx} {
+        let argv [get $plan argv]
+
+        if [< [len $argv] 2] {
+            return [weft::task::failed [weft::error::make invalid-args \
+                "sh: nothing to run (sh \{...\})"]]
+        }
+
+        var line [get $argv 1]
+        var i 2
+
+        while [< $i [len $argv]] {
+            set! line "$line [get $argv $i]"
+            set! i [+ $i 1]
+        }
+
+        return [weft::shell::execute-shell! $line $plan $ctx]
+    }]
+}

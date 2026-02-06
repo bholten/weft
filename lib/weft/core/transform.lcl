@@ -1,0 +1,378 @@
+;;; weft::transform -- structured text operations with previewable edit
+;;; plans (plan section 7).
+;;;
+;;; A transform is data plus a closure:
+;;;   #{name upper description "Uppercase the range"
+;;;     fn <lambda {ctx} -> tagged result>}
+;;;
+;;; The closure receives ctx (#{buffer start end text input? ...}) and
+;;; returns one of the tagged results below.  RUNNING A TRANSFORM NEVER
+;;; MUTATES THE LIVE DOCUMENT: run! turns the result into a pending
+;;; edit PLAN (a portable value -- it logs and inspects for free);
+;;; apply! executes the plan as ONE document transaction (one undo
+;;; step, one notification, anchors transform once); reject! discards.
+;;;
+;;; Tagged results (constructed via the procs below):
+;;;   replace  -- new text for [start, end) only (the safe tier)
+;;;   edits    -- explicit #{start end text} list anywhere (escape hatch)
+;;;   no-change / fail err
+;;;   prompt   -- ask the user, re-run with ctx.input bound (transforms
+;;;               stay deterministic and replayable)
+
+namespace weft::transform {
+
+    var registry #{}
+    var pending #{}
+
+    proc register! {t} {
+        set! registry [put $registry [get $t name] $t]
+        return [get $t name]
+    }
+
+    proc names {} {
+        return [List::sort [Dict::keys $registry]]
+    }
+
+    proc describe {name} {
+        if [not [has? $registry $name]] { return #{} }
+        return [get $registry $name]
+    }
+
+    ;; ---- tagged results ----
+
+    proc replace {text} {
+        return #{weft_transform 1 kind replace text $text}
+    }
+
+    proc edits {lst} {
+        return #{weft_transform 1 kind edits edits $lst}
+    }
+
+    proc no-change {} {
+        return #{weft_transform 1 kind no_change}
+    }
+
+    proc fail {msg} {
+        return #{weft_transform 1 kind error
+            error [weft::error::make invalid-args $msg]}
+    }
+
+    proc prompt {msg default} {
+        return #{weft_transform 1 kind prompt message $msg default $default}
+    }
+
+    proc result? {v} {
+        return [and [dict? $v] [has? $v weft_transform]]
+    }
+
+    ;; ---- running ----
+
+    proc _edits-ok? {doc lst} {
+        let dlen [Lk::doc_len $doc]
+        var prev 0
+        var ok 1
+        foreach ed $lst {
+            if [or [< [get $ed start] $prev] \
+                   [> [get $ed end] $dlen] \
+                   [< [get $ed end] [get $ed start]]] {
+                set! ok 0
+            }
+            set! prev [get $ed end]
+        }
+        return $ok
+    }
+
+    ;; Run a registered transform.  ctx needs buffer (+ start/end for
+    ;; a range; whole buffer otherwise); when called with no ctx from
+    ;; evaluated code, the running execution's ctx is used.  Returns
+    ;;   #{kind plan}      -- plan pending, preview it
+    ;;   #{kind no_change} | #{kind error error ..} | #{kind prompt ..}
+    proc run {name *rest} {
+        var ctx [weft::image::ctx]
+
+        if [== 1 [len $rest]] {
+            set! ctx [get $rest 0]
+        }
+
+        if [not [has? $registry $name]] {
+            return #{kind error error [weft::error::make invalid-args \
+                "no transform named '$name' (see weft::transform::names)"]}
+        }
+
+        let bid [weft::ctx::field $ctx buffer]
+
+        if [not [weft::ws::buffer? $bid]] {
+            return #{kind error error [weft::error::make invalid-args \
+                "transform '$name' has no buffer in ctx"]}
+        }
+
+        let doc [weft::ws::buffer-doc $bid]
+        var start 0
+        var end [Lk::doc_len $doc]
+
+        if [and [has? $ctx start] [has? $ctx end]] {
+            set! start [get $ctx start]
+            set! end [get $ctx end]
+        }
+
+        var tctx [Dict::merge $ctx #{buffer $bid start $start end $end
+            text [String::range [Lk::doc_text $doc] $start $end]}]
+
+        var r ""
+        var e ""
+
+        if [not [== 0 [catch {
+                apply [get [get $registry $name] fn] $tctx } r e]] ] {
+            return #{kind error error [weft::error::from-caught $e]}
+        }
+
+        if [not [weft::transform::result? $r]] {
+            return #{kind error error [weft::error::make invalid-args
+                "transform '$name' returned no tagged result"]}
+        }
+
+        let kind [get $r kind]
+
+        if [== $kind no_change] { return #{kind no_change} }
+
+        if [== $kind error] { return #{kind error error [get $r error]} }
+
+        if [== $kind prompt] {
+            return #{kind prompt name $name ctx $tctx
+                message [get $r message] default [get $r default]}
+        }
+
+        var edits ()
+
+        if [== $kind replace] {
+            let rt [String::from [get $r text]]
+
+            if [== $rt [get $tctx text]] {
+                return #{kind no_change}
+            }
+
+            set! edits [list #{start $start end $end text $rt}]
+        } else {
+            set! edits [List::sort_by \
+                [weft::transform::_render-edits [get $r edits]] \
+                [lambda {ed} { get $ed start }]]
+
+            if [not [weft::transform::_edits-ok? $doc $edits]] {
+                return #{kind error error [weft::error::make invalid-args \
+                    "transform '$name' produced overlapping or out-of-range edits"]}
+            }
+
+            if [== 0 [len $edits]] { return #{kind no_change} }
+        }
+
+        set! pending #{transform $name buffer $bid
+            base_rev [Lk::doc_revision $doc] edits $edits}
+        return #{kind plan plan $pending}
+    }
+
+    ;; Edit `text` is TEXT: a transform or query fn that computes a
+    ;; number (renumbering) hands back a typed int, and the diff/apply
+    ;; paths string-manipulate it -- render at the seam, once.
+    proc _render-edits {edits} {
+        var out ()
+
+        foreach ed $edits {
+            if [has? $ed text] {
+                set! out [List::push $out \
+                    [put $ed text [String::from [get $ed text]]]]
+            } else {
+                set! out [List::push $out $ed]
+            }
+        }
+
+        return $out
+    }
+
+    ;; Pend an edits plan directly -- the query pipeline's edit sink
+    ;; (section 14 Q3) and any other programmatic edit producer share
+    ;; the registered-transform path from here on: same validation,
+    ;; same diff preview, same staleness refusal, same one-transaction
+    ;; apply.  `name` is provenance for the diff header.
+    proc propose! {name bid edit_list} {
+        if [not [weft::ws::buffer? $bid]] {
+            return #{kind error error [weft::error::make invalid-args
+                "propose!: no buffer '$bid'"]}
+        }
+
+        let doc [weft::ws::buffer-doc $bid]
+        let edits [List::sort_by [weft::transform::_render-edits $edit_list] \
+            [lambda {ed} { get $ed start }]]
+
+        if [== 0 [len $edits]] { return #{kind no_change} }
+
+        if [not [weft::transform::_edits-ok? $doc $edits]] {
+            return #{kind error error [weft::error::make invalid-args \
+                "'$name' produced overlapping or out-of-range edits"]}
+        }
+
+        set! pending #{transform $name buffer $bid
+            base_rev [Lk::doc_revision $doc] edits $edits}
+
+        return #{kind plan plan $pending}
+    }
+
+    proc pending? {} {
+        return [> [len [Dict::keys $pending]] 0]
+    }
+
+    proc pending-plan {} {
+        return $pending
+    }
+
+    ;; ---- the preview text: the plan IS the diff ----
+
+    proc _prefix-lines {text prefix} {
+        var out ()
+
+        foreach line [String::split $text "\n"] {
+            set! out [List::push $out "$prefix$line"]
+        }
+
+        return [String::join $out "\n"]
+    }
+
+    proc diff-text {} {
+        if [not [weft::transform::pending?]] { return "" }
+
+        let doc [weft::ws::buffer-doc [get $pending buffer]]
+        let full [Lk::doc_text $doc]
+
+        var out ";; transform: [get $pending transform] -> buffer [get $pending buffer]\n;; middle-click to decide:  \[weft::transform::apply\]   \[weft::transform::reject\]\n"
+
+        foreach ed [get $pending edits] {
+            let line [+ 1 [Lk::doc_pos_to_line $doc [get $ed start]]]
+
+            set! out "$out\n@ line $line\n"
+
+            let old [String::range $full [get $ed start] [get $ed end]]
+
+            if [not [empty? $old]] {
+                set! out "$out[weft::transform::_prefix-lines $old {- }]\n"
+            }
+
+            if [not [empty? [get $ed text]]] {
+                set! out "$out[weft::transform::_prefix-lines [get $ed text] {+ }]\n"
+            }
+        }
+
+        return $out
+    }
+
+    ;; ---- deciding ----
+
+    ;; Apply the pending plan as one transaction.  Refuses a stale
+    ;; plan (document changed since it was made).  Edits are applied
+    ;; back-to-front so earlier offsets stay true.
+    ;; Commit a plan (#{transform buffer base_rev edits}) as one
+    ;; transaction.  Returns the "applied: name" string, or a
+    ;; structured `cancelled` error when the plan is stale -- the
+    ;; buffer closed or changed since the plan was made.  The filter
+    ;; module commits its own plans through here (never the pending
+    ;; slot: a filter must not clobber a review in progress).
+    proc commit! {plan} {
+        let name [get $plan transform]
+
+        if [not [weft::ws::buffer? [get $plan buffer]]] {
+            return [weft::error::make cancelled
+                "stale plan: buffer closed since the transform ran"]
+        }
+
+        let doc [weft::ws::buffer-doc [get $plan buffer]]
+
+        if [not [== [Lk::doc_revision $doc] [get $plan base_rev]]] {
+            return [weft::error::make cancelled \
+                "stale plan: buffer changed since '$name' ran (rejected)"]
+        }
+
+        let edits [List::reverse [get $plan edits]]
+
+        Lk::doc_transact $doc {
+            foreach ed $edits {
+                if [> [get $ed end] [get $ed start]] {
+                    Lk::doc_delete $doc [get $ed start] \
+                        [- [get $ed end] [get $ed start]]
+                }
+
+                if [not [empty? [get $ed text]]] {
+                    Lk::doc_insert $doc [get $ed start] [get $ed text]
+                }
+            }
+        }
+
+        return "applied: $name"
+    }
+
+    proc apply {} {
+        if [not [weft::transform::pending?]] {
+            return "no pending transform"
+        }
+
+        let r [weft::transform::commit! $pending]
+
+        set! pending #{}
+
+        return $r
+    }
+
+    proc reject {} {
+        if [not [weft::transform::pending?]] {
+            return "no pending transform"
+        }
+
+        let name [get $pending transform]
+
+        set! pending #{}
+
+        return "rejected: $name"
+    }
+}
+
+;; ---- built-ins (the legacy set) ----
+
+weft::transform::register! #{name upper
+    description "Uppercase the range"
+    fn [lambda {ctx} {
+        return [::weft::transform::replace [String::upper [get $ctx text]]]
+    }]}
+
+weft::transform::register! #{name lower
+    description "Lowercase the range"
+    fn [lambda {ctx} {
+        return [::weft::transform::replace [String::lower [get $ctx text]]]
+    }]}
+
+weft::transform::register! #{name sort-lines
+    description "Sort the range's lines"
+    fn [lambda {ctx} {
+        return [::weft::transform::replace [String::join \
+            [List::sort [String::split [get $ctx text] "\n"]] "\n"]]
+    }]}
+
+weft::transform::register! #{name reverse-lines
+    description "Reverse the range's lines"
+    fn [lambda {ctx} {
+        return [::weft::transform::replace [String::join \
+            [List::reverse [String::split [get $ctx text] "\n"]] "\n"]]
+    }]}
+
+;; The prompt tier's demo: deterministic re-run with ctx.input bound.
+weft::transform::register! #{name prefix-lines
+    description "Prefix every line in the range (asks for the prefix)"
+    fn [lambda {ctx} {
+        if [not [has? $ctx input]] {
+            return [::weft::transform::prompt "prefix with?" ";; "]
+        }
+
+        var out ()
+
+        foreach line [String::split [get $ctx text] "\n"] {
+            set! out [List::push $out "[get $ctx input]$line"]
+        }
+
+        return [::weft::transform::replace [String::join $out "\n"]]
+    }]}

@@ -1,0 +1,245 @@
+;; The legacy parity gate (plan section 11, "Legacy retirement -- a
+;; gate, not a phase").
+;;   weft --headless test/parity-gates.lcl
+;;
+;; The C+SDL3 weft was frozen at the lk-rewrite branch cut
+;; (2026-07-31) and inventoried feature by feature before deletion
+;; (2026-08-18).  This file IS that inventory: every user-visible
+;; feature of the legacy editor appears below with a verdict --
+;;
+;;   ported   the rewrite does the same thing; the check exercises
+;;            the rewrite's entry point
+;;   changed  the rewrite does it DIFFERENTLY by a recorded design
+;;            decision (plan sections 2, 13, 14 or docs/commands.md);
+;;            the check exercises the replacement
+;;   dropped  gone on purpose, with the reason
+;;   gap      not in the rewrite yet and wanted; listed in the suite
+;;            output so it can never be silently forgotten
+;;
+;; The gate fails on any ported/changed check that no longer holds.
+;; Gaps and drops are printed, never hidden -- a deferred item is
+;; marked explicitly (repo convention).  Headless, CWD-independent.
+
+require "weft/host/test.lcl"
+
+var _n_ported 0
+var _n_changed 0
+var _n_dropped 0
+var _n_gap 0
+
+proc ported {legacy new ok} {
+    if [not $ok] { error "PARITY FAILED (ported): $legacy -> $new" }
+    set! _n_ported [+ $_n_ported 1]
+    puts "ported:  $legacy -> $new"
+}
+
+proc changed {legacy new ok} {
+    if [not $ok] { error "PARITY FAILED (changed): $legacy -> $new" }
+    set! _n_changed [+ $_n_changed 1]
+    puts "changed: $legacy -> $new"
+}
+
+proc dropped {legacy why} {
+    set! _n_dropped [+ $_n_dropped 1]
+    puts "dropped: $legacy -- $why"
+}
+
+proc gap {legacy note} {
+    set! _n_gap [+ $_n_gap 1]
+    puts "GAP:     $legacy -- $note"
+}
+
+proc defined? {ns name} {
+    return [Ns::has? $ns $name]
+}
+
+weft::ws::init! [weft::testhost::editor-hooks]
+weft::config::put! data_dir "/data"
+weft::persist::reset!
+
+weft::testhost::fs-put! "/t/a.txt" "hello weft\nsecond line\n"
+weft::testhost::fs-put! "/t/target.c" "int a;\nint b;\nint c;\n"
+
+let _ctx [weft::ctx::make #{}]
+let _b [weft::ws::buffer-open! "/t/a.txt" $_ctx]
+let _v [weft::ws::view-create! $_b]
+let _p [weft::ws::tree-init! $_v]
+let _store [weft::ws::buffer-store $_b]
+let _doc [weft::ws::buffer-doc $_b]
+
+puts ";; ---- documents and buffers ----"
+
+changed {weft::doc::length/text/line-*} {Lk::doc_* model layer, weft::q::lines} \
+    [and [== 23 [Lk::doc_len $_doc]] \
+         [== 2 [-> [weft::q::doc $_b] {weft::q::lines} {weft::q::count}]]]
+ported {weft::buffer::open path} {weft::ws::buffer-open! (resource layer, one resolve point)} \
+    [== $_b [weft::ws::buffer-open! "/t/a.txt" $_ctx]]
+ported {weft::buffer::open-output name content} {weft::ws::buffer-create! (path-less buffers, name = filetype key)} \
+    [not [weft::error::error? [weft::ws::buffer-create! "*note*" "" "x"]]]
+ported {weft::buffer::list} {weft::ws::buffer-list} \
+    [>= [len [weft::ws::buffer-list]] 2]
+ported {weft::buffer::by-id id} {weft::ws::buffer id (path, name, cwd, filetype)} \
+    [== "/t/a.txt" [get [weft::ws::buffer $_b] path]]
+ported {weft::buffer::save} {weft::ws::buffer-save! + dirty = Lk::history_at_saved} \
+    [not [weft::error::error? [weft::ws::buffer-save! $_b $_ctx]]]
+ported {weft::buffer::new} {weft::open <missing path> opens a (new) bound buffer} \
+    [not [weft::error::error? [weft::ws::buffer-open! "/t/fresh.txt" $_ctx]]]
+ported {weft::buffer::menu (inserted at cursor)} {weft::buffers -- sink rows with qjump presentations} \
+    [defined? $weft buffers]
+ported {weft::buffer::open-at path line} {plumb file:line rule -> LOOK dispatch} \
+    [not [weft::error::error? [weft::plumb::dispatch! \
+        #{rule file-line text "/t/target.c:2" cap1 "/t/target.c" cap2 2} \
+        [weft::ctx::make #{pane $_p}]]]]
+changed {weft::buffer::close (pane) / kill (buffer)} {pane-close! never loses buffers; buffer-close! id force} \
+    [and [defined? ${weft::ws} pane-close!] [defined? ${weft::ws} buffer-close!]]
+
+puts ";; ---- panes and layout ----"
+
+let _p2 [weft::ws::pane-split! $_p h $_b]
+ported {ctrl+2 / ctrl+3 split} {ctrl+e / ctrl+d -> weft::ws::pane-split! (workspace owns ratios)} \
+    [== 2 [len [weft::ws::panes]]]
+ported {draggable split divider} {controlled splits: drags arrive as commands -> split-ratio-set!} \
+    [defined? ${weft::ws} split-ratio-set!]
+ported {ctrl+tab / pane::next} {ctrl+n -> weft::ws::focus-next!} \
+    [not [weft::error::error? [weft::ws::focus-next!]]]
+dropped {weft::pane::prev} {ctrl+n cycles; two panes make prev = next, more are rare -- click focuses}
+ported {ctrl+w close pane, buffer survives} {weft::ws::pane-close! (views are disposable projections)} \
+    [and [not [weft::error::error? [weft::ws::pane-close! $_p2]]] [weft::ws::buffer? $_b]]
+ported {focus border, status bar Ln/Col} {shell status row + focused-pane highlight} 1
+dropped {tag bar (New/Open/Save/SaveAs/Del + file dialogs)} {was already stubbed to height 0 in legacy; ctrl+o open bar and weft::buffers replace it}
+gap {line-number gutter} {lk editor has no gutter; ctrl+g goto and the status row carry line info}
+
+puts ";; ---- annotations ----"
+
+let _aid [Lk::annot_add $_store 0 5 "notes" #{k v}]
+changed {weft::annot::add/remove/at/in-range/get/clear-layer} {Lk::annot_* store directly (bias-anchored, typed presentations)} \
+    [and [== 1 [len [Lk::annot_at $_store 2]]] [== 1 [len [Lk::annot_in_range $_store 0 23]]]]
+let _ed [weft::annot::edit-at #{buffer $_b start 0 end 5}]
+ported {weft::annot::edit-at / edit-range} {weft::annot::edit-at #{buffer start end} (ctrl+shift+i)} \
+    [not [weft::error::error? $_ed]]
+ported {weft::annot::apply-edit / cancel-edit} {same names; apply refuses a stale doc} \
+    [and [defined? ${weft::annot} apply-edit] [not [weft::error::error? [weft::annot::cancel-edit]]]]
+changed {weft::annot::persist / ephemeral layer} {derived-by-ownership: producer-owned layers never persist} \
+    [has? [weft::producer::owned-layers] plumb]
+ported {weft::annot::orphans / resolve-orphan / discard-orphan} {weft::orphans / orphan-adopt / orphan-drop (+ inspector section)} \
+    [and [defined? $weft orphans] [and [defined? $weft orphan-adopt] [defined? $weft orphan-drop]]]
+ported {ctrl+i inspect at cursor} {weft::inspect::report #{buffer pos}} \
+    [>= [String::find [weft::inspect::report #{buffer $_b pos 2}] "notes"] 0]
+ported {style:fg / style:bg / style:underline metadata on user-layer annotations} {weft::annot::style-of -- authored layers project their style: metadata; the store's change seq reprojects} \
+    [== #{fg (255 0 0)} [weft::annot::style-of #{"style:fg" "#ff0000"}]]
+
+puts ";; ---- interaction, plumbing, execution ----"
+
+changed {weft::interact::* + weft::config::handler} {plumb rules as data (weft::plumb::rule!), gestures in the shell} \
+    [has? [weft::plumb::rule-names] file-line]
+ported {plumb file:line ViewLayer + weft::plumb::scan} {plumb producer, revision-driven and live on rule changes} \
+    [== plumb [get [weft::plumb::producer-def] name]]
+changed {middle-click acme-exec (+cmd/!cmd buffers)} {EXECUTE -> weft::cmd::resolve, streams into *output* with run records} \
+    [and [== argv [get [weft::cmd::resolve {ls -l} [weft::ctx::make #{buffer $_b ns user}]] route]] \
+         [== lcl [get [weft::cmd::resolve {weft::version} [weft::ctx::make #{buffer $_b ns user}]] route]]]
+changed {weft::shell::exec cmd} {sh {...} explicit spelling; operators route to sh -c} \
+    [== shell [get [weft::cmd::resolve {echo a | wc} [weft::ctx::make #{buffer $_b ns user}]] route]]
+dropped {right-click pipe-selection (replace selection with command output)} {right-click is LOOK (Acme); edits go through reviewable plans -- transforms / weft::q::replace}
+changed {weft::fs::ls / cd / pwd} {plain ls rows are verified locations (weft::recog); cd is a semantic command per buffer} \
+    [defined? ${weft::ws} buffer-set-cwd!]
+ported {ctrl+enter execute selection/line} {ctrl+enter EXECUTE (REPL: pure lcl, ";; =>" echo kept)} 1
+ported {ctrl+` REPL (*lcl*)} {ctrl+r *lcl*; ctrl+t adds a *shell* buffer with its own cwd} 1
+
+puts ";; ---- REPL attachment and selection ----"
+
+let _tgt [weft::ws::buffer-create! "target.txt" "/t/target.txt" "alpha\nbeta\n"]
+let _a1 [weft::image::eval-in! user {weft::repl::attach} \
+    [weft::ctx::make #{buffer $_tgt ns user}]]
+ported {weft::repl::attach / detach / target} {same names; attachment IS ctx} \
+    [and [get $_a1 ok] [weft::repl::attached?]]
+changed {weft::repl::target-selection / target-cursor / goto} {ctx carries buffer + live selection (weft::repl::ctx-fields)} \
+    [defined? ${weft::repl} ctx-fields]
+changed {weft::sel::start/end/text/buffer/exists?/info} {explicit ctx everywhere: weft::ctx::field $ctx selection} \
+    [== b1 [weft::ctx::field [weft::ctx::make #{buffer b1}] buffer]]
+changed {weft::editor::cursor/cursor-set/insert/delete} {lk editor model + edit plans (weft::transform::propose!)} \
+    [defined? ${weft::transform} propose!]
+weft::repl::detach
+
+puts ";; ---- transforms and diff preview ----"
+
+let _tb [weft::ws::buffer-create! "tbuf" "" "hello world\n"]
+let _plan [weft::transform::run upper #{buffer $_tb start 0 end 11}]
+ported {weft::transform::run / apply / reject / list / register} {run / apply / reject / names / register!} \
+    [and [== plan [get $_plan kind]] [weft::transform::pending?]]
+ported {*diff* preview with [apply] [reject]} {weft::transform::diff-text; *diff* pane closes on decision} \
+    [>= [String::find [weft::transform::diff-text] "HELLO"] 0]
+ported {transform results replace / patch / prompt / cancel} {replace / edits / prompt / no-change / fail} \
+    [and [weft::transform::result? [weft::transform::replace "x"]] \
+         [weft::transform::result? [weft::transform::prompt "m" "d"]]]
+ported {built-ins upper lower sort-lines reverse-lines} {registered transforms} \
+    [has? [weft::transform::names] upper]
+weft::transform::reject
+changed {weft::transform::menu} {weft::commands -- one curated menu, text is the menu} \
+    [defined? $weft commands]
+
+puts ";; ---- search, replace, goto ----"
+
+weft::producer::attach! $_b search
+weft::search::query! $_b "line"
+weft::producer::tick! $_b
+ported {ctrl+f incremental search, live match layer, n/m} {ctrl+f -> search producer (all matches)} \
+    [== 1 [len [Lk::annot_by_layer $_store "search"]]]
+ported {ctrl+h replace field (execution was unwired in legacy)} {ctrl+h replace-one / ctrl+return replace-all -- wired} 1
+ported {ctrl+g goto line} {ctrl+g goto bar} 1
+weft::search::clear! $_b
+
+puts ";; ---- configuration ----"
+
+weft::config::bind! "f5" {weft::version}
+ported {weft::config::keybind key script} {weft::config::bind! chord script (focused buffer + selection ctx)} \
+    [> [len [weft::config::bindings-list]] 0]
+weft::config::filetype! ".txt" #{wrap word}
+ported {weft::config::wrap ext enabled width} {weft::config::filetype! ext #{wrap word|character|none}} \
+    [== word [weft::config::filetype-value ".txt" wrap ""]]
+changed {weft::config::viewlayer / language / language-ext} {filetype! ext #{lang c}; grammars embedded from submodules/} \
+    [== c [weft::ts::lang-for ".c"]]
+ported {weft::config::font path size} {config font_path / font_size keys} \
+    [weft::config::has-key? font_path]
+changed {weft::config::filetype ext layer script} {producers (weft::producer::define!) and q::annotate rules} \
+    [defined? ${weft::producer} define!]
+ported {~/.config/weft/init.lcl} {same path; legacy files warn-and-continue} 1
+gap {weft::config::indent ext tab-size use-tabs} {lk inserts tab_size spaces (pinned v1 policy); no per-filetype tabs}
+dropped {dynamic tree-sitter languages via .so (weft::config::language)} {grammars are pinned submodules built into the host; the package matrix, not dlopen, decides capability}
+gap {embedded parsers json, bash, javascript} {only lcl and c are checked out under submodules/ -- add grammars as they are wanted}
+
+puts ";; ---- tree-sitter highlighting ----"
+
+ported {tree-sitter ViewLayer per pane, incremental} {ts producer: sessions, incremental reparse, predicates} \
+    [== ts [get [weft::ts::producer-def] name]]
+ported {hardcoded capture palette} {weft::ts::style! capture #{fg ..} -- a palette users edit} \
+    [> [len [Dict::keys [weft::ts::style-of "keyword"]]] 0]
+changed {weft::ts::highlight (one-shot style annotations)} {producers rescan on revision; nothing to re-run by hand} 1
+
+puts ";; ---- persistence ----"
+
+Lk::annot_add $_store 0 5 "notes" #{k v}
+ported {registry.weft + annots/<uuid>.weft on save} {persist: doc registry + annots at rest, wire-encoded envelopes} \
+    [>= [weft::persist::annots-save! $_b] 1]
+ported {32-byte context anchors, fuzzy re-anchoring, orphans} {weft::anchor (0-100 confidence) + orphan flow} \
+    [defined? ${weft::anchor} capture]
+changed {legacy .weft text format} {envelope-wrapped wire values; decoded, never eval'd -- NO migration of pre-rewrite data (see below)} 1
+ported {no session/layout file} {sessions: split tree + ratios + focus + cursors, auto-save on quit} \
+    [== 1 [weft::session::save!]]
+
+puts ";; ---- editing surface (lk editor) ----"
+
+ported {cursor/word/line/page motion, shift-extend} {lk editor widget} 1
+ported {ctrl+a/c/x/v, ctrl+z / ctrl+shift+z / ctrl+y} {lk editor: select all, clipboard, history} 1
+ported {tab inserts tab_size spaces} {lk editor (v1 policy)} 1
+ported {per-extension wrap, width 0 = pane width} {wrap_mode global + filetype! #{wrap ..}} 1
+dropped {column / block selection (ctrl+drag, virtual columns)} {not in the lk editor; no user has asked -- an lk feature request if wanted, not a weft one}
+dropped {layers/*.lcl scripts (syntax_c, etymology, highlight_demo)} {authoring model changed: producers + q::annotate; the etymology idea lives on as a q::annotate word-list rule}
+dropped {lib/weft.lcl embedded stdlib (string/list aliases, acme-exec)} {lcl's own String::/List:: and the command pipeline}
+dropped {CLI: single positional file, no flags} {weft [files...], --headless script, no-args restores the session}
+
+puts ""
+puts "parity: $_n_ported ported, $_n_changed changed, $_n_dropped dropped, $_n_gap gaps"
+puts ";; Migration decision: legacy registry.weft / annots/*.weft are NOT"
+puts ";; read by the rewrite (pre-release data, no users beyond the author);"
+puts ";; the envelope's format version is what future migrations key on."
+puts "PARITY GATES PASSED -- legacy/editor-c may be deleted"

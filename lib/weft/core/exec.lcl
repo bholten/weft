@@ -1,0 +1,501 @@
+;;; weft::shell -- shell execution as the first real async task (plan
+;;; P2).  Spawn through the process capabilities, stream output into the
+;;; *output* buffer via frame-polled non-blocking reads, exit status
+;;; appended as a footer.  Cancellation kills the process; closing the
+;;; output buffer cancels every task streaming into it (the workspace
+;;; kernel routes that through weft::tasks::cancel-for-buffer!).
+;;;
+;;; Pure capability consumer: on a host without process.* every execute
+;;; fails cleanly with `unsupported`.
+
+namespace weft::shell {
+
+    var output_buffer ""
+
+    ;; The *output* buffer if it exists -- never creates one.  The UI
+    ;; asks every frame (tail-follow); a query must not conjure a
+    ;; buffer nobody asked for.
+    proc output-buffer-id {} {
+        if [and [not [empty? $output_buffer]] \
+                [weft::ws::buffer? $output_buffer]] {
+            return $output_buffer
+        }
+
+        return ""
+    }
+
+    ;; The *output* buffer, recreated if it was closed.
+    proc output-buffer! {} {
+        let have [weft::shell::output-buffer-id]
+
+        if [not [empty? $have]] { return $have }
+
+        set! output_buffer [weft::ws::buffer-create! "*output*" "" ""]
+        return $output_buffer
+    }
+
+    ;; Where this execution's output goes: ctx `out` (a live buffer id
+    ;; -- EXECUTE HERE sets it to the executing buffer) wins; the
+    ;; default is *output*.  The seam every echo, stream, and emitter
+    ;; resolves through -- an inline run never conjures *output*.
+    proc out-buffer! {ctx} {
+        let o [weft::ctx::field $ctx out]
+
+        if [and [not [empty? $o]] [weft::ws::buffer? $o]] { return $o }
+
+        return [weft::shell::output-buffer!]
+    }
+
+    ;; Echo a structured error VALUE into `out`: "!! why", and when it
+    ;; carries `candidates` (an ambiguous buffer name, docs/buffers.md)
+    ;; one row per candidate through the sink, each a qjump menu of
+    ;; its own.  Returns how many rows it printed, so a caller knows
+    ;; whether *output* is worth surfacing.
+    proc report-error! {out v} {
+        weft::shell::_append! $out "!! [weft::error::message $v]\n"
+
+        let data [weft::error::data $v]
+        var n 0
+
+        if [has? $data candidates] {
+            foreach c [get $data candidates] {
+                weft::sink::emit! $out "  [get $c name]  [get $c id]\n" \
+                    #{layer {qjump}
+                      meta #{kind {buffer-row} buffer [get $c id]}
+                      present #{ptype {qjump}
+                          value #{buffer [get $c id] start 0 end 0}}}
+                set! n [+ $n 1]
+            }
+        }
+
+        return $n
+    }
+
+    ;; ---- notices: what the status row flashed, kept ----
+    ;; A flash lives four seconds; a notice lives here so an error you
+    ;; missed can still be read.  `weft::messages` prints them.
+    var _notices ()
+
+    proc notice! {text} {
+        var at 0
+        let t [weft::cap::invoke "time.now" #{} #{}]
+
+        if [== [weft::task::state $t] succeeded] {
+            set! at [weft::task::result $t]
+        }
+
+        set! _notices [List::push $_notices #{at $at text $text}]
+
+        if [> [len $_notices] 200] {
+            set! _notices [List::slice $_notices [- [len $_notices] 200] [len $_notices]]
+        }
+
+        return ""
+    }
+
+    proc notices {} {
+        return $_notices
+    }
+
+    proc _append! {buf_id text} {
+        let doc [weft::ws::buffer-doc $buf_id]
+        Lk::doc_insert $doc [Lk::doc_len $doc] $text
+        return ""
+    }
+
+    ;; Feed a chunk through the framing session and hand completed
+    ;; lines to the recognizers (stage C) with the run's context.
+    proc _ingest! {rid sid chunk} {
+        weft::recog::lines! $rid [weft::sink::feed! $sid $chunk]
+        return ""
+    }
+
+    proc _drain! {h rid sid} {
+        var more 1
+
+        while $more {
+            let c [weft::task::result
+                [weft::cap::invoke "process.read" #{proc $h} #{}]]
+            if [empty? $c] {
+                set! more 0
+            } else {
+                weft::shell::_ingest! $rid $sid $c
+            }
+        }
+
+        return ""
+    }
+
+    proc _poll {tid h out rid sid} {
+        let chunk [weft::task::result
+            [weft::cap::invoke "process.read" #{proc $h} #{}]]
+
+        if [not [empty? $chunk]] {
+            weft::shell::_ingest! $rid $sid $chunk
+            weft::cmd::run-grew! $rid
+        }
+
+        if [weft::task::result \
+                [weft::cap::invoke "process.alive?" #{proc $h} #{}]] {
+            return [weft::task::pending $tid]
+        }
+
+        ;; Process ended: drain the pipe, reap, close the framing
+        ;; session (flushes an unterminated tail), footer, release.
+        weft::shell::_drain! $h $rid $sid
+        weft::recog::lines! $rid [weft::sink::close! $sid]
+
+        let w [weft::task::result \
+            [weft::cap::invoke "process.reap" #{proc $h} #{}]]
+        var status 0
+
+        if [has? $w status] {
+            set! status [get $w status]
+        }
+
+        weft::shell::_append! $out "\[exit $status\]\n\n"
+        weft::cap::invoke "process.close" #{proc $h} #{}
+        weft::cmd::run-exit! $rid $status {exited}
+
+        return [weft::task::done #{status $status}]
+    }
+
+    proc _cancel {h out rid sid} {
+        weft::cap::invoke "process.kill" #{proc $h} #{}
+        weft::sink::close! $sid
+        weft::shell::_append! $out "\[killed\]\n\n"
+        weft::cap::invoke "process.close" #{proc $h} #{}
+        weft::cmd::run-exit! $rid "" {cancelled}
+
+        return ""
+    }
+
+    ;; EXECUTE routing (command pipeline stage A): the text is
+    ;; CLASSIFIED by weft::cmd::resolve before anything runs --
+    ;; resolution chooses the language the rest of the line is
+    ;; interpreted in.  Lcl-callable heads (and ::-paths, namespace
+    ;; forms, dynamic heads) evaluate in the image; semantic commands
+    ;; mutate weft state; unmistakable shell structure hands the raw
+    ;; string to sh -c; external heads run as literal argv.  All
+    ;; report into *output*; image evaluations leave execution
+    ;; records; process routes leave run records.
+    proc run-text! {text ctx} {
+        let t [String::trim $text]
+
+        if [empty? $t] { return [weft::task::done ""] }
+
+        let plan [weft::cmd::resolve $t $ctx]
+        let route [get $plan route]
+
+        if [== $route none] { return [weft::task::done ""] }
+
+        if [== $route shell] {
+            return [weft::shell::execute-shell! $t $plan $ctx]
+        }
+
+        if [== $route argv] {
+            return [weft::shell::execute-argv! $plan $ctx]
+        }
+
+        ;; FILTER route (stage D): the selection through a program.
+        ;; The filter module owns the run; a failed start echoes here
+        ;; like any other refused plan.
+        if [== $route filter] {
+            let ft [weft::filter::run! [get $plan mode] \
+                [get $plan command] $ctx]
+
+            if [== [weft::task::state $ft] failed] {
+                let out [weft::shell::out-buffer! $ctx]
+                weft::shell::_append! $out \
+                    "> $t\n!! [weft::error::message [weft::task::failure $ft]]\n\n"
+            }
+
+            return $ft
+        }
+
+        if [== $route semantic] {
+            let st [apply [get $plan handler] $plan $ctx]
+            let sstate [weft::task::state $st]
+
+            ;; A handler may hand off to a streaming provider (sh):
+            ;; the pending task already echoes its own header.
+            if [== $sstate pending] { return $st }
+
+            let out [weft::shell::out-buffer! $ctx]
+            weft::shell::_append! $out "> $t\n"
+
+            if [== $sstate succeeded] {
+                weft::shell::_append! $out "[weft::task::result $st]\n\n"
+            } else {
+                weft::shell::_append! $out \
+                    "!! [weft::error::message [weft::task::failure $st]]\n\n"
+            }
+
+            return $st
+        }
+
+        if [== $route error] {
+            let out [weft::shell::out-buffer! $ctx]
+            let err [get $plan error]
+            weft::shell::_append! $out \
+                "> $t\n!! [weft::error::message $err]\n\n"
+            return [weft::task::failed $err]
+        }
+
+        ;; LCL route: evaluate in the image with the ctx's namespace
+        ;; current (default user, plan section 13.7).
+        let out [weft::shell::out-buffer! $ctx]
+        weft::shell::_append! $out "> $t\n"
+
+        var ns [weft::ctx::field $ctx ns]
+
+        if [empty? $ns] {
+            set! ns user
+        }
+
+        let r [weft::image::eval-in! $ns $t $ctx]
+
+        if [get $r ok] {
+            var vs "[get $r value]"
+            let v [get $r value]
+
+            ;; Query plans echo compactly (plan section 14); sink
+            ;; emitters already wrote their output -- echo the
+            ;; summary, not the value.
+            if [and [dict? $v] [has? $v kind]] {
+                if [== [get $v kind] query] {
+                    set! vs [weft::q::describe $v]
+                }
+
+                if [== [get $v kind] emitted] {
+                    set! vs [get $v summary]
+                }
+            }
+
+            ;; A command that RETURNED a structured error (weft::open
+            ;; on an unreadable path, weft::close on a dirty buffer):
+            ;; the value stays the error -- programmable -- but it
+            ;; echoes as a failure, and an ambiguous-buffer error's
+            ;; candidates print as rows through the sink, each a
+            ;; qjump menu of its own (docs/buffers.md).
+            if [weft::error::error? $v] {
+                weft::shell::report-error! $out $v
+                set! vs ""
+            }
+
+            weft::shell::_append! $out "$vs\n\n"
+            return [weft::task::done [get $r value]]
+        }
+
+        weft::shell::_append! $out \
+            "!! [weft::error::message [get $r error]]\n\n"
+        return [weft::task::failed [get $r error]]
+    }
+
+    ;; Spawn + stream + run record, shared by both process routes.
+    ;; `echo` is the *output* header line; `provider` names the route.
+    proc _launch! {argv echo provider form cwd ctx} {
+        var spawn_args #{argv $argv}
+
+        if [not [empty? $cwd]] {
+            set! spawn_args [put $spawn_args cwd $cwd]
+        }
+
+        let spawn_t [weft::cap::invoke "process.spawn" $spawn_args $ctx]
+
+        if [not [== [weft::task::state $spawn_t] succeeded]] {
+            return $spawn_t
+        }
+
+        let h [weft::task::result $spawn_t]
+        let out [weft::shell::out-buffer! $ctx]
+        let exec_id [weft::ctx::field $ctx execution]
+        let tid "shexec-$exec_id"
+        let start [Lk::doc_len [weft::ws::buffer-doc $out]]
+
+        weft::shell::_append! $out "$echo\n"
+
+        let rid [weft::cmd::run-start! #{form $form provider $provider
+            cwd $cwd argv $argv buffer $out task $tid start $start
+            end [Lk::doc_len [weft::ws::buffer-doc $out]]}]
+        let sid [weft::sink::open! $out]
+
+        ;; An inline run (out is not *output*) is quiet -- its output
+        ;; is already where the user is looking; `out` in the meta is
+        ;; what the shell's tail-follow watches.
+        var tmeta #{buffer $out execution $exec_id run $rid out $out}
+
+        if [not [== $out [weft::shell::output-buffer-id]]] {
+            set! tmeta [put $tmeta quiet 1]
+        }
+
+        weft::tasks::register! $tid #{poll [lambda {} {
+                    return [weft::shell::_poll $tid $h $out $rid $sid]
+                }]
+                cancel [lambda {} {
+                    return [weft::shell::_cancel $h $out $rid $sid]
+                }]
+                meta $tmeta}
+        return [weft::task::pending $tid]
+    }
+
+    ;; The SHELL provider: the raw command line handed verbatim to
+    ;; sh -c, in the executing buffer's cwd.  Returns a pending task
+    ;; value carrying the registry id; a failed spawn task passes
+    ;; through untouched.
+    proc execute! {cmdline ctx} {
+        return [weft::shell::_launch! ("/bin/sh" "-c" $cmdline) \
+            "$ $cmdline" {shell} $cmdline \
+            [weft::cmd::ctx-cwd $ctx] $ctx]
+    }
+
+    ;; The SHELL provider with a plan: when the plan carries an
+    ;; OPERAND it arrives as the script's $1 -- never spliced into the
+    ;; text, so no quoting question exists.  Text that does not place
+    ;; $1/$@ itself gets `"$@"` appended: the operand is the final
+    ;; argument of the final command, the shell-natural reading.
+    proc execute-shell! {cmdline plan ctx} {
+        if [not [has? $plan operand]] {
+            return [weft::shell::execute! $cmdline $ctx]
+        }
+
+        let o [get $plan operand]
+        var script $cmdline
+
+        if [not [weft::cmd::_mentions-positional? $cmdline]] {
+            set! script "$cmdline \"\$@\""
+        }
+
+        return [weft::shell::_launch! \
+            ("/bin/sh" "-c" $script "weft" [get $o text]) \
+            "$ $cmdline  \[\$1 = [weft::shell::_brief [get $o text]]\]" \
+            {shell} $cmdline [weft::cmd::ctx-cwd $ctx] $ctx]
+    }
+
+    proc _brief {text} {
+        var t [String::replace $text "\n" "\\n"]
+
+        if [> [String::length $t] 40] {
+            set! t "[String::range $t 0 40]..."
+        }
+
+        return [repr $t]
+    }
+
+    ;; The ARGV provider: literal argv from a resolved plan.  The
+    ;; echo shows the DECODED argv -- what the process actually
+    ;; receives -- so quoting surprises surface immediately.  The
+    ;; plan's cwd wins over the ctx (gesture actions construct plans
+    ;; targeting other directories -- e.g. re-listing a clicked dir).
+    proc execute-argv! {plan ctx} {
+        var argv [get $plan argv]
+
+        ;; An OPERAND is one more argv element -- exactly as selected,
+        ;; whatever it contains.
+        if [has? $plan operand] {
+            set! argv [List::push $argv [get [get $plan operand] text]]
+        }
+
+        var cwd ""
+
+        if [has? $plan cwd] {
+            set! cwd [get $plan cwd]
+        } else {
+            set! cwd [weft::cmd::ctx-cwd $ctx]
+        }
+
+        var form ""
+
+        if [has? $plan text] { set! form [get $plan text] }
+
+        return [weft::shell::_launch! $argv \
+            "$ [String::join $argv { }]" {argv} $form $cwd $ctx]
+    }
+
+    ;; ---- N execution units (docs/commands.md "Selections") ----
+    ;; N selections = N execution units: run-text! over each unit IN
+    ;; ORDER, unit k+1 starting when unit k's task leaves the pending
+    ;; registry -- never concurrently (two `git add` children racing
+    ;; the index lock would corrupt what one-at-a-time gets right),
+    ;; and never batched (each unit resolves and records
+    ;; independently; a failure does not stop the queue -- the
+    ;; multi-line shell pin).  units: (#{text .. ctx ..} ...), each
+    ;; ctx made fresh so execution ids never collide.
+    ;;
+    ;; The queue is FRAME-PUMPED (seq-tick! beside tasks::poll-all!),
+    ;; never registered as a task: a registry poll that starts new
+    ;; runs would store a closure reaching weft::tasks inside
+    ;; weft::tasks -- the reference cycle lcl refuses.  Pure data
+    ;; here, like the filter event queue.
+
+    var _seqs #{}
+    var _seq_n 0
+
+    proc run-texts! {units} {
+        if [== 0 [len $units]] { return [weft::task::done ""] }
+
+        if [== 1 [len $units]] {
+            let u [get $units 0]
+            return [weft::shell::run-text! [get $u text] [get $u ctx]]
+        }
+
+        set! _seq_n [+ $_seq_n 1]
+        let sid "exec-seq-$_seq_n"
+
+        set! _seqs [put $_seqs $sid #{units $units i 0 watching ""}]
+
+        if [weft::shell::_seq-advance! $sid] {
+            return [weft::task::pending $sid]
+        }
+
+        return [weft::task::done #{kind exec-seq units [len $units]}]
+    }
+
+    ;; Advance one queue: start units until one goes async or the
+    ;; queue drains.  Returns 1 while the queue lives.
+    proc _seq-advance! {sid} {
+        var s [get $_seqs $sid]
+
+        ;; The current unit is done when its task id has left the
+        ;; pending registry (retired by poll-all! or by cancel).
+        if [not [empty? [get $s watching]]] {
+            if [has? [weft::tasks::pending-ids] [get $s watching]] {
+                return 1
+            }
+
+            set! s [put $s watching ""]
+        }
+
+        let units [get $s units]
+        var i [get $s i]
+
+        while [< $i [len $units]] {
+            let u [get $units $i]
+            set! i [+ $i 1]
+
+            let t [weft::shell::run-text! [get $u text] [get $u ctx]]
+
+            if [== [weft::task::state $t] pending] {
+                set! s [put $s i $i]
+                set! s [put $s watching [get $t id]]
+                set! _seqs [put $_seqs $sid $s]
+                return 1
+            }
+        }
+
+        set! _seqs [del $_seqs $sid]
+        return 0
+    }
+
+    ;; The frame pump: advance every live queue.  Returns how many
+    ;; are still running (headless drains loop on tasks + this).
+    proc seq-tick! {} {
+        foreach sid [Dict::keys $_seqs] {
+            if [has? $_seqs $sid] {
+                weft::shell::_seq-advance! $sid
+            }
+        }
+
+        return [len [Dict::keys $_seqs]]
+    }
+}

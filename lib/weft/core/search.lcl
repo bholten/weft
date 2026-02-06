@@ -1,0 +1,103 @@
+;;; weft::search -- the all-matches search producer (plan P4).
+;;;
+;;; The mini-bar owns the ACTIVE match (selection + scroll); this
+;;; producer owns the rest: every occurrence of a buffer's current
+;;; query is annotated on the `search` layer, so all matches light up
+;;; while you type and keep tracking the document afterwards.  Queries
+;;; are literal byte strings (the bar's semantics); matching needs no
+;;; regex capability, so search highlighting works on every host.
+;;;
+;;; Query changes drive rescans through the producer generation token
+;;; (P4 stage A): query!/clear! bump a counter and open buffers
+;;; re-annotate on the next frame with no document edit.
+;;;
+;;; NB: the setter is query!, NOT set! -- a namespace-local proc named
+;;; set! shadows the builtin inside its own namespace and recurses.
+
+namespace weft::search {
+
+    var queries #{}   ;; buffer-id -> query string
+    var gen 0
+
+    proc generation {} {
+        return $gen
+    }
+
+    proc query {buffer_id} {
+        if [not [has? $queries $buffer_id]] { return "" }
+
+        return [get $queries $buffer_id]
+    }
+
+    proc query! {buffer_id q} {
+        ;; The query is text; a bare-number query arrives typed.
+        let qs [String::from $q]
+
+        if [== $qs [weft::search::query $buffer_id]] { return $qs }
+
+        set! queries [put $queries $buffer_id $qs]
+        set! gen [+ $gen 1]
+
+        return $qs
+    }
+
+    proc clear! {buffer_id} {
+        if [has? $queries $buffer_id] {
+            set! queries [del $queries $buffer_id]
+            set! gen [+ $gen 1]
+        }
+
+        return ""
+    }
+
+    ;; The producer update: drop the search layer, re-annotate every
+    ;; match of the buffer's current query (no query, no annotations).
+    ;; Matching walks the document with Lk::doc_find -- C-speed, no
+    ;; text copies (a pure-Lcl scan here was a measured frame-time
+    ;; cliff on large buffers).  Q5 convergence decision, pinned:
+    ;; this SPECIALIZED engine stays specialized -- the interactive
+    ;; search state is not re-expressed through the algebra; its
+    ;; results appear as a range source like any layer, via
+    ;; [weft::q::annots <bid> "search"].
+    proc scan! {ctx} {
+        let store [get $ctx store]
+
+        foreach id [Lk::annot_by_layer $store "search"] {
+            Lk::annot_remove $store $id
+        }
+
+        let q [weft::search::query [get $ctx buffer]]
+
+        if [empty? $q] { return "" }
+
+        let doc [get $ctx doc]
+        let ql [String::length $q]
+
+        var from 0
+        var going 1
+
+        while $going {
+            let hit [Lk::doc_find $doc $q $from]
+
+            if [< $hit 0] {
+                set! going 0
+            } else {
+                Lk::annot_add $store $hit [+ $hit $ql] "search" #{}
+                set! from [+ $hit $ql]
+            }
+        }
+
+        return ""
+    }
+
+    proc producer-def {} {
+        return #{name search layers (search)
+            update [lambda {ctx} { return [weft::search::scan! $ctx] }]
+            generation [lambda {} { return [weft::search::generation] }]}
+    }
+
+    ;; Span styling for the search layer (projected by the view layer).
+    proc style {} {
+        return #{bg (96 84 24)}
+    }
+}

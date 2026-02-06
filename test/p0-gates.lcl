@@ -1,0 +1,64 @@
+;; P0 acceptance gates (plan section 11).  Run:
+;;   weft --headless test/p0-gates.lcl
+;; Must behave identically from any working directory.
+
+proc gate {name ok} {
+    if [not $ok] { error "GATE FAILED: $name" }
+    puts "ok: $name"
+}
+
+;; -- Core modules loaded, capability registry live --
+gate "cap registry loaded" [weft::cap::available? "id.new"]
+
+;; -- Unsupported capability is denied cleanly with a structured error --
+let _t_bad [weft::cap::invoke "no.such.capability" #{} #{}]
+gate "unsupported cap -> failed task" [== [weft::task::state $_t_bad] failed]
+gate "unsupported cap -> unsupported code" \
+    [== [weft::error::code [weft::task::failure $_t_bad]] unsupported]
+
+;; -- Structured error convention --
+let _e [weft::error::make invalid-args "test message"]
+gate "error? recognizes errors" [weft::error::error? $_e]
+gate "error? rejects plain dicts" [not [weft::error::error? #{a 1}]]
+
+;; -- Task contract --
+let _t_ok [weft::task::done 42]
+gate "done task succeeded" [== [weft::task::state $_t_ok] succeeded]
+gate "done task result" [== [weft::task::result $_t_ok] 42]
+gate "cancel completed task is no-op" \
+    [== [weft::task::state [weft::task::cancel $_t_ok]] succeeded]
+
+;; -- id.new: fresh ids differ --
+let _id1 [weft::task::result [weft::cap::invoke "id.new" #{} #{}]]
+let _id2 [weft::task::result [weft::cap::invoke "id.new" #{} #{}]]
+gate "id.new yields fresh ids" [not [== $_id1 $_id2]]
+
+;; -- fs capability round trip (io package present in default matrix) --
+if $weft_have_io {
+    let _cfg_t [weft::cap::invoke "fs.read" \
+        #{path "$weft_config_dir/default.lcl"} #{}]
+    gate "fs.read succeeds" [== [weft::task::state $_cfg_t] succeeded]
+    gate "fs.read content sane" \
+        [>= [String::find [weft::task::result $_cfg_t] "weft::config"] 0]
+}
+
+;; -- Document round trip with no window (lk model layer, headless) --
+;; Revisions are opaque tokens: compare for change, never for order.
+let _d [Lk::doc_new "hello"]
+let _rev0 [Lk::doc_revision $_d]
+Lk::doc_insert $_d 5 " weft"
+gate "doc round trip" [== [Lk::doc_text $_d] "hello weft"]
+gate "doc revision changed" [not [== [Lk::doc_revision $_d] $_rev0]]
+
+;; -- Versioned envelope --
+let _env [weft::envelope::wrap test-kind #{payload-key 7}]
+let _p [weft::envelope::unwrap $_env test-kind]
+gate "envelope round trip" [== [get $_p payload-key] 7]
+let _bad [weft::envelope::unwrap $_env other-kind]
+gate "envelope kind mismatch -> error" [weft::error::error? $_bad]
+
+;; -- Config registry (default.lcl was loaded by boot) --
+gate "config loaded from default.lcl" [weft::config::has-key? font_size]
+
+puts ""
+puts "P0 GATES PASSED"

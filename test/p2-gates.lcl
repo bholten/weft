@@ -1,0 +1,213 @@
+;; P2 acceptance gates, stage A: async task model + shell execution.
+;;   weft --headless test/p2-gates.lcl
+;; The test host fakes fs/id; process capabilities are the REAL posix
+;; ones -- these gates spawn actual processes (/bin/sh, echo, sleep).
+
+proc gate {name ok} {
+    if [not $ok] { error "GATE FAILED: $name" }
+    puts "ok: $name"
+}
+
+require "weft/host/test.lcl"
+
+weft::ws::init! [weft::testhost::editor-hooks]
+let _ctx [weft::ctx::make #{}]
+
+;; ---- task registry with a synthetic task ----
+var _polls 0
+var _cancelled 0
+
+weft::tasks::register! "fake-1" #{poll [lambda {} {
+        set! _polls [+ $_polls 1]
+        if [< $_polls 3] { return [::weft::task::pending "fake-1"] }
+        return [::weft::task::done 42]
+    }]
+    cancel [lambda {} { set! _cancelled 1 ; return "" }]
+    meta #{buffer "bufX" execution "x0"}}
+
+gate "pending task registered" [== 1 [len [weft::tasks::pending-ids]]]
+gate "poll keeps pending tasks" [== 1 [weft::tasks::poll-all!]]
+weft::tasks::poll-all!
+gate "poll retires completed tasks" [== 0 [weft::tasks::poll-all!]]
+gate "task polled to completion" [== 3 $_polls]
+
+weft::tasks::register! "fake-2" #{poll [lambda {} {
+        return [::weft::task::pending "fake-2"]
+    }]
+    cancel [lambda {} { set! _cancelled 1 ; return "" }]
+    meta #{buffer "bufX" execution "x1"}}
+gate "cancel-for-buffer cancels matching tasks" \
+    [== 1 [weft::tasks::cancel-for-buffer! "bufX"]]
+gate "cancel closure ran" [== 1 $_cancelled]
+gate "cancelled task retired" [== 0 [len [weft::tasks::pending-ids]]]
+
+;; ---- a poll that raises retires as failed, never wedges ----
+weft::tasks::register! "fake-3" #{poll [lambda {} { error "boom" }]
+    cancel [lambda {} { return "" }] meta #{}}
+gate "raising poll retires the task" [== 0 [weft::tasks::poll-all!]]
+
+;; ---- shell execution: stream, exit footer ----
+proc drain-tasks {} {
+    var i 0
+    while [and [> [weft::tasks::poll-all!] 0] [< $i 200000]] {
+        set! i [+ $i 1]
+    }
+    return $i
+}
+
+let _t1 [weft::shell::execute! "echo hello-weft" $_ctx]
+gate "execute returns a pending task" \
+    [== [weft::task::state $_t1] pending]
+drain-tasks
+let _out [weft::shell::output-buffer!]
+let _text [Lk::doc_text [weft::ws::buffer-doc $_out]]
+gate "command line echoed to output" [>= [String::find $_text "$ echo hello-weft"] 0]
+gate "stdout streamed into output buffer" \
+    [>= [String::find $_text "hello-weft"] 0]
+gate "exit footer appended" [>= [String::find $_text "\[exit 0\]"] 0]
+
+let _t2 [weft::shell::execute! "exit 3" $_ctx]
+drain-tasks
+gate "nonzero exit status reported" [>= [String::find \
+    [Lk::doc_text [weft::ws::buffer-doc $_out]] "\[exit 3\]"] 0]
+
+;; ---- unsupported host degrades cleanly (spawn failure passthrough) ----
+;; Emulate by asking for a capability that cannot exist here.
+gate "execute on missing capability fails as task" \
+    [== [weft::task::state [weft::cap::invoke "process.spawn-nope" #{} #{}]] \
+        failed]
+
+;; ---- EXECUTE routing: :: paths evaluate, the rest shells out ----
+let _rt1 [weft::shell::run-text! "weft::version" $_ctx]
+gate "lcl route completes synchronously" \
+    [== [weft::task::state $_rt1] succeeded]
+gate "lcl route returns the value" \
+    [== [weft::task::result $_rt1] $weft_version]
+gate "lcl result lands in output" [>= [String::find \
+    [Lk::doc_text [weft::ws::buffer-doc $_out]] "> weft::version"] 0]
+
+let _rt2 [weft::shell::run-text! "weft::no::such" $_ctx]
+gate "lcl route failure is a failed task" \
+    [== [weft::task::state $_rt2] failed]
+gate "lcl failure reported in output" [>= [String::find \
+    [Lk::doc_text [weft::ws::buffer-doc $_out]] "!!"] 0]
+
+let _rt3 [weft::shell::run-text! "echo via-shell" $_ctx]
+gate "shell route stays async" [== [weft::task::state $_rt3] pending]
+drain-tasks
+gate "shell route streams" [>= [String::find \
+    [Lk::doc_text [weft::ws::buffer-doc $_out]] "via-shell"] 0]
+
+;; ---- cancellation via buffer close ----
+let _t3 [weft::shell::execute! "sleep 30" $_ctx]
+weft::tasks::poll-all!
+gate "long-running task stays pending" \
+    [== 1 [len [weft::tasks::pending-ids]]]
+gate "closing the output buffer cancels its tasks" \
+    [and [== 1 [weft::ws::buffer-close! $_out 1]] \
+         [== 0 [len [weft::tasks::pending-ids]]]]
+
+;; ---- a fresh output buffer appears on next execute ----
+let _t4 [weft::shell::execute! "echo again" $_ctx]
+gate "output buffer recreated after close" \
+    [not [== [weft::shell::output-buffer!] $_out]]
+drain-tasks
+gate "streaming works into the recreated buffer" [>= [String::find \
+    [Lk::doc_text [weft::ws::buffer-doc [weft::shell::output-buffer!]]] \
+    "again"] 0]
+
+puts ""
+puts "P2 STAGE-A GATES PASSED"
+puts ""
+
+;; ================= stage B: plumb producer + LOOK dispatch =========
+
+if $weft_have_regex {
+
+weft::producer::define! [weft::plumb::producer-def]
+weft::plumb::default-rules!
+
+;; ---- scan: matches become annotations with typed presentations ----
+let _pb [weft::ws::buffer-create! "notes" "" \
+    "see src/main.c:42 and lib/util.c:7 for details\n"]
+weft::testhost::presented-reset!
+weft::producer::attach! $_pb plumb
+gate "attach is idempotent" [== 0 [weft::producer::attach! $_pb plumb]]
+gate "first tick scans" [== 1 [weft::producer::tick! $_pb]]
+gate "unchanged doc does not rescan" [== 0 [weft::producer::tick! $_pb]]
+
+let _store [weft::ws::buffer-store $_pb]
+let _pl [Lk::annot_by_layer $_store "plumb"]
+gate "two file:line matches annotated" [== 2 [len $_pl]]
+gate "match offsets exact" \
+    [== 4 [get [Lk::annot_span $_store [get $_pl 0]] 0]]
+gate "annotation carries its rule" \
+    [== file-line [Lk::annot_meta $_store [get $_pl 0] rule]]
+
+let _pres [weft::testhost::presented]
+gate "presentations attached per match" [== 2 [len $_pres]]
+let _v0 [get [get $_pres 0] value]
+gate "presentation value carries captures" \
+    [and [== "src/main.c" [get $_v0 cap1]] [== 42 [get $_v0 cap2]]]
+
+;; ---- word:digits without a dot or slash is NOT a plumb ----
+let _pb2 [weft::ws::buffer-create! "prose" "" \
+    "meet at 12:30, ratio 0:1, rev 3:14 -- but see a/b.c:5\n"]
+weft::producer::attach! $_pb2 plumb
+weft::producer::tick! $_pb2
+gate "bare number:number is not plumbed" \
+    [== 1 [len [Lk::annot_by_layer [weft::ws::buffer-store $_pb2] "plumb"]]]
+
+;; ---- rescan on revision change; annotations survive via anchors ----
+Lk::doc_insert [weft::ws::buffer-doc $_pb] 0 "x"
+gate "changed doc rescans" [== 1 [weft::producer::tick! $_pb]]
+gate "rescan rebuilds the layer" \
+    [== 2 [len [Lk::annot_by_layer $_store "plumb"]]]
+
+;; ---- producer errors are inspectable state, not crashes ----
+weft::producer::define! #{name broken layers (broken)
+    update [lambda {ctx} { error "producer boom" }]}
+weft::producer::attach! $_pb broken
+weft::producer::tick! $_pb
+gate "failing producer parks in error status" \
+    [== error [get [weft::producer::status $_pb broken] state]]
+gate "healthy producer unaffected" \
+    [== ok [get [weft::producer::status $_pb plumb] state]]
+
+;; ---- definitions are validated: layers is a LIST (lcl never
+;; reparses text as a list, so `{x}` would register one layer per char) ----
+gate "define! refuses braced layers structurally" \
+    [weft::error::error? [weft::producer::define! #{name bad layers {bad}
+        update [lambda {ctx} { "" }]}]]
+gate "the refused producer is not defined" \
+    [not [has? [weft::producer::names] bad]]
+
+;; ---- detach clears owned layers ----
+weft::producer::detach! $_pb plumb
+gate "detach clears the plumb layer" \
+    [== 0 [len [Lk::annot_by_layer $_store "plumb"]]]
+
+;; ---- LOOK dispatch: file:line opens at the line ----
+weft::testhost::fs-put! "/t/target.c" "line1\nline2\nline3\nline4\n"
+let _lb [weft::ws::buffer-create! "looker" "" "go to /t/target.c:3 now"]
+let _lv [weft::ws::view-create! $_lb]
+let _lp [weft::ws::tree-init! $_lv]
+
+let _r [weft::plumb::dispatch! \
+    #{rule file-line text "/t/target.c:3" cap1 "/t/target.c" cap2 3} \
+    [weft::ctx::make #{pane $_lp}]]
+gate "dispatch succeeds" [not [weft::error::error? $_r]]
+
+let _shown [weft::ws::view-buffer [weft::ws::pane-view $_lp]]
+gate "pane now shows the target buffer" \
+    [== "/t/target.c" [get [weft::ws::buffer $_shown] path]]
+gate "cursor moved to the target line" \
+    [== 12 [weft::testhost::editor-cursor \
+        [weft::ws::view-editor [weft::ws::pane-view $_lp]]]]
+gate "unknown rule reports an error" \
+    [weft::error::error? [weft::plumb::dispatch! #{rule nope} \
+        [weft::ctx::make #{}]]]
+
+puts ""
+puts "P2 STAGE-B GATES PASSED"
+}

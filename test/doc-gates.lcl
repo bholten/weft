@@ -1,0 +1,161 @@
+;; Doc gates: the documented-module contract.
+;;   weft --headless test/doc-gates.lcl
+;; Dogfoods lcl's Doc library (lib/doc in the lcl repo, reached via
+;; the lcl-lib require root): extraction shape, every public entry
+;; documented, and the docstrings' own doctests run against the live
+;; modules.  The _documented list is the "documented = stable" set --
+;; adding an undocumented public proc to a listed module FAILS here,
+;; so the docs cannot rot silently.
+
+proc gate {name ok} {
+    if [not $ok] { error "GATE FAILED: $name" }
+    puts "ok: $name"
+}
+
+if [not $weft_have_io] {
+    puts "deferred: doc gates (host built without io)"
+} else {
+    require "doc/src/Doc.lcl"
+    require "weft/core/error.lcl"
+    require "weft/core/wire.lcl"
+    require "weft/core/anchor.lcl"
+
+    let _documented ("weft/core/error.lcl"
+        "weft/core/wire.lcl"
+        "weft/core/anchor.lcl")
+
+    var _fails 0
+    var _passes 0
+
+    foreach _m $_documented {
+        let _model [Doc::extract_file "$weft_lib_dir/$_m"]
+
+        gate "$_m: extracts exactly one namespace" \
+            [== 1 [len [get $_model entries]]]
+
+        let _ns [get [get $_model entries] 0]
+
+        gate "$_m: the namespace has a docstring" \
+            [not [empty? [get $_ns doc]]]
+
+        var _undoc ()
+
+        foreach _e [get $_ns entries] {
+            if [empty? [get $_e doc]] {
+                set! _undoc [List::push $_undoc [get $_e name]]
+            }
+        }
+
+        if [> [len $_undoc] 0] {
+            puts "undocumented in $_m: [String::join $_undoc ", "]"
+        }
+
+        gate "$_m: every public entry documented ([len [get $_ns entries]] entries)" \
+            [== 0 [len $_undoc]]
+
+        let _res [Doc::doctest $_model]
+        set! _fails [+ $_fails [get $_res fail]]
+        set! _passes [+ $_passes [get $_res pass]]
+
+        gate "$_m: has doctests" [> [+ [get $_res pass] [get $_res fail]] 0]
+
+        foreach _f [get $_res failures] {
+            puts "FAIL [get $_f name]: >> [get $_f cmd]"
+            puts "  expected: [get $_f expect]"
+            puts "  got:      [get $_f got]"
+        }
+    }
+
+    gate "doctests: $_passes passed, $_fails failed" [== 0 $_fails]
+
+    ;; ================= describe / apropos: docs on live symbols =====
+    ;; lcl eval_at + Doc::register/lookup/describe/search (lcl
+    ;; 15b6771d), docs/commands.md "Describe".
+    require "weft/host/test.lcl"
+    weft::ws::init! [weft::testhost::editor-hooks]
+
+    gate "boot loaded lcl's Doc library" [== 1 $weft_have_doc]
+
+    ;; Provenance: a ctx `source` names the buffer and line; without
+    ;; one the origin is *image*.
+    let _r0 [weft::image::eval-in! user {proc dg_plain {} { 1 }
+Proc::origin $dg_plain} [weft::ctx::make #{}]]
+    gate "eval without a source has origin *image*" \
+        [== "*image*" [get [get $_r0 value] file]]
+
+    let _stext {;; scratch
+
+;;; Says hi, loudly.
+proc dg_hi {who} { return "HI $who" }
+}
+    let _sb [weft::ws::buffer-create! "*scratch*" "" $_stext]
+    let _r1 [weft::image::eval-in! user {proc dg_hi {who} { return "HI $who" }} \
+        [weft::ctx::make #{buffer $_sb source #{name "*scratch*" line 4}}]]
+    gate "eval with a source defines the proc" [get $_r1 ok]
+    let _o1 [Proc::origin [getvar user::dg_hi]]
+    gate "its origin is the buffer name and the fragment's line" \
+        [and [== "*scratch*" [get $_o1 file]] [== 4 [get $_o1 line]]]
+    gate "the execution record carries the origin" \
+        [== "*scratch*" [get [get [get [weft::image::records] \
+            [- [len [weft::image::records]] 1]] origin] name]]
+
+    ;; source-of: path when the buffer has one, else its name; 1-based line.
+    let _so [weft::image::source-of $_sb 14]
+    gate "source-of a path-less buffer: name + 1-based line" \
+        [and [== "*scratch*" [get $_so name]] [== 3 [get $_so line]]]
+
+    ;; describe: a scratch proc finds its docstring through the live
+    ;; buffer's text (registered lazily, every time).
+    let _out [weft::shell::out-buffer! [weft::image::ctx]]
+    let _d1 [weft::describe "user::dg_hi"]
+    let _t1 [Lk::doc_text [weft::ws::buffer-doc $_out]]
+    gate "describe emits" [== emitted [get $_d1 kind]]
+    gate "describe of a scratch proc: signature, *scratch*:4, docstring" \
+        [and [>= [String::find $_t1 "proc user::dg_hi {who}"] 0] \
+             [and [>= [String::find $_t1 "*scratch*:4"] 0] \
+                  [>= [String::find $_t1 "Says hi, loudly."] 0]]]
+
+    ;; Edit the buffer's docstring: describe follows the live text.
+    Lk::doc_delete [weft::ws::buffer-doc $_sb] 0 [String::length $_stext]
+    Lk::doc_insert [weft::ws::buffer-doc $_sb] 0 \
+        ";; scratch\n\n;;; Says hi, QUIETLY.\nproc dg_hi {who} { return \"HI\" }\n"
+    weft::describe "user::dg_hi"
+    let _t1b [Lk::doc_text [weft::ws::buffer-doc $_out]]
+    gate "describe re-registers the live buffer (edited docstring shows)" \
+        [>= [String::find $_t1b "Says hi, QUIETLY."] 0]
+
+    ;; A weft module proc: read from its file on first use.
+    weft::describe "weft::anchor::capture"
+    let _t2 [Lk::doc_text [weft::ws::buffer-doc $_out]]
+    gate "describe of a module proc: file:line and its docstring" \
+        [and [>= [String::find $_t2 "core/anchor.lcl:"] 0] \
+             [>= [String::find $_t2 "Record position"] 0]]
+
+    ;; A bare name from the REPL resolves through the evaluation's
+    ;; namespace: `weft::describe dg_hi` typed in user:: is user::dg_hi.
+    let _rb [weft::image::eval-in! user {weft::describe dg_hi} \
+        [weft::ctx::make #{ns user}]]
+    let _tb [Lk::doc_text [weft::ws::buffer-doc $_out]]
+    gate "describe of a bare name resolves in the ctx namespace" \
+        [and [get $_rb ok] [>= [String::find $_tb "proc user::dg_hi {who}"] 0]]
+
+    ;; Unknown name: a structured error, nothing emitted.
+    let _d3 [weft::describe dg_no_such_name]
+    gate "describe of an unknown name is an invalid-args error" \
+        [and [weft::error::error? $_d3] \
+             [== invalid-args [weft::error::code $_d3]]]
+
+    ;; apropos: indexes weft:: and user:: origins, searches names + docs.
+    let _a1 [weft::apropos "context anchors"]
+    let _t3 [Lk::doc_text [weft::ws::buffer-doc $_out]]
+    gate "apropos finds a module by its docstring text" \
+        [and [== emitted [get $_a1 kind]] \
+             [>= [String::find $_t3 "weft::anchor"] 0]]
+    weft::apropos "dg_hi"
+    let _t4 [Lk::doc_text [weft::ws::buffer-doc $_out]]
+    gate "apropos finds a scratch-defined proc by name" \
+        [>= [String::find $_t4 "dg_hi"] 0]
+    let _a2 [weft::apropos "capture"]
+    gate "apropos on a common word finds several" [> [get $_a2 count] 1]
+
+}

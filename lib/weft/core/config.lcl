@@ -1,0 +1,84 @@
+;;; weft::config -- the configuration registry (plan section 11, P0).
+;;;
+;;; System defaults (config/default.lcl) and user config
+;;; (~/.config/weft/init.lcl) both write here; everything else reads.
+;;; Keys are flat words for now; richer structure arrives with P3.
+
+namespace weft::config {
+
+    ;; ---- keybindings as data ----
+    ;; bind! "ctrl+shift+u" {script} -- the script evaluates in the
+    ;; image (user:: current) with the focused pane's buffer and
+    ;; selection as ctx when the chord fires.  The registry is
+    ;; weft::keymap (one table for profile chords, config scripts and
+    ;; the shell's intents; later wins); this is the config spelling.
+    ;; An optional third argument is the one-liner `weft::keys` shows.
+
+    proc bind! {chord script (doc "")} {
+        return [weft::keymap::bind! $chord $script $doc]
+    }
+
+    proc bindings-list {} {
+        return [weft::keymap::scripts]
+    }
+
+    ;; ---- per-filetype settings as data ----
+    ;; filetype! ".md" #{wrap word}  -- consumed by the shell (wrap)
+    ;; and the plumb producer (rule scoping), extensible by key.
+
+    var filetypes #{}
+
+    ;; Config generation: bumped on any settings change, reported to
+    ;; producer generation closures so config-driven derived state
+    ;; (filetype languages, rule scopes) re-renders live (P4).
+    var gen 0
+
+    proc generation {} {
+        return $gen
+    }
+
+    proc filetype! {ext settings} {
+        set! filetypes [put $filetypes $ext $settings]
+        set! gen [+ $gen 1]
+        return $ext
+    }
+
+    proc filetype-value {ext key default} {
+        if [not [has? $filetypes $ext]] { return $default }
+
+        let s [get $filetypes $ext]
+
+        if [not [has? $s $key]] { return $default }
+
+        return [get $s $key]
+    }
+
+    var settings #{}
+
+    proc put! {key val} {
+        set! settings [put $settings $key $val]
+        set! gen [+ $gen 1]
+
+        return $val
+    }
+
+    proc has-key? {key} {
+        return [has? $settings $key]
+    }
+
+    proc value {key} {
+        if [not [has? $settings $key]] {
+            error "weft::config::value: no setting '$key'"
+        }
+
+        return [get $settings $key]
+    }
+
+    proc value-or {key default} {
+        if [not [has? $settings $key]] { return $default }
+
+        return [get $settings $key]
+    }
+
+    proc all {} { return $settings }
+}

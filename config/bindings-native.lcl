@@ -1,0 +1,80 @@
+;; Native (SDL window) keybinding profile -- loaded by default.lcl.
+;;
+;; Commands are portable weft vocabulary; default bindings are a HOST
+;; PROFILE (docs/buffers.md).  A browser build would ship its own
+;; profile (ctrl+w / ctrl+1 / ctrl+shift+b are the browser's there);
+;; the commands do not change.  Every row is plain data in ONE
+;; registry (weft::keymap, docs/commands.md "Keys"):
+;;
+;;   weft::keymap::chord! "ctrl+s" Save       chord -> a shell INTENT
+;;   weft::config::bind!  "ctrl+u" {script}   chord -> a script (ctx:
+;;                                            focused buffer+selection)
+;;
+;; so ~/.config/weft/init.lcl overrides any of it -- later wins, and
+;; `weft::keys` lists every chord, saying which rows shadow which.
+;; The intents (what the shell can do, one line of doc each) live in
+;; lib/weft/ui/intents.lcl; a chord naming an intent that does not
+;; exist is listed as a profile error and never registered.
+
+;; ---- the shell's own chords ----
+weft::keymap::chord! "ctrl+s"            Save
+weft::keymap::chord! "ctrl+e"            SplitH
+weft::keymap::chord! "ctrl+shift+d"      SplitV
+weft::keymap::chord! "ctrl+w"            ClosePane
+weft::keymap::chord! "ctrl+n"            NextPane
+weft::keymap::chord! "ctrl+b"            NextBuffer
+weft::keymap::chord! "ctrl+o"            OpenBar
+weft::keymap::chord! "ctrl+r"            ReplOpen
+weft::keymap::chord! "ctrl+t"            ShellOpen
+weft::keymap::chord! "ctrl+i"            Inspect
+weft::keymap::chord! "ctrl+shift+i"      AnnotEdit
+weft::keymap::chord! "ctrl+return"       Execute
+weft::keymap::chord! "ctrl+shift+return" ExecuteWith
+weft::keymap::chord! "ctrl+alt+return"   ExecuteHere
+weft::keymap::chord! "ctrl+f"            SearchOpen
+weft::keymap::chord! "ctrl+h"            ReplaceOpen
+weft::keymap::chord! "ctrl+g"            GotoOpen
+weft::keymap::chord! "ctrl+p"            FilterOpen
+
+;; ---- inside the bars ----
+;; (plain ctrl+d is the lk editor's own: select the next match as a
+;; new caret -- which is why split-stacked is ctrl+shift+d.)
+weft::keymap::chord! "return"      SearchNext
+weft::keymap::chord! "return"      ReplaceOne
+weft::keymap::chord! "ctrl+return" ReplaceAll
+weft::keymap::chord! "return"      GotoJump
+weft::keymap::chord! "return"      TransformSubmit
+weft::keymap::chord! "return"      OpenSubmit
+weft::keymap::chord! "return"      ShowSubmit
+weft::keymap::chord! "return"      FilterSubmit
+weft::keymap::chord! "escape"      BarClose
+
+;; ---- buffers and panes ----
+;; ctrl+w closes the PANE; ctrl+shift+w -- the stronger close -- kills
+;; the BUFFER (Emacs's C-x 0 / C-x k distinction).  ctrl+k is left
+;; alone on purpose: kill-to-end-of-line territory.
+weft::config::bind! "ctrl+shift+b" {weft::shell::buffer-bar!} \
+    {the buffer bar: show a buffer by fuzzy name}
+weft::config::bind! "ctrl+1"       {weft::only} \
+    {collapse the splits to this pane}
+weft::config::bind! "ctrl+shift+w" {weft::close} \
+    {kill this buffer (dirty refuses; `weft::close force` discards)}
+weft::config::bind! "ctrl+shift+e" {weft::transpose} \
+    {flip this pane's split between side-by-side and stacked}
+
+;; ---- fresh buffers: the tiling-window-manager move ----
+;; ctrl+e / ctrl+shift+d split showing the SAME buffer (shell chords);
+;; the alt spellings split showing a NEW empty one, and ctrl+shift+n
+;; opens one in place.  `weft::new v notes` from any text names it.
+weft::config::bind! "ctrl+shift+n" {weft::new} \
+    {a fresh empty buffer in this pane}
+weft::config::bind! "ctrl+alt+e"   {weft::new h} \
+    {a fresh empty buffer in a new pane beside this one}
+weft::config::bind! "ctrl+alt+d"   {weft::new v} \
+    {a fresh empty buffer in a new pane below this one}
+
+;; ---- transforms ----
+;; Scripts evaluate in the image with the focused buffer and selection
+;; as ctx: bound transforms act on the selection, preview included.
+weft::config::bind! "ctrl+u" {weft::transform::run "upper"} \
+    {upper-case the selection -- previews first; the example binding}

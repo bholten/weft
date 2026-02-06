@@ -1,0 +1,66 @@
+;;; weft::task -- the task contract (plan section 5).
+;;;
+;;; Every capability invocation returns something task-shaped, even when
+;;; it completed synchronously, so synchronous assumptions never embed
+;;; anywhere.  States: pending | succeeded | failed | cancelled.
+;;;
+;;; P0 ships completed tasks only.  Pending tasks (a poll fn + the
+;;; frame-drained pending list) arrive with the first real async
+;;; consumer: P2 shell execute.
+
+namespace weft::task {
+
+    ;; A pending task value: id addresses the live entry in the
+    ;; weft::tasks registry (P2); completed task values have no id.
+    proc pending {id} {
+        return #{weft_task 1 state pending id $id}
+    }
+
+    proc done {value} {
+        return #{weft_task 1 state succeeded value $value}
+    }
+
+    proc failed {err} {
+        return #{weft_task 1 state failed error $err}
+    }
+
+    proc cancelled {} {
+        return #{weft_task 1 state cancelled}
+    }
+
+    proc task? {v} {
+        if [not [dict? $v]] { return 0 }
+        return [has? $v weft_task]
+    }
+
+    proc state {t} { return [get $t state] }
+
+    proc done? {t} {
+        return [not [== [get $t state] pending]]
+    }
+
+    ;; The successful value.  Asking for the result of a task that did
+    ;; not succeed is a caller bug -- check state (or use failure).
+    proc result {t} {
+        if [not [== [get $t state] succeeded]] {
+            error "weft::task::result: task state is [get $t state], not succeeded"
+        }
+
+        return [get $t value]
+    }
+
+    ;; The structured error of a failed task.
+    proc failure {t} {
+        if [not [== [get $t state] failed]] {
+            error "weft::task::failure: task state is [get $t state], not failed"
+        }
+
+        return [get $t error]
+    }
+
+    ;; Completed tasks: cancel is a no-op that reports the task as-is.
+    ;; Pending tasks will override this path in P2.
+    proc cancel {t} { return $t }
+
+    proc poll {t} { return [get $t state] }
+}

@@ -1,0 +1,462 @@
+;;; weft::persist -- the persistence root: data dir + doc registry
+;;; (plan section 8, P5).
+;;;
+;;; Annotations and sessions live OUTSIDE the documents they describe,
+;;; in a per-user data dir:
+;;;
+;;;   <data-dir>/registry        path -> stable doc id (+ mtime)
+;;;   <data-dir>/<doc-id>.annots one file of authored annotations
+;;;   <data-dir>/session         the saved workspace shape
+;;;
+;;; Every file is wire-encoded and envelope-wrapped; reads go through
+;;; decode -> migrate -> validate and come back as values or structured
+;;; errors.  The registry gives a document a durable identity that
+;;; survives editing sessions (and, someday, renames): array positions
+;;; and inode numbers are never identity.  mtime rides along so loading
+;;; can tell "file unchanged since annotations were saved" (anchors are
+;;; exact) from "file changed underneath us" (re-anchor, P5-B).
+;;;
+;;; Location: config `data_dir` if set (tests point this at the fake
+;;; fs), else $XDG_DATA_HOME/weft, else ~/.local/share/weft -- the
+;;; legacy C-weft location, kept deliberately.
+
+namespace weft::persist {
+
+    var _dir ""
+    var _registry #{}
+    var _loaded 0
+
+    ;; The resolved data directory (created on first use).
+    proc data-dir {} {
+        if [not [empty? $_dir]] { return $_dir }
+
+        var d [weft::config::value-or data_dir ""]
+
+        if [empty? $d] {
+            let xdg [weft::task::result
+                [weft::cap::invoke "env.get" #{name "XDG_DATA_HOME"} #{}]]
+
+            if [not [empty? $xdg]] {
+                set! d "$xdg/weft"
+            } else {
+                let home [weft::task::result
+                    [weft::cap::invoke "env.get" #{name "HOME"} #{}]]
+                set! d "$home/.local/share/weft"
+            }
+        }
+
+        weft::cap::invoke "fs.mkdir" #{path $d} #{}
+        set! _dir $d
+
+        return $d
+    }
+
+    ;; ---- envelope-wrapped file IO (shared by registry, annots,
+    ;; session) ----
+
+    proc write-value! {path kind payload} {
+        let text [weft::wire::encode [weft::envelope::wrap $kind $payload]]
+        let t [weft::cap::invoke "fs.write" #{path $path text $text} #{}]
+
+        if [== [weft::task::state $t] failed] {
+            return [weft::task::failure $t]
+        }
+
+        return 1
+    }
+
+    ;; The payload, or a weft::error (missing file included -- callers
+    ;; that treat absence as empty check the code).
+    proc read-value {path kind} {
+        let t [weft::cap::invoke "fs.read" #{path $path} #{}]
+
+        if [== [weft::task::state $t] failed] {
+            return [weft::task::failure $t]
+        }
+
+        let v [weft::wire::decode [weft::task::result $t]]
+
+        if [weft::error::error? $v] { return $v }
+
+        return [weft::envelope::unwrap $v $kind]
+    }
+
+    ;; ---- doc registry ----
+    ;; #{<path> #{id <stable> scheme "file" mtime <N>} ...}
+
+    proc _registry-path {} {
+        return "[weft::persist::data-dir]/registry"
+    }
+
+    proc _load-registry! {} {
+        if $_loaded { return "" }
+
+        set! _loaded 1
+
+        let v [weft::persist::read-value [weft::persist::_registry-path]
+            registry]
+
+        if [not [weft::error::error? $v]] {
+            set! _registry $v
+        }
+
+        return ""
+    }
+
+    proc _save-registry! {} {
+        return [weft::persist::write-value! [weft::persist::_registry-path]
+            registry $_registry]
+    }
+
+    ;; The stable doc id for a path, minted on first ask.
+    proc doc-id {path} {
+        weft::persist::_load-registry!
+
+        if [has? $_registry $path] {
+            return [get [get $_registry $path] id]
+        }
+
+        let id [weft::task::result [weft::cap::invoke "id.new" #{} #{}]]
+
+        set! _registry [put $_registry $path
+            #{id $id scheme "file" mtime 0}]
+        weft::persist::_save-registry!
+
+        return $id
+    }
+
+    proc registered? {path} {
+        weft::persist::_load-registry!
+
+        return [has? $_registry $path]
+    }
+
+    ;; Recorded mtime from the last annotation save (0 = never saved).
+    proc saved-mtime {path} {
+        weft::persist::_load-registry!
+
+        if [not [has? $_registry $path]] { return 0 }
+
+        return [get [get $_registry $path] mtime]
+    }
+
+    proc record-mtime! {path mtime} {
+        ;; doc-id ensures the entry exists.
+        weft::persist::doc-id $path
+        set! _registry [put $_registry $path
+            [put [get $_registry $path] mtime $mtime]]
+
+        return [weft::persist::_save-registry!]
+    }
+
+    ;; The file's current mtime via the host (0 when unsupported or
+    ;; missing -- callers treat 0 as "cannot fast-path").
+    proc file-mtime {path} {
+        let t [weft::cap::invoke "fs.mtime" #{path $path} #{}]
+
+        if [not [== [weft::task::state $t] succeeded]] { return 0 }
+
+        return [weft::task::result $t]
+    }
+
+    ;; ---- annotations at rest (P5-B) ----
+    ;;
+    ;; One file per document: <data-dir>/<doc-id>.annots, kind
+    ;; `annots`, payload:
+    ;;
+    ;;   #{path <path>
+    ;;     annots (#{layer .. meta #{} start N end N
+    ;;               start_anchor <anchor> end_anchor <anchor>} ..)
+    ;;     orphans (..records that failed to re-anchor..)}
+    ;;
+    ;; Only AUTHORED layers persist: anything a producer owns is
+    ;; derived state and rebuilds on open (weft::producer::
+    ;; owned-layers is the classification).  Offsets are trusted only
+    ;; when the file's mtime still matches the recorded save; anything
+    ;; else re-anchors through weft::anchor and failures become
+    ;; orphans (inspectable, carried forward on save, P5-C).
+
+    var _orphans #{}      ;; buffer-id -> list of orphaned records
+    var _reports #{}      ;; buffer-id -> last load's resolution counts
+    var _last_error ""    ;; persistence failures never block saves
+
+    proc annots-path {path} {
+        return "[weft::persist::data-dir]/[weft::persist::doc-id $path].annots"
+    }
+
+    proc last-error {} {
+        return $_last_error
+    }
+
+    proc orphans {buffer_id} {
+        if [not [has? $_orphans $buffer_id]] { return () }
+
+        return [get $_orphans $buffer_id]
+    }
+
+    proc _set-orphans! {buffer_id lst} {
+        set! _orphans [put $_orphans $buffer_id $lst]
+
+        return ""
+    }
+
+    ;; How the last load resolved: #{exact N fuzzy N orphaned N}
+    ;; (#{} before any load).  Confidence is a property of RESOLUTION,
+    ;; not of the annotation -- it lives here and in the orphan flow,
+    ;; never in authored metadata.
+    proc load-report {buffer_id} {
+        if [not [has? $_reports $buffer_id]] { return #{} }
+
+        return [get $_reports $buffer_id]
+    }
+
+    ;; ---- the orphan flow (P5-C) ----
+    ;; An orphan is a persisted record whose context no longer exists
+    ;; in the document.  It stays parked -- saved and reloaded with
+    ;; the buffer -- until the user either adopts it onto a span they
+    ;; choose or drops it.
+
+    proc _remove-at {lst idx} {
+        var out ()
+        var i 0
+
+        foreach item $lst {
+            if [not [== $i $idx]] {
+                set! out [List::push $out $item]
+            }
+
+            set! i [+ $i 1]
+        }
+
+        return $out
+    }
+
+    ;; Re-attach orphan #idx onto [start, end) of the buffer.  The
+    ;; record's layer and metadata survive; the anchors are recaptured
+    ;; from the adopted span on the next save.
+    proc orphan-adopt! {buffer_id idx start end} {
+        let lst [weft::persist::orphans $buffer_id]
+
+        if [or [< $idx 0] [>= $idx [len $lst]]] {
+            return [weft::error::make invalid-args
+                "no orphan #$idx (buffer has [len $lst])"]
+        }
+
+        let rec [get $lst $idx]
+        let store [weft::ws::buffer-store $buffer_id]
+        var lr ""
+        var le ""
+
+        catch { Lk::annot_layer_register $store [get $rec layer] } lr le
+
+        let aid [Lk::annot_add $store $start $end [get $rec layer]
+            [get $rec meta]]
+
+        weft::persist::_set-orphans! $buffer_id \
+            [weft::persist::_remove-at $lst $idx]
+
+        return $aid
+    }
+
+    proc orphan-drop! {buffer_id idx} {
+        let lst [weft::persist::orphans $buffer_id]
+
+        if [or [< $idx 0] [>= $idx [len $lst]]] {
+            return [weft::error::make invalid-args
+                "no orphan #$idx (buffer has [len $lst])"]
+        }
+
+        weft::persist::_set-orphans! $buffer_id \
+            [weft::persist::_remove-at $lst $idx]
+
+        return 1
+    }
+
+    ;; Persist the buffer's authored annotations (no-op for pathless
+    ;; buffers).  Caller guarantees the document content matches the
+    ;; file at `path` (the save path calls this right after fs.write).
+    ;; An optional second arg of 0 skips the mtime record: the
+    ;; clean-close path passes it when the file changed EXTERNALLY
+    ;; while the buffer sat open -- offsets then re-anchor on the next
+    ;; load instead of being trusted against someone else's text.
+    proc annots-save! {buffer_id *rest} {
+        var record_mtime 1
+
+        if [== 1 [len $rest]] { set! record_mtime [get $rest 0] }
+
+        let b [weft::ws::buffer $buffer_id]
+        let path [get $b path]
+
+        if [empty? $path] { return 0 }
+
+        let store [get $b store]
+        let text [Lk::doc_text [get $b doc]]
+        let derived [weft::producer::owned-layers]
+        var recs ()
+
+        foreach id [Lk::annot_in_range $store 0 [String::length $text]] {
+            let layer [Lk::annot_layer $store $id]
+
+            if [not [has? $derived $layer]] {
+                let span [Lk::annot_span $store $id]
+                let s [get $span 0]
+                let e [get $span 1]
+
+                set! recs [List::push $recs #{layer $layer
+                    meta [Lk::annot_meta_all $store $id]
+                    start $s end $e
+                    start_anchor [weft::anchor::capture $text $s]
+                    end_anchor [weft::anchor::capture $text $e]}]
+            }
+        }
+
+        let w [weft::persist::write-value! [weft::persist::annots-path $path]
+            annots #{path $path annots $recs
+                orphans [weft::persist::orphans $buffer_id]}]
+
+        if [weft::error::error? $w] {
+            set! _last_error $w
+
+            return $w
+        }
+
+        if $record_mtime {
+            weft::persist::record-mtime! $path \
+                [weft::persist::file-mtime $path]
+        }
+
+        return [len $recs]
+    }
+
+    ;; Load and re-attach the buffer's persisted annotations.  Exact
+    ;; offsets when the file is unchanged since the recorded save;
+    ;; context re-anchoring otherwise.  Returns the count attached
+    ;; (orphans are parked, not attached).
+    proc annots-load! {buffer_id} {
+        let b [weft::ws::buffer $buffer_id]
+        let path [get $b path]
+
+        if [empty? $path] { return 0 }
+        if [not [weft::persist::registered? $path]] { return 0 }
+
+        let v [weft::persist::read-value
+            [weft::persist::annots-path $path] annots]
+
+        if [weft::error::error? $v] {
+            ;; A missing file just means nothing was ever saved.
+            return 0
+        }
+
+        let store [get $b store]
+        let text [Lk::doc_text [get $b doc]]
+        let n [String::length $text]
+        let cur [weft::persist::file-mtime $path]
+        let exact [and [> $cur 0]
+            [== $cur [weft::persist::saved-mtime $path]]]
+
+        var attached 0
+        var orphans ()
+        var n_ok 0
+        var n_fuzzy 0
+
+        ;; Records that failed to anchor in an EARLIER session stay
+        ;; parked until adopted or dropped.
+        foreach o [get $v orphans] {
+            set! orphans [List::push $orphans $o]
+        }
+
+        foreach rec [get $v annots] {
+            var s -1
+            var e -1
+            var ok 1
+            var sure 1
+
+            if $exact {
+                set! s [get $rec start]
+                set! e [get $rec end]
+            } else {
+                let rs [weft::anchor::resolve $text [get $rec start_anchor]]
+                let re [weft::anchor::resolve $text [get $rec end_anchor]]
+
+                if [or [== orphaned [get $rs status]]
+                       [== orphaned [get $re status]]] {
+                    set! ok 0
+                } else {
+                    set! s [get $rs pos]
+                    set! e [get $re pos]
+
+                    if [or [== fuzzy [get $rs status]]
+                           [== fuzzy [get $re status]]] {
+                        set! sure 0
+                    }
+                }
+            }
+
+            if [and $ok [or [> $s $e] [or [< $s 0] [> $e $n]]]] {
+                set! ok 0
+            }
+
+            if $ok {
+                var lr ""
+                var le ""
+
+                catch { Lk::annot_layer_register $store [get $rec layer] } lr le
+                Lk::annot_add $store $s $e [get $rec layer] [get $rec meta]
+                set! attached [+ $attached 1]
+
+                if $sure {
+                    set! n_ok [+ $n_ok 1]
+                } else {
+                    set! n_fuzzy [+ $n_fuzzy 1]
+                }
+            } else {
+                set! orphans [List::push $orphans $rec]
+            }
+        }
+
+        weft::persist::_set-orphans! $buffer_id $orphans
+        set! _reports [put $_reports $buffer_id
+            #{ok $n_ok fuzzy $n_fuzzy
+                orphaned [- [len $orphans] [len [get $v orphans]]]}]
+
+        return $attached
+    }
+
+    ;; Quit-time sweep: persist annotations for every clean, pathed
+    ;; buffer, under the close path's trust rule (an externally
+    ;; changed file keeps its stale mtime record so the next load
+    ;; re-anchors).  Dirty buffers are the user's explicit decision --
+    ;; the sweep never touches them.
+    proc flush-clean! {} {
+        var n 0
+
+        foreach row [weft::ws::buffer-list] {
+            if [and [not [get $row dirty]] [not [empty? [get $row path]]]] {
+                let p [get $row path]
+                let trust [== [weft::persist::file-mtime $p]
+                    [weft::persist::saved-mtime $p]]
+                var fr ""
+                var fe ""
+
+                if [== 0 [catch { \
+                        weft::persist::annots-save! [get $row id] $trust \
+                    } fr fe]] {
+                    set! n [+ $n 1]
+                }
+            }
+        }
+
+        return $n
+    }
+
+    ;; Test seam: forget cached state (gates re-point data_dir).
+    proc reset! {} {
+        set! _dir ""
+        set! _registry #{}
+        set! _loaded 0
+        set! _orphans #{}
+        set! _last_error ""
+
+        return ""
+    }
+}

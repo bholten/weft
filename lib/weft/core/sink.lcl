@@ -1,0 +1,160 @@
+;;; weft::sink -- producer-agnostic enriched output (command pipeline
+;;; stage B, docs/commands.md).  The abstraction is NOT "process
+;;; output -> document"; it is producer -> sink -> text range +
+;;; metadata.  An external process is one producer; weft::buffers is
+;;; another; any evaluator can be a third.  All of them converge on
+;;; the same document/annotation/presentation machinery.
+;;;
+;;; emit! appends text and returns the EXACT range it landed at,
+;;; attaching annotation metadata and a typed presentation atomically
+;;; -- no producer ever guesses document offsets.
+;;;
+;;; Streaming producers open a session and feed! raw chunks; the sink
+;;; appends them and FRAMES COMPLETE LINES (process chunks are
+;;; arbitrary), returning line records -- absolute [start,end) range
+;;; including the newline, text excluding it, stream identity -- for
+;;; downstream recognizers (stage C).  Concurrent producers may
+;;; interleave appends in a shared buffer: when the sink detects that
+;;; someone else appended mid-line, it flushes the open line at its
+;;; true extent (record tagged `split 1`) rather than framing a range
+;;; that spans foreign text.
+
+namespace weft::sink {
+
+    var _sessions #{}
+    var _seq 0
+
+    ;; Append text at the end of a buffer.  opts (optional dict):
+    ;;   layer <name>    annotation layer (default "out")
+    ;;   meta #{...}     annotation metadata over the emitted range
+    ;;   present #{ptype .. value ..}   typed presentation on it
+    ;; Returns #{start N end N}.
+    proc emit! {bid text_in *rest} {
+        var opts #{}
+        ;; Emitted output is text; a producer handing over a computed
+        ;; number (typed since lcl c6b44be) is rendered here, once.
+        let text [String::from $text_in]
+
+        if [> [len $rest] 0] { set! opts [get $rest 0] }
+
+        let doc [weft::ws::buffer-doc $bid]
+        let start [Lk::doc_len $doc]
+
+        if [not [empty? $text]] {
+            Lk::doc_insert $doc $start $text
+        }
+
+        let end [Lk::doc_len $doc]
+
+        if [and [> $end $start] \
+                [or [has? $opts meta] [has? $opts present]]] {
+            var layer "out"
+            var meta #{}
+
+            if [has? $opts layer] { set! layer [get $opts layer] }
+            if [has? $opts meta] { set! meta [get $opts meta] }
+
+            ;; Annotate the CONTENT, excluding a trailing newline:
+            ;; lk end anchors are RIGHT-biased (typing at a span's
+            ;; edge extends it -- right interactively), so a span
+            ;; closed exactly at the buffer tail would swallow every
+            ;; subsequent append.  The delimiter is not content.
+            var aend $end
+
+            if [== [String::range $text \
+                    [- [String::length $text] 1] \
+                    [String::length $text]] "\n"] {
+                set! aend [- $end 1]
+            }
+
+            let store [weft::ws::buffer-store $bid]
+            let a [Lk::annot_add $store $start $aend $layer $meta]
+
+            if [has? $opts present] {
+                let p [get $opts present]
+                weft::ws::present! $store $a [get $p ptype] [get $p value]
+            }
+        }
+
+        return #{start $start end $end}
+    }
+
+    ;; ---- streaming sessions: chunks in, framed lines out ----
+
+    proc open! {bid} {
+        set! _seq [+ $_seq 1]
+        let sid "sink-$_seq"
+        let doc [weft::ws::buffer-doc $bid]
+        set! _sessions [put $_sessions $sid #{buffer $bid
+            partial "" line_start [Lk::doc_len $doc]
+            end [Lk::doc_len $doc]}]
+        return $sid
+    }
+
+    ;; Append a chunk; return the list of line records it completed.
+    proc feed! {sid chunk *rest} {
+        var stream "out"
+
+        if [> [len $rest] 0] { set! stream [get $rest 0] }
+
+        let s [get $_sessions $sid]
+        let bid [get $s buffer]
+        let doc [weft::ws::buffer-doc $bid]
+        var partial [get $s partial]
+        var line_start [get $s line_start]
+        var records ()
+
+        ;; Foreign append since our last write: the open line's true
+        ;; extent ends where our last append ended.
+        if [and [not [empty? $partial]] \
+                [not [== [Lk::doc_len $doc] [get $s end]]]] {
+            set! records [List::push $records #{start $line_start
+                end [get $s end] text $partial stream $stream
+                split 1}]
+            set! partial ""
+        }
+
+        if [empty? $partial] {
+            set! line_start [Lk::doc_len $doc]
+        }
+
+        weft::sink::emit! $bid $chunk
+
+        var buf "$partial$chunk"
+        let pieces [String::split $buf "\n"]
+        var i 0
+        var off $line_start
+
+        while [< $i [- [len $pieces] 1]] {
+            let ptext [get $pieces $i]
+            let plen [+ [String::length $ptext] 1]
+            set! records [List::push $records #{start $off
+                end [+ $off $plen] text $ptext stream $stream}]
+            set! off [+ $off $plen]
+            set! i [+ $i 1]
+        }
+
+        let tail [get $pieces [- [len $pieces] 1]]
+        set! _sessions [put $_sessions $sid #{buffer $bid
+            partial $tail line_start $off end [Lk::doc_len $doc]}]
+        return $records
+    }
+
+    ;; Close the session, flushing any unterminated tail as a final
+    ;; record (streams may end without a newline).
+    proc close! {sid} {
+        if [not [has? $_sessions $sid]] { return () }
+
+        let s [get $_sessions $sid]
+        var records ()
+
+        if [not [empty? [get $s partial]]] {
+            set! records [List::push $records #{start [get $s line_start]
+                end [get $s end] text [get $s partial]
+                stream "out"}]
+        }
+
+        set! _sessions [del $_sessions $sid]
+        return $records
+    }
+}

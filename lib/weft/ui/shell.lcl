@@ -1,0 +1,2382 @@
+;;; P1 UI shell: the lk-DSL projection of the workspace kernel.
+;;;
+;;; All durable state lives in weft::ws; this file renders the pane/split
+;;; tree each frame and translates commands into workspace calls.  Only
+;;; presentation-local bits (the ui handle, the flash message) are shell
+;;; globals -- globals because the DSL view body is re-evaluated from the
+;;; DSL's own scope each frame and sees only global names; everything
+;;; else it reaches through qualified weft::ws::* calls.
+;;;
+;;; Keybindings (interim until config-driven bindings return):
+;;;   ctrl+s save   ctrl+e split side-by-side   ctrl+shift+d split
+;;;   stacked (plain ctrl+d belongs to the editor: select next match,
+;;;   the lk multi-cursor gesture set)   ctrl+w close pane
+;;;   ctrl+n next pane   ctrl+b next buffer
+
+var wsh_ui {}
+var wsh_flash ""
+var wsh_flash_until 0
+
+;; Every flash is also a notice (weft::messages replays them), and a
+;; flash that reports a failure stays up twice as long.
+proc wsh_flash_set {msg} {
+    var ttl 4000
+
+    ;; Failures read "<what>: <why>" or "!! <why>" (the shell's own
+    ;; conventions above); plain confirmations do not.
+    if [or [>= [String::find $msg ": "] 0] [== 0 [String::find $msg "!!"]]] {
+        set! ttl 8000
+    }
+
+    set! wsh_flash $msg
+    set! wsh_flash_until [+ [Lk::time_ms $wsh_ui] $ttl]
+    weft::shell::notice! $msg
+    return ""
+}
+
+;; ---- lk-backed editor hooks for weft::ws::init! ----
+;; free is a no-op: dropping the last reference to the editor value
+;; releases the lk resource through its finalizer.
+
+proc wsh_editor_hooks {} {
+    return #{make [lambda {doc hist store ft} {
+                let ed [Lk::editor_new $wsh_ui $doc $hist]
+                ;; wrap: per-filetype setting, else the global default
+                Lk::editor_wrap $ed [::weft::config::filetype-value $ft wrap \
+                    [::weft::config::value-or wrap_mode character]]
+                Lk::editor_presentations $ed $store
+                return $ed
+            }]
+            free [lambda {ed} { return 1 }]
+            snapshot [lambda {ed} {
+                return #{cursor [Lk::editor_cursor $ed]}
+            }]
+            restore [lambda {ed snap} {
+                Lk::editor_set_cursor $ed [get $snap cursor]
+                return 1
+            }]
+            set_editable [lambda {ed flag} {
+                Lk::editor_set_editable $ed $flag
+                return 1
+            }]
+            present [lambda {store annot_id ptype value} {
+                Lk::annot_present $wsh_ui $store $annot_id $ptype $value
+                return ""
+            }]
+            selection [lambda {ed} {
+                return [Lk::editor_selection $ed]
+            }]
+            selections [lambda {ed} {
+                return [Lk::editor_selections $ed]
+            }]
+            carets [lambda {ed} {
+                return [Lk::editor_carets $ed]
+            }]}
+}
+
+;; ---- commands ----
+
+;; Adopt the pane a key command fired in as the workspace focus (the
+;; lk focus is already there; ws focus may lag it by a frame).
+proc wsh_cmd_pane {cmd} {
+    let p [get [get $cmd args] 0]
+
+    if [== pane [get [weft::ws::node $p] kind]] {
+        weft::ws::focus! $p
+    }
+
+    return $p
+}
+
+;; Lk::focus_set resolves against the last committed tree, so a widget
+;; created THIS frame (a fresh split's editor, a just-opened mini-bar
+;; input) cannot be focused directly.  Lk::focus_request (lk c139450)
+;; parks the id on the ui and applies it at end_frame once the node is
+;; committed -- it stays pending until it lands, a later request
+;; replaces it, and a successful explicit focus_set clears it.  So:
+;; request first, then try now; a node that already exists gets focus
+;; this frame and the request is consumed, a fresh one lands at commit.
+proc wsh_focus_request {node_name} {
+    Lk::focus_request $wsh_ui $node_name
+    Lk::focus_set $wsh_ui $node_name
+
+    return ""
+}
+
+proc wsh_focus_editor {} {
+    let p [weft::ws::focused-pane]
+
+    if [not [empty? $p]] {
+        wsh_focus_request "ed_$p"
+    }
+
+    return $p
+}
+
+proc wsh_save {} {
+    let f [weft::ws::focused-ctx-fields]
+    let b [get $f buffer]
+    let r [weft::ws::buffer-save! $b [weft::ctx::make $f]]
+
+    if [weft::error::error? $r] {
+        wsh_flash_set "save failed: [weft::error::message $r]"
+    } else {
+        wsh_flash_set "saved [get [weft::ws::buffer $b] path]"
+    }
+
+    return $r
+}
+
+proc wsh_split {axis} {
+    let f [weft::ws::focused-ctx-fields]
+
+    weft::ws::pane-split! [get $f pane] $axis [get $f buffer]
+    wsh_focus_editor
+
+    return ""
+}
+
+proc wsh_close_pane {} {
+    let r [weft::ws::pane-close! [weft::ws::focused-pane]]
+
+    if [weft::error::error? $r] {
+        wsh_flash_set [weft::error::message $r]
+    } else {
+        wsh_focus_editor
+    }
+
+    return ""
+}
+
+proc wsh_next_pane {} {
+    weft::ws::focus-next!
+    wsh_focus_editor
+    return ""
+}
+
+;; ---- REPL: the *lcl* buffer, a view of the image (plan 13.7) ----
+;; Ctrl+Enter there always evaluates in the image with `user` current
+;; and echoes ";; =>" inline (the legacy convention).  Every REPL pane
+;; showing this buffer is a view of the same image by construction.
+
+;; NB braced: a quoted welcome would interpolate the examples at load.
+var wsh_repl_welcome {;; weft repl -- a view of the image
+;; ctrl+enter evaluates the selection or current line; user:: is the
+;; current package.  Try: [weft::version]   [weft::buffers]
+;;                        [weft::image::user-defs]
+;;
+;; Attach: execute `weft::repl::attach` IN a target buffer, then
+;; transforms run here act on the target's selection.
+;; [weft::repl::target]   [weft::repl::detach]
+;;
+;; Multi-line: statements end at newlines -- continue one across
+;; lines with a trailing \ (newlines inside [...] already continue).
+
+}
+
+proc wsh_repl_buffer? {bid} {
+    return [== "*lcl*" [get [weft::ws::buffer $bid] name]]
+}
+
+;; ---- the *shell* buffer (ctrl+t) ----
+;;
+;; Not a mode and not a terminal: an ORDINARY buffer that happens to be
+;; where you keep commands.  Every buffer already executes lines with
+;; ctrl+enter -- what was missing was a summonable one with a cwd of
+;; its own, so `cd` sticks and the next command starts where the last
+;; left off.  Resolution still chooses the language per line (the
+;; pipeline's thesis); nothing here forks the model.
+
+;; NB braced: a quoted welcome would interpolate the examples at load.
+var wsh_shell_welcome {;; weft shell -- an ordinary buffer that holds commands.
+;; ctrl+enter runs the line (or the selection).  Output streams into
+;; *output*, where paths verified against this buffer's cwd are
+;; clickable (right-click opens, shift+right-click opens beside).
+;;
+;;   cd ..                    move THIS buffer's cwd; it sticks
+;;   sh {ls *.c}              force the shell, globs and all
+;;   weft::cmd::explain {ls}  how a line resolves, running nothing
+;;
+;; lcl still works here too -- a callable head evaluates in the image.
+
+}
+
+proc wsh_open_shell {} {
+    var b [weft::ws::buffer-for-name "*shell*"]
+    let here [::wsh_focused_buf]
+
+    if [empty? $b] {
+        set! b [weft::ws::buffer-create! "*shell*" "" $wsh_shell_welcome]
+
+        ;; Start where you summoned it from: a shell opened in a file's
+        ;; pane begins in that file's directory.
+        if [weft::ws::buffer? $here] {
+            weft::ws::buffer-set-cwd! $b [weft::ws::buffer-cwd $here]
+        }
+
+        let vid [weft::ws::pane-show-buffer! [weft::ws::focused-pane] $b]
+        Lk::editor_set_cursor [weft::ws::view-editor $vid] \
+            [Lk::doc_len [weft::ws::buffer-doc $b]]
+    } else {
+        weft::ws::pane-show-buffer! [weft::ws::focused-pane] $b
+    }
+
+    wsh_focus_editor
+
+    return $b
+}
+
+;; Edit the annotations at the cursor (ctrl+shift+i, the companion to
+;; ctrl+i's read-only inspector): a selection scopes the session, no
+;; selection takes the whole buffer.
+proc wsh_annot_edit {} {
+    let f [weft::ws::focused-ctx-fields]
+    var cf $f
+    let sel [weft::ws::view-selection [get $f view]]
+
+    if [== 2 [len $sel]] {
+        set! cf [Dict::merge $cf #{start [get $sel 0] end [get $sel 1]}]
+    }
+
+    let r [weft::annot::edit-at [weft::ctx::make $cf]]
+
+    if [weft::error::error? $r] {
+        wsh_flash_set "annot: [weft::error::message $r]"
+    } else {
+        ::wsh_after_eval $r
+    }
+
+    return ""
+}
+
+proc wsh_open_repl {} {
+    var b [weft::ws::buffer-for-name "*lcl*"]
+    var fresh 0
+
+    if [empty? $b] {
+        set! b [weft::ws::buffer-create! "*lcl*" "" $wsh_repl_welcome]
+        set! fresh 1
+    }
+
+    let vid [weft::ws::pane-show-buffer! [weft::ws::focused-pane] $b]
+
+    if $fresh {
+        Lk::editor_set_cursor [weft::ws::view-editor $vid] \
+            [Lk::doc_len [weft::ws::buffer-doc $b]]
+    }
+
+    wsh_focus_editor
+
+    return $b
+}
+
+;; Evaluate the selection or current line of a REPL view; insert the
+;; result inline after it.  Multi-line results continue as comments.
+;; 1 when every non-blank line of `text` starts with `;;`.
+proc wsh_comment_only? {text} {
+    foreach ln [String::split $text "\n"] {
+        let t [String::trim $ln]
+
+        if [and [not [empty? $t]] [not [== 0 [String::find $t ";;"]]]] {
+            return 0
+        }
+    }
+
+    return 1
+}
+
+proc wsh_repl_eval {pane} {
+    let vid [weft::ws::pane-view $pane]
+    let bid [weft::ws::view-buffer $vid]
+    let ed [weft::ws::view-editor $vid]
+    let doc [weft::ws::buffer-doc $bid]
+    var text ""
+    var at 0
+    var from 0
+    let sel [Lk::editor_selection $ed]
+
+    if [== [len $sel] 2] {
+        set! text [String::range [Lk::doc_text $doc] [get $sel 0] [get $sel 1]]
+        set! at [Lk::doc_line_end $doc \
+            [Lk::doc_pos_to_line $doc [get $sel 1]]]
+        set! from [get $sel 0]
+    } else {
+        let ln [Lk::doc_pos_to_line $doc [Lk::editor_cursor $ed]]
+        set! text [String::range [Lk::doc_text $doc] \
+            [Lk::doc_line_start $doc $ln] [Lk::doc_line_end $doc $ln]]
+        set! at [Lk::doc_line_end $doc $ln]
+        set! from [Lk::doc_line_start $doc $ln]
+    }
+
+    ;; The SOURCE is *lcl* itself even while attached: the text came
+    ;; from here, the attachment only lends the target as ctx.
+    let src [weft::image::source-of $bid [::wsh_trimmed_start $text $from]]
+    set! text [String::trim $text]
+
+    if [empty? $text] { return "" }
+
+    ;; Comment-only text (an echo line, a lone remark) is inert -- but
+    ;; a selection that LEADS with a `;;;` docstring and goes on to
+    ;; define the proc is code: skip only when every line is comment.
+    if [::wsh_comment_only? $text] { return "" }
+
+    ;; While attached, REPL evaluations carry the TARGET buffer (and
+    ;; its live selection) as ctx -- the lens.
+    var cf #{buffer $bid view $vid ns user source $src}
+
+    if [weft::repl::attached?] {
+        set! cf [Dict::merge $cf [weft::repl::ctx-fields]]
+    }
+
+    let r [weft::image::eval-in! user $text [weft::ctx::make $cf]]
+    var echo ""
+
+    if [get $r ok] {
+        ;; Render explicitly: a lone substitution keeps the value's
+        ;; type, and String::replace below refuses ints/lists/dicts.
+        var vs [String::from [get $r value]]
+        let v [get $r value]
+
+        if [and [dict? $v] [has? $v kind]] {
+            if [== [get $v kind] plan] {
+                set! vs "plan pending -> *diff* (apply/reject there)"
+            }
+
+            if [== [get $v kind] prompt] {
+                set! vs "prompting: [get $v message]"
+            }
+
+            if [== [get $v kind] query] {
+                ;; Plans echo compactly (plan section 14) -- run them
+                ;; with a terminal: preview / count / explain.
+                set! vs [weft::q::describe $v]
+            }
+
+            if [== [get $v kind] emitted] {
+                set! vs [get $v summary]
+            }
+        }
+        set! echo "\n;; => [String::replace $vs "\n" "\n;;    "]"
+    } else {
+        set! echo "\n;; !! [weft::error::message [get $r error]]"
+    }
+
+    Lk::doc_insert $doc $at $echo
+    Lk::editor_set_cursor $ed [+ $at [String::length $echo]]
+
+    if [get $r ok] {
+        ::wsh_after_eval [get $r value]
+    }
+
+    return ""
+}
+
+;; The EXECUTE unit texts for a focused view: each nonempty selection
+;; of the caret set is ONE program (document order, the selection SET
+;; pin: N selections = N execution units); no selection = the cursor
+;; line, exactly as ever.
+proc wsh_execute_texts {f} {
+    let doc [weft::ws::buffer-doc [get $f buffer]]
+    let sels [weft::ws::view-selections [get $f view]]
+    var spans ()
+
+    if [> [len $sels] 0] {
+        foreach s $sels { set! spans [List::push $spans $s] }
+    } else {
+        let ed [weft::ws::view-editor [get $f view]]
+        let ln [Lk::doc_pos_to_line $doc [Lk::editor_cursor $ed]]
+        set! spans [list [list [Lk::doc_line_start $doc $ln] \
+            [Lk::doc_line_end $doc $ln]]]
+    }
+
+    ;; Each unit carries its SOURCE (docs/commands.md "Describe"):
+    ;; the buffer and the line the trimmed text starts on, so procs
+    ;; defined by EXECUTE know where they were born.
+    var units ()
+
+    foreach s $spans {
+        let raw [String::range [Lk::doc_text $doc] [get $s 0] [get $s 1]]
+        let tt [String::trim $raw]
+
+        if [not [empty? $tt]] {
+            set! units [List::push $units #{text $tt \
+                source [weft::image::source-of [get $f buffer] \
+                    [::wsh_trimmed_start $raw [get $s 0]]]}]
+        }
+    }
+
+    return $units
+}
+
+;; The offset where `raw`'s trimmed text begins: leading blank lines
+;; would otherwise shift every origin line.
+proc wsh_trimmed_start {raw start} {
+    var n 0
+
+    foreach ch $raw {
+        if [or [== $ch " "] [or [== $ch "\t"] [or [== $ch "\n"] [== $ch "\r"]]]] {
+            set! n [+ $n 1]
+        } else {
+            return [+ $start $n]
+        }
+    }
+
+    return $start
+}
+
+;; Run prepared units -- (#{text .. ctx ..}) -- through the exec
+;; sequencer (in order, continue on failure, independent records) and
+;; surface once.  The single-unit case goes through wsh_run_text so
+;; its richer tail (flash of the value, error echo) is preserved.
+proc wsh_run_units {units quiet} {
+    if [== 0 [len $units]] { return "" }
+
+    if [== 1 [len $units]] {
+        let u [get $units 0]
+        return [::wsh_run_text [get $u text] [get $u ctx]]
+    }
+
+    weft::shell::run-texts! $units
+
+    if [not $quiet] { ::wsh_show_output }
+
+    wsh_flash_set "> [len $units] execution units"
+
+    return ""
+}
+
+;; EXECUTE (ctrl+enter): run the selection -- or the current line when
+;; nothing is selected -- as a shell command streaming into *output*.
+;; N selections = N execution units, document order, run IN SEQUENCE
+;; with independent records.  (Middle-click EXECUTE and the
+;; weft-command route arrive with plumb.)
+proc wsh_execute {} {
+    let f [weft::ws::focused-ctx-fields]
+
+    if [wsh_repl_buffer? [get $f buffer]] {
+        return [wsh_repl_eval [get $f pane]]
+    }
+
+    var units ()
+
+    foreach u [wsh_execute_texts $f] {
+        set! units [List::push $units #{text [get $u text] \
+            ctx [weft::ctx::make [Dict::merge $f #{source [get $u source]}]]}]
+    }
+
+    wsh_run_units $units 0
+
+    return ""
+}
+
+;; EXECUTE HERE (ctrl+alt+enter, docs/commands.md "Output goes
+;; here"): EXECUTE, but the output -- echo, stream, exit footer,
+;; recognizer enrichment -- lands at the TAIL OF THIS BUFFER instead
+;; of *output*.  `ls` below your notes, clickable rows and all: the
+;; scratchpad reading of qol.md's "dump into the same buffer".
+proc wsh_execute_here {} {
+    let f [weft::ws::focused-ctx-fields]
+
+    if [wsh_repl_buffer? [get $f buffer]] {
+        return [wsh_repl_eval [get $f pane]]
+    }
+
+    let hf [Dict::merge $f #{out [get $f buffer]}]
+    var units ()
+
+    foreach u [wsh_execute_texts $f] {
+        set! units [List::push $units #{text [get $u text] \
+            ctx [weft::ctx::make [Dict::merge $hf #{source [get $u source]}]]}]
+    }
+
+    wsh_run_units $units 1
+
+    return ""
+}
+
+;; EXECUTE WITH OPERAND (ctrl+shift+enter, docs/commands.md
+;; "Operands"): the program is the CURSOR LINE; the operands are this
+;; view's selections lying outside that line, else the previously
+;; focused pane's selection set -- the cross-pane composition: select
+;; paths in B, put the cursor on `grep -n foo` in A, ctrl+shift+enter.
+;; N selections = N operands = N runs of the program, document order.
+;; No operand anywhere is a refusal, never a silent plain EXECUTE.
+proc wsh_operands_for {f} {
+    let vid [get $f view]
+    let ed [weft::ws::view-editor $vid]
+    let doc [weft::ws::buffer-doc [get $f buffer]]
+    let ln [Lk::doc_pos_to_line $doc [Lk::editor_cursor $ed]]
+    let ls [Lk::doc_line_start $doc $ln]
+    let le [Lk::doc_line_end $doc $ln]
+    var ops ()
+
+    ;; Outside = no overlap between the line and the selection.
+    foreach s [weft::ws::view-selections $vid] {
+        if [or [<= [get $s 1] $ls] [>= [get $s 0] $le]] {
+            let o [weft::cmd::operand-from-range [get $f buffer] \
+                [get $s 0] [get $s 1]]
+
+            if [has? $o kind] { set! ops [List::push $ops $o] }
+        }
+    }
+
+    if [> [len $ops] 0] { return $ops }
+
+    let live [weft::ws::panes]
+
+    foreach p [weft::ws::focus-history] {
+        if [== $p [get $f pane]] { continue }
+        if [not [has? $live $p]] { continue }
+
+        let ov [weft::ws::pane-view $p]
+
+        foreach s [weft::ws::view-selections $ov] {
+            let o [weft::cmd::operand-from-range \
+                [weft::ws::view-buffer $ov] [get $s 0] [get $s 1]]
+
+            if [has? $o kind] { set! ops [List::push $ops $o] }
+        }
+
+        if [> [len $ops] 0] { return $ops }
+    }
+
+    return ()
+}
+
+proc wsh_execute_with {} {
+    let f [weft::ws::focused-ctx-fields]
+
+    if [wsh_repl_buffer? [get $f buffer]] {
+        return [wsh_repl_eval [get $f pane]]
+    }
+
+    let ed [weft::ws::view-editor [get $f view]]
+    let doc [weft::ws::buffer-doc [get $f buffer]]
+    let ln [Lk::doc_pos_to_line $doc [Lk::editor_cursor $ed]]
+    let text [String::trim [String::range [Lk::doc_text $doc] \
+        [Lk::doc_line_start $doc $ln] [Lk::doc_line_end $doc $ln]]]
+
+    if [empty? $text] { return "" }
+
+    let ops [wsh_operands_for $f]
+
+    if [== 0 [len $ops]] {
+        wsh_flash_set "!! no operand: select text outside this line, or in another pane"
+        return ""
+    }
+
+    let src [weft::image::source-of [get $f buffer] \
+        [Lk::doc_line_start $doc $ln]]
+    var units ()
+
+    foreach o $ops {
+        set! units [List::push $units #{text $text \
+            ctx [weft::ctx::make [Dict::merge $f #{operand $o source $src}]]}]
+    }
+
+    wsh_run_units $units 0
+
+    return ""
+}
+
+;; Make sure a buffer is visible: if no view shows it, open it in a
+;; stacked split under the focused pane, keeping focus where it was.
+proc wsh_show_in_split {bid} {
+    if [> [len [weft::ws::views-of-buffer $bid]] 0] {
+        return ""
+    }
+
+    let was [weft::ws::focused-pane]
+
+    weft::ws::pane-split! $was v $bid
+    weft::ws::focus! $was
+    wsh_focus_editor
+
+    return ""
+}
+
+proc wsh_show_output {} {
+    wsh_show_in_split [weft::shell::output-buffer!]
+
+    return ""
+}
+
+;; Make a buffer visible AND focused: a file you asked to open is one
+;; you meant to look at, unlike the machine buffers that surface
+;; beside you while you keep typing.
+proc wsh_reveal_buffer {bid} {
+    wsh_show_in_split $bid
+
+    foreach p [weft::ws::panes] {
+        if [== [weft::ws::view-buffer [weft::ws::pane-view $p]] $bid] {
+            weft::ws::focus! $p
+            wsh_focus_editor
+
+            return $p
+        }
+    }
+
+    return ""
+}
+
+;; Close every pane showing a named buffer.  A decided session's
+;; artifact (*diff* after apply/reject, *annot-edit* after commit or
+;; cancel) stops being true the moment it is decided; leaving it on
+;; screen invites acting on a stale answer.  The buffer itself
+;; survives -- panes are disposable projections, and pane-close!
+;; refuses the last pane on its own.
+proc wsh_close_views_of {name} {
+    let b [weft::ws::buffer-for-name $name]
+
+    if [empty? $b] { return "" }
+
+    foreach p [weft::ws::panes] {
+        if [== [weft::ws::view-buffer [weft::ws::pane-view $p]] $b] {
+            weft::ws::pane-close! $p
+        }
+    }
+
+    wsh_focus_editor
+
+    return ""
+}
+
+;; *output* follows its tail while a task streams into it -- but only
+;; for a view that is actually AT the tail.  lk carries a cursor along
+;; through a foreign insert (RIGHT bias) without scrolling: a document
+;; changing elsewhere must not yank a reader's viewport.  So a cursor
+;; sitting at the new end is exactly the view that was watching the
+;; stream, and only that one is asked to scroll; click anywhere else
+;; and the view holds still until you return to the end.  A view
+;; seeing the buffer for the first time starts at the tail -- the
+;; newest output is the point of opening it.
+var wsh_tail_len #{}    ;; view-id -> *output* length last seen
+
+proc wsh_follow_buffer {bid fresh_to_tail} {
+    let n [Lk::doc_len [weft::ws::buffer-doc $bid]]
+
+    foreach vid [weft::ws::views-of-buffer $bid] {
+        let ed [weft::ws::view-editor $vid]
+
+        if [has? $wsh_tail_len $vid] {
+            if [> $n [get $wsh_tail_len $vid]] {
+                if [== [Lk::editor_cursor $ed] $n] {
+                    Lk::editor_scroll_to_cursor $ed
+                }
+            }
+        } else {
+            ;; Only *output* parks a first view at the tail; a USER'S
+            ;; buffer receiving an inline run keeps its cursor -- but
+            ;; a watcher already sitting at the end still follows.
+            if $fresh_to_tail {
+                Lk::editor_set_cursor $ed $n
+            } else {
+                if [== [Lk::editor_cursor $ed] $n] {
+                    Lk::editor_scroll_to_cursor $ed
+                }
+            }
+        }
+
+        set! wsh_tail_len [put $wsh_tail_len $vid $n]
+    }
+
+    return ""
+}
+
+proc wsh_follow_output {} {
+    let obid [weft::shell::output-buffer-id]
+
+    if [not [empty? $obid]] { wsh_follow_buffer $obid 1 }
+
+    ;; Buffers an inline run is streaming into follow the same sticky
+    ;; rule while the run lives (task meta `out`).
+    var seen #{}
+
+    foreach tid [weft::tasks::pending-ids] {
+        let m [weft::tasks::meta $tid]
+
+        if [has? $m out] {
+            let b [get $m out]
+
+            if [and [not [== $b $obid]] \
+                    [and [not [has? $seen $b]] [weft::ws::buffer? $b]]] {
+                set! seen [put $seen $b 1]
+                wsh_follow_buffer $b 0
+            }
+        }
+    }
+
+    return ""
+}
+
+;; ---- transform preview (P3): the plan is the diff ----
+
+proc wsh_show_diff {} {
+    var b [weft::ws::buffer-for-name "*diff*"]
+
+    if [empty? $b] {
+        set! b [weft::ws::buffer-create! "*diff*" "" ""]
+    }
+
+    let doc [weft::ws::buffer-doc $b]
+
+    Lk::doc_transact $doc {
+        if [> [Lk::doc_len $doc] 0] {
+            Lk::doc_delete $doc 0 [Lk::doc_len $doc]
+        }
+
+        Lk::doc_insert $doc 0 [weft::transform::diff-text]
+    }
+
+    wsh_show_in_split $b
+
+    return ""
+}
+
+;; ---- inspector (ctrl+i): the registries, rendered at point ----
+
+proc wsh_inspect {} {
+    let f [weft::ws::focused-ctx-fields]
+    let pos [Lk::editor_cursor [weft::ws::view-editor [get $f view]]]
+    let text [weft::inspect::report #{buffer [get $f buffer] pos $pos}]
+
+    var b [weft::ws::buffer-for-name "*inspect*"]
+
+    if [empty? $b] {
+        set! b [weft::ws::buffer-create! "*inspect*" "" ""]
+    }
+
+    let doc [weft::ws::buffer-doc $b]
+
+    Lk::doc_transact $doc {
+        if [> [Lk::doc_len $doc] 0] {
+            Lk::doc_delete $doc 0 [Lk::doc_len $doc]
+        }
+        Lk::doc_insert $doc 0 $text
+    }
+
+    wsh_show_in_split $b
+
+    return ""
+}
+
+;; A transform asked a question (kind prompt): the mini-bar collects
+;; the answer, then the transform re-runs with ctx.input bound.
+var wsh_prompt_name ""
+var wsh_prompt_ctx #{}
+var wsh_prompt_msg ""
+var wsh_prompt_val ""
+
+;; A text_input's typed buffer lives in lk widget STATE keyed by node
+;; id, and state wins over the `text` prop once it exists -- so a
+;; reused id would show the previous prompt's answer forever.  Giving
+;; each prompt a fresh id makes the prop authoritative exactly once,
+;; which is what "prefill the default" means.  The bindings are
+;; ptype-scoped, not id-scoped, so a changing id costs nothing.
+var wsh_prompt_seq 0
+var wsh_prompt_node "transform_in"
+
+proc wsh_prompt_open {p} {
+    set! wsh_prompt_name [get $p name]
+    set! wsh_prompt_ctx [get $p ctx]
+    set! wsh_prompt_msg "[get $p message] (default: [get $p default])"
+    set! wsh_prompt_val [get $p default]
+    set! ::wsh_bar transform
+    set! wsh_prompt_seq [+ $wsh_prompt_seq 1]
+    set! wsh_prompt_node "transform_in_$wsh_prompt_seq"
+
+    wsh_focus_request $wsh_prompt_node
+
+    return ""
+}
+
+proc wsh_prompt_submit {} {
+    let r [weft::transform::run $wsh_prompt_name \
+        [Dict::merge $wsh_prompt_ctx #{input $wsh_prompt_val}]]
+
+    ::wsh_bar_close
+    ::wsh_after_eval $r
+
+    return ""
+}
+
+;; Shared tail for anything that may have produced a transform
+;; outcome: pending plan -> preview; prompt -> ask; error -> flash.
+;; An open annotation session surfaces its buffer the same way.
+;; Which review sessions were open the last time we looked.  A
+;; transition from open to decided is what closes the artifact -- not
+;; "is it pending now", which would also close a *diff* an unrelated
+;; command happened to run past.
+var wsh_had_plan 0
+var wsh_had_annot 0
+
+proc wsh_after_eval {v} {
+    if [weft::annot::pending?] {
+        set! wsh_had_annot 1
+        wsh_show_in_split [weft::annot::session-buffer]
+    } else {
+        if $wsh_had_annot {
+            set! wsh_had_annot 0
+            wsh_close_views_of "*annot-edit*"
+        }
+    }
+
+    if [weft::transform::pending?] {
+        set! wsh_had_plan 1
+        wsh_show_diff
+        return ""
+    }
+
+    if $wsh_had_plan {
+        set! wsh_had_plan 0
+        wsh_close_views_of "*diff*"
+    }
+
+    ;; A command that returned a structured error value: flash it
+    ;; (failures read "!! why" -> 8s), the way a failed task would.
+    ;; An ambiguous buffer name also prints its candidates as rows;
+    ;; EXECUTE's echo already did that, a chord/bar evaluation has
+    ;; not -- print them here and surface *output* only then.
+    if [weft::error::error? $v] {
+        wsh_flash_set "!! [weft::error::message $v]"
+
+        if [has? [weft::error::data $v] candidates] {
+            weft::shell::report-error! [weft::shell::output-buffer!] $v
+            wsh_show_output
+        }
+    }
+
+    if [and [dict? $v] [has? $v kind]] {
+        if [== [get $v kind] prompt] {
+            wsh_prompt_open $v
+        }
+
+        if [== [get $v kind] error] {
+            wsh_flash_set "transform: [weft::error::message [get $v error]]"
+        }
+
+        if [== [get $v kind] no_change] {
+            wsh_flash_set "no changes"
+        }
+
+        if [== [get $v kind] show] {
+            wsh_show_in_split [get $v buffer]
+        }
+
+        ;; weft::open: a file you asked for is one you meant to read.
+        if [== [get $v kind] open] {
+            wsh_reveal_buffer [get $v buffer]
+            wsh_flash_set "opened [get $v path]"
+        }
+
+        ;; A producer emitted into *output* (weft::buffers, weft::
+        ;; commands): surface it.  The REPL echoes the summary, but
+        ;; the rows ARE the result -- a menu you cannot see is not a
+        ;; menu.
+        if [== [get $v kind] emitted] {
+            wsh_show_output
+        }
+    }
+
+    ;; An evaluation that STARTED A RUN streams into *output*: show it
+    ;; for the same reason.  EXECUTE already does this on its own path;
+    ;; this covers the run launched from the REPL or a bound key, where
+    ;; the value handed back is the task itself.
+    if [weft::task::task? $v] {
+        wsh_show_output
+    }
+
+    return ""
+}
+
+;; Buffer menu v0: cycle the focused pane through the buffer registry.
+;; (The real menu is Acme-style clickable text -- P2, with plumbing.)
+proc wsh_next_buffer {} {
+    let f [weft::ws::focused-ctx-fields]
+    let bl [weft::ws::buffer-list]
+
+    if [< [len $bl] 2] {
+        wsh_flash_set "no other buffers"
+        return ""
+    }
+
+    var idx 0
+    var i 0
+
+    foreach row $bl {
+        if [== [get $row id] [get $f buffer]] { set! idx $i }
+        set! i [+ $i 1]
+    }
+
+    let next [get [get $bl [% [+ $idx 1] [len $bl]]] id]
+
+    weft::ws::pane-show-buffer! [get $f pane] $next
+
+    return ""
+}
+
+;; ---- per-frame projections (called from the view body) ----
+
+;; ---- gestures (EXECUTE / LOOK, plan P2) ----
+
+;; `:` is a word char so weft::command paths middle-click as one word.
+var wsh_word_chars "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.~/:-"
+
+proc wsh_in_set {text i n} {
+    if [or [< $i 0] [>= $i $n]] { return 0 }
+    return [>= [String::find $wsh_word_chars [String::index $text $i]] 0]
+}
+
+proc wsh_word_at {doc pos} {
+    let text [Lk::doc_text $doc]
+    let n [String::length $text]
+    var s $pos
+    var e $pos
+
+    while [wsh_in_set $text [- $s 1] $n] {
+        set! s [- $s 1]
+    }
+
+    while [wsh_in_set $text $e $n] {
+        set! e [+ $e 1]
+    }
+
+    ;; A filter glyph (| < >) glued to the word's front travels with
+    ;; it, so middle-clicking `|sort` EXECUTEs the filter, not `sort`
+    ;; -- whether the click lands on the word or on the glyph itself.
+    if [and [== $s $e] [::wsh_filter_glyph? $text $s $n]] {
+        set! e [+ $s 1]
+
+        while [wsh_in_set $text $e $n] {
+            set! e [+ $e 1]
+        }
+    }
+
+    if [== $s $e] { return #{text ""} }
+
+    if [::wsh_filter_glyph? $text [- $s 1] $n] {
+        set! s [- $s 1]
+    }
+
+    ;; A filter spelling runs to the END OF ITS LINE: `|tr a-z A-Z` is
+    ;; one command, and the word rule would hand the filter a bare
+    ;; `tr`.  (The caller trims.)
+    if [::wsh_filter_glyph? $text $s $n] {
+        set! e [Lk::doc_line_end $doc [Lk::doc_pos_to_line $doc $s]]
+    }
+
+    return #{start $s end $e text [String::range $text $s $e]}
+}
+
+proc wsh_filter_glyph? {text i n} {
+    if [or [< $i 0] [>= $i $n]] { return 0 }
+
+    let c [String::index $text $i]
+
+    return [or [== $c "|"] [or [== $c "<"] [== $c ">"]]]
+}
+
+proc wsh_pane_of_node {node_name} {
+    if [not [== 0 [String::find $node_name "ed_"]]] { return "" }
+
+    let p [String::replace $node_name "ed_" ""]
+
+    if [== pane [get [weft::ws::node $p] kind]] { return $p }
+
+    return ""
+}
+
+;; EXECUTE at a click: the selection when the click lands inside it,
+;; else the clicked word, run as a shell command.
+proc wsh_execute_at {pane pos} {
+    weft::ws::focus! $pane
+    Lk::focus_set $wsh_ui "ed_$pane"
+
+    if [wsh_repl_buffer? [weft::ws::view-buffer [weft::ws::pane-view $pane]]] {
+        wsh_repl_eval $pane
+        return 1
+    }
+
+    let vid [weft::ws::pane-view $pane]
+    let ed [weft::ws::view-editor $vid]
+    let doc [weft::ws::buffer-doc [weft::ws::view-buffer $vid]]
+    let sels [weft::ws::view-selections $vid]
+    var cf #{pane $pane view $vid buffer [weft::ws::view-buffer $vid]}
+    var inside 0
+
+    foreach s $sels {
+        if [and [>= $pos [get $s 0]] [< $pos [get $s 1]]] {
+            set! inside 1
+        }
+    }
+
+    ;; Inside ANY selection: the selections ARE the programs -- the
+    ;; caret set's N execution units, exactly the keyboard EXECUTE.
+    if $inside {
+        var units ()
+
+        foreach s $sels {
+            let raw [String::range [Lk::doc_text $doc] [get $s 0] [get $s 1]]
+            let tt [String::trim $raw]
+
+            if [not [empty? $tt]] {
+                let src [weft::image::source-of [get $cf buffer] \
+                    [::wsh_trimmed_start $raw [get $s 0]]]
+                set! units [List::push $units \
+                    #{text $tt ctx [weft::ctx::make \
+                        [Dict::merge $cf #{source $src}]]}]
+            }
+        }
+
+        if [== 0 [len $units]] { return 0 }
+
+        wsh_run_units $units 0
+
+        return 1
+    }
+
+    ;; The click landed OUTSIDE every selection: the word is the
+    ;; program and the selections are its OPERANDS (docs/commands.md
+    ;; stage D) -- select lines, type `|sort` below them, middle-click
+    ;; it; select N filenames, middle-click `git add` once.  N
+    ;; selections = N runs, document order, one operand each.  Either
+    ;; way the ctx names the buffer (so the run has its cwd).
+    let text [String::trim [get [wsh_word_at $doc $pos] text]]
+
+    if [empty? $text] { return 0 }
+
+    set! cf [Dict::merge $cf \
+        #{source [weft::image::source-of [get $cf buffer] $pos]}]
+
+    if [== 0 [len $sels]] {
+        ::wsh_run_text $text [weft::ctx::make $cf]
+
+        return 1
+    }
+
+    var units ()
+
+    foreach s $sels {
+        set! units [List::push $units #{text $text \
+            ctx [weft::ctx::make [Dict::merge $cf \
+                #{start [get $s 0] end [get $s 1]}]]}]
+    }
+
+    wsh_run_units $units 0
+
+    return 1
+}
+
+;; Shared EXECUTE tail: route through run-text!, surface the outcome.
+proc wsh_run_text {text ctx} {
+    let t [weft::shell::run-text! $text $ctx]
+    var quiet 0
+
+    ;; EXECUTE HERE: the output is already where the user is looking.
+    if [not [empty? [weft::ctx::field $ctx out]]] { set! quiet 1 }
+
+    ;; A pending task may ask not to surface *output* on start (filters
+    ;; report through their own events; *output* pops only if there is
+    ;; something to read).
+    if [== [weft::task::state $t] pending] {
+        let m [weft::tasks::meta [get $t id]]
+
+        if [has? $m quiet] { set! quiet [get $m quiet] }
+    }
+
+    if [not $quiet] { wsh_show_output }
+
+    if [== [weft::task::state $t] failed] {
+        wsh_flash_set "!! [weft::error::message [weft::task::failure $t]]"
+    } else {
+        wsh_flash_set "> $text"
+
+        ;; Only completed evaluations carry a value; asking a PENDING
+        ;; task (streaming shell/argv runs) for its result raises.
+        if [== [weft::task::state $t] succeeded] {
+            let v [weft::task::result $t]
+
+            ;; An error VALUE was already echoed (rows included) by
+            ;; run-text!'s echo; flash it here, do not print it twice.
+            if [weft::error::error? $v] {
+                wsh_flash_set "!! [weft::error::message $v]"
+            } else {
+                wsh_after_eval $v
+            }
+        }
+    }
+
+    return ""
+}
+
+;; LOOK at a click (non-plumb fallback): search-next for the clicked
+;; word from the cursor, wrapping; the match becomes the selection.
+proc wsh_look_at {pane pos} {
+    weft::ws::focus! $pane
+    Lk::focus_set $wsh_ui "ed_$pane"
+
+    let vid [weft::ws::pane-view $pane]
+    let ed [weft::ws::view-editor $vid]
+    let doc [weft::ws::buffer-doc [weft::ws::view-buffer $vid]]
+    let needle [get [wsh_word_at $doc $pos] text]
+
+    if [empty? $needle] { return 0 }
+
+    var hit [Lk::doc_find $doc $needle [+ [Lk::editor_cursor $ed] 1]]
+
+    if [< $hit 0] {
+        set! hit [Lk::doc_find $doc $needle 0]
+    }
+
+    if [>= $hit 0] {
+        Lk::editor_command $ed set_cursor $hit
+        Lk::editor_command $ed set_cursor \
+            [+ $hit [String::length $needle]] extend
+    }
+
+    return 1
+}
+
+;; ---- LOOK destinations (plumb / qjump / loc) ----
+;;
+;; Where a LOOK gesture lands its result.  Plain right-click acts in
+;; the pane you clicked -- Acme's rule, the window you are already in.
+;; Shift+right-click splits that pane first, so the source stays
+;; visible: the difference between FOLLOWING a reference and COMPARING
+;; against it.  Both spellings share every handler below; the flag is
+;; the only difference, which is why it is a parameter and not a
+;; second code path.
+proc wsh_hit_pane {cmd new} {
+    var pane [wsh_pane_of_node [get $cmd source_node_id]]
+
+    if [empty? $pane] { set! pane [weft::ws::focused-pane] }
+
+    if $new {
+        let here [weft::ws::view-buffer [weft::ws::pane-view $pane]]
+        let p2 [weft::ws::pane-split! $pane h $here]
+
+        if [not [weft::error::error? $p2]] { set! pane $p2 }
+    }
+
+    return $pane
+}
+
+proc wsh_qjump_hit {cmd new} {
+    let pane [wsh_hit_pane $cmd $new]
+    let r [weft::q::jump! [get [get $cmd hit] value] \
+        [weft::ctx::make #{pane $pane}]]
+
+    if [weft::error::error? $r] {
+        wsh_flash_set "query: [weft::error::message $r]"
+    } else {
+        weft::ws::focus! $pane
+        wsh_focus_editor
+    }
+
+    return ""
+}
+
+proc wsh_plumb_hit {cmd new} {
+    let pane [wsh_hit_pane $cmd $new]
+    let r [weft::plumb::dispatch! [get [get $cmd hit] value] \
+        [weft::ctx::make #{pane $pane}]]
+
+    if [weft::error::error? $r] {
+        wsh_flash_set "plumb: [weft::error::message $r]"
+    } else {
+        weft::ws::focus! $pane
+        wsh_focus_editor
+    }
+
+    return ""
+}
+
+;; LOOK on a recognized location (command pipeline stage C): the
+;; gesture POLICY for the recognizer's typed facts -- file/fileline
+;; open (at the line), dir re-lists into *output*, url hands off to
+;; xdg-open.  The recognizer discovers; this decides.
+proc wsh_loc_hit {cmd new} {
+    let v [get [get $cmd hit] value]
+    let kind [get $v kind]
+
+    ;; A directory re-lists into *output* and a url leaves the
+    ;; workspace entirely -- neither has anywhere to put a new pane,
+    ;; so the shift spelling only means anything for files.
+    if [or [== $kind file] [== $kind fileline]] {
+        let pane [wsh_hit_pane $cmd $new]
+        let ctx [weft::ctx::make #{pane $pane}]
+        let b [weft::ws::buffer-open! [get $v path] $ctx]
+
+        if [weft::error::error? $b] {
+            wsh_flash_set "open: [weft::error::message $b]"
+            return ""
+        }
+
+        let vid [weft::ws::pane-show-buffer! $pane $b]
+
+        if [== $kind fileline] {
+            let doc [weft::ws::buffer-doc $b]
+            var ln [get $v line]
+
+            if [< $ln 1] { set! ln 1 }
+
+            let last [Lk::doc_line_count $doc]
+
+            if [> $ln $last] { set! ln $last }
+
+            weft::ws::view-goto! $vid [Lk::doc_line_start $doc [- $ln 1]]
+        }
+
+        weft::ws::focus! $pane
+        wsh_focus_editor
+
+        return ""
+    }
+
+    let ctx [weft::ctx::make #{pane [wsh_hit_pane $cmd 0]}]
+
+    if [== $kind dir] {
+        weft::shell::execute-argv! #{argv ("ls")
+            text "ls [get $v path]" cwd [get $v path]} $ctx
+        wsh_show_output
+    }
+
+    if [== $kind url] {
+        weft::shell::execute-argv! #{argv ("xdg-open" [get $v url])
+            text {xdg-open} cwd ""} $ctx
+    }
+
+    return ""
+}
+
+;; ---- mini-bar: search / replace / goto / open (P2 stage C) ----
+;; One bottom bar, four modes.  The text inputs own their buffers
+;; (LKS_TEXT_BUF); the app mirrors values via value_changed commands.
+;; Return/Escape are scoped to the bar inputs' presentation ptypes, so
+;; they never collide with editor keybindings.
+
+var wsh_bar ""
+var wsh_search_val ""
+var wsh_replace_val ""
+var wsh_goto_val ""
+var wsh_open_val ""
+var wsh_open_seq 0
+var wsh_open_node "open_in"
+var wsh_show_val ""
+var wsh_show_seq 0
+var wsh_show_node "show_in"
+var wsh_search_anchor 0
+
+proc wsh_focused_ed {} {
+    return [weft::ws::view-editor [weft::ws::pane-view [weft::ws::focused-pane]]]
+}
+
+proc wsh_focused_doc {} {
+    return [weft::ws::buffer-doc [weft::ws::view-buffer \
+        [weft::ws::pane-view [weft::ws::focused-pane]]]]
+}
+
+proc wsh_focused_buf {} {
+    return [weft::ws::view-buffer \
+        [weft::ws::pane-view [weft::ws::focused-pane]]]
+}
+
+proc wsh_bar_open {mode input} {
+    set! wsh_bar $mode
+    set! wsh_search_anchor [Lk::editor_cursor [wsh_focused_ed]]
+
+    ;; Re-light all-matches highlighting for the remembered needle.
+    if [or [== $mode search] [== $mode replace]] {
+        weft::search::query! [wsh_focused_buf] $wsh_search_val
+    }
+
+    wsh_focus_request $input
+
+    return ""
+}
+
+proc wsh_bar_close {} {
+    set! wsh_bar ""
+    weft::search::clear! [wsh_focused_buf]
+    wsh_focus_editor
+    return ""
+}
+
+;; ctrl+o: open a file by name.  The box starts prefilled with the
+;; focused buffer's cwd so you type only the leaf -- and because a
+;; missing path opens as a new bound buffer, this is also how you
+;; create one.  Fresh node id per open, so the prefill actually shows
+;; (see wsh_prompt_open for why).
+proc wsh_open_bar {} {
+    var dir [weft::ws::buffer-cwd [wsh_focused_buf]]
+
+    if [empty? $dir] { set! dir "." }
+
+    set! wsh_open_val "$dir/"
+    set! wsh_bar open
+    set! wsh_open_seq [+ $wsh_open_seq 1]
+    set! wsh_open_node "open_in_$wsh_open_seq"
+    set! wsh_search_anchor [Lk::editor_cursor [wsh_focused_ed]]
+
+    wsh_focus_request $wsh_open_node
+
+    return ""
+}
+
+;; ctrl+shift+b: show a buffer by name (docs/buffers.md).  The same
+;; bar mechanism as ctrl+o; submitting runs `weft::show` on the text,
+;; so the resolver's prefix rules ARE the completion and an ambiguous
+;; name prints its candidates as rows in *output*.
+proc wsh_show_bar {} {
+    set! wsh_show_val ""
+    set! wsh_bar show
+    set! wsh_show_seq [+ $wsh_show_seq 1]
+    set! wsh_show_node "show_in_$wsh_show_seq"
+    set! wsh_search_anchor [Lk::editor_cursor [wsh_focused_ed]]
+
+    wsh_focus_request $wsh_show_node
+
+    return ""
+}
+
+proc wsh_show_submit {} {
+    let q [String::trim $wsh_show_val]
+
+    wsh_bar_close
+
+    if [empty? $q] { return "" }
+
+    ::wsh_command_eval "weft::show {$q}"
+
+    return ""
+}
+
+;; Run one weft:: command form in the image with the focused pane as
+;; ctx and surface the outcome like any EXECUTE -- the chord layer
+;; for the buffer commands is nothing but this.
+proc wsh_command_eval {form} {
+    let f [weft::ws::focused-ctx-fields]
+    let r [weft::image::eval-in! user $form \
+        [weft::ctx::make [Dict::merge $f #{ns user}]]]
+
+    if [get $r ok] {
+        wsh_after_eval [get $r value]
+
+        ;; Re-home focus on the (possibly new) focused pane's editor
+        ;; -- unless the value opened a bar, whose focus request wins.
+        if [empty? $wsh_bar] { wsh_focus_editor }
+    } else {
+        wsh_flash_set "!! [weft::error::message [get $r error]]"
+    }
+
+    return ""
+}
+
+;; The bar as a command, so the chord that opens it can live in the
+;; bindings profile as data beside weft::only and friends.
+;; NB: `::` root spellings -- the wsh_* helpers are top-level procs
+;; whose own qualified weft:: references OWN the weft namespace, so
+;; capturing them by value here would cycle at pop; and wsh_filter_bar
+;; is defined below this block, which the old dynamic fallback hid.
+;; A root reference is live and never captured (redesign D3).
+namespace weft::shell {
+    proc buffer-bar! {} {
+        ::wsh_show_bar
+        return ""
+    }
+
+    proc filter-bar! {} {
+        ::wsh_filter_bar
+        return ""
+    }
+}
+
+;; ---- ctrl+p: the filter bar (docs/commands.md stage D) ----
+;; The operand is the focused view's selection (or its cursor for
+;; `<cmd`), captured at SUBMIT -- the editor keeps its selection while
+;; the bar has focus.  A bare command means `|cmd`; `<cmd`/`>cmd` are
+;; typed as spelled.  The text then goes through the ordinary EXECUTE
+;; tail, so resolution, records and explain all apply.
+var wsh_filter_val ""
+var wsh_filter_seq 0
+var wsh_filter_node "filter_in"
+
+proc wsh_filter_bar {} {
+    set! wsh_filter_val ""
+    set! wsh_bar filter
+    set! wsh_filter_seq [+ $wsh_filter_seq 1]
+    set! wsh_filter_node "filter_in_$wsh_filter_seq"
+    set! wsh_search_anchor [Lk::editor_cursor [wsh_focused_ed]]
+
+    wsh_focus_request $wsh_filter_node
+
+    return ""
+}
+
+;; ctx fields for an operand-taking command: the focused pane, its
+;; buffer, and its selection as start/end -- or the cursor as pos.
+;; A caret SET rides as `selections`: N selections = N filter runs in
+;; one transaction; N bare carets = N zero-width insertion points
+;; (`<date` inserts at every caret).  The primary still lands in
+;; start/end (or pos) so single-range consumers read the ctx as ever.
+proc wsh_operand_ctx_fields {} {
+    let f [weft::ws::focused-ctx-fields]
+    let sels [weft::ws::view-selections [get $f view]]
+
+    if [>= [len $sels] 2] {
+        var mf [Dict::merge $f #{selections $sels}]
+        let p [weft::ws::view-selection [get $f view]]
+
+        if [== 2 [len $p]] {
+            set! mf [Dict::merge $mf #{start [get $p 0] end [get $p 1]}]
+        }
+
+        return $mf
+    }
+
+    if [== 1 [len $sels]] {
+        let s [get $sels 0]
+
+        return [Dict::merge $f #{start [get $s 0] end [get $s 1]}]
+    }
+
+    let carets [weft::ws::view-carets [get $f view]]
+
+    if [>= [len $carets] 2] {
+        var zs ()
+
+        foreach c $carets {
+            set! zs [List::push $zs [list $c $c]]
+        }
+
+        return [Dict::merge $f #{selections $zs
+            pos [Lk::editor_cursor [weft::ws::view-editor [get $f view]]]}]
+    }
+
+    return [Dict::merge $f \
+        #{pos [Lk::editor_cursor [weft::ws::view-editor [get $f view]]]}]
+}
+
+proc wsh_filter_submit {} {
+    var t [String::trim $wsh_filter_val]
+    let cf [wsh_operand_ctx_fields]
+
+    wsh_bar_close
+
+    if [empty? $t] { return "" }
+
+    let c0 [String::index $t 0]
+
+    if [not [or [== $c0 "|"] [or [== $c0 "<"] [== $c0 ">"]]]] {
+        set! t "|$t"
+    }
+
+    wsh_run_text $t [weft::ctx::make $cf]
+
+    return ""
+}
+
+;; Async filter outcomes: flash the note; surface *output* only when
+;; there is something to read there (failure, stale result); a
+;; previewed plan opens *diff* through the usual tail.
+proc wsh_drain_filter_events {} {
+    foreach ev [weft::filter::take-events!] {
+        wsh_flash_set [get $ev note]
+
+        if [get $ev surface] { wsh_show_output }
+        if [get $ev review] { wsh_after_eval "" }
+    }
+
+    return ""
+}
+
+proc wsh_open_submit {} {
+    let p [String::trim $wsh_open_val]
+
+    if [empty? $p] {
+        wsh_bar_close
+        return ""
+    }
+
+    let b [weft::ws::buffer-open! $p [weft::ctx::make [weft::ws::focused-ctx-fields]]]
+
+    wsh_bar_close
+
+    if [weft::error::error? $b] {
+        wsh_flash_set "open: [weft::error::message $b]"
+    } else {
+        wsh_reveal_buffer $b
+        wsh_flash_set "opened $p"
+    }
+
+    return ""
+}
+
+;; Find wsh_search_val from `from` (wrapping) and make the match the
+;; active selection.  Returns 1 on a match.
+proc wsh_search_from {from} {
+    if [empty? $wsh_search_val] { return 0 }
+
+    let ed [wsh_focused_ed]
+    let doc [wsh_focused_doc]
+
+    var hit [Lk::doc_find $doc $wsh_search_val $from]
+
+    if [< $hit 0] {
+        set! hit [Lk::doc_find $doc $wsh_search_val 0]
+    }
+
+    if [< $hit 0] {
+        wsh_flash_set "no match: $wsh_search_val"
+        return 0
+    }
+
+    Lk::editor_command $ed set_cursor $hit
+    Lk::editor_command $ed set_cursor \
+        [+ $hit [String::length $wsh_search_val]] extend
+
+    return 1
+}
+
+;; Swap the current selection for the replacement (empty replacement
+;; means delete -- insert of zero bytes would leave the selection).
+proc wsh_replace_selection {ed} {
+    if [empty? $wsh_replace_val] {
+        Lk::editor_command $ed delete_backward
+    } else {
+        Lk::editor_command $ed insert_text $wsh_replace_val
+    }
+
+    return ""
+}
+
+;; Replace the active match (when the selection is exactly the
+;; needle), then advance to the next one.
+proc wsh_replace_one {} {
+    let ed [wsh_focused_ed]
+    let doc [wsh_focused_doc]
+    let sel [Lk::editor_selection $ed]
+
+    if [== [len $sel] 2] {
+        if [== [String::range [Lk::doc_text $doc] [get $sel 0] [get $sel 1]] \
+               $wsh_search_val] {
+            wsh_replace_selection $ed
+        }
+    }
+
+    wsh_search_from [Lk::editor_cursor $ed]
+
+    return ""
+}
+
+proc wsh_replace_all {} {
+    if [empty? $wsh_search_val] { return "" }
+
+    let ed [wsh_focused_ed]
+    let doc [wsh_focused_doc]
+    var count 0
+    var going 1
+
+    Lk::editor_command $ed set_cursor 0
+    while $going {
+        let hit [Lk::doc_find $doc $wsh_search_val \
+            [Lk::editor_cursor $ed]]
+
+        if [< $hit 0] {
+            set! going 0
+        } else {
+            Lk::editor_command $ed set_cursor $hit
+            Lk::editor_command $ed set_cursor \
+                [+ $hit [String::length $wsh_search_val]] extend
+            wsh_replace_selection $ed
+            set! count [+ $count 1]
+        }
+    }
+
+    wsh_flash_set "replaced $count"
+
+    return ""
+}
+
+proc wsh_goto_jump {} {
+    let ed [wsh_focused_ed]
+    let doc [wsh_focused_doc]
+    var ln 0
+    var e ""
+
+    if [not [== 0 [catch { int [String::trim $wsh_goto_val] } ln e]]] {
+        wsh_flash_set "goto: not a line number: $wsh_goto_val"
+        return ""
+    }
+
+    if [< $ln 1] {
+        set! ln 1
+    }
+
+    let last [Lk::doc_line_count $doc]
+
+    if [> $ln $last] {
+        set! ln $last
+    }
+
+    Lk::editor_command $ed set_cursor [Lk::doc_line_start $doc [- $ln 1]]
+    wsh_bar_close
+
+    return ""
+}
+
+;; Per-frame derived state: ensure producers are attached to every
+;; visible buffer and tick them.  Projection is NOT per-frame: the
+;; projected layers (plumb, search, ts) are written only by producers,
+;; so a view reprojects exactly when its buffer's producers ran --
+;; rebuilding a large file's span list every frame was a measured
+;; frame-time cliff (live search lagged seconds behind on a C file).
+var wsh_proj_gen #{}    ;; buffer-id -> projection generation
+var wsh_proj_done #{}   ;; view-id -> last "buffer:generation" projected
+var wsh_proj_seq #{}    ;; buffer-id -> annot store seq at last bump
+
+proc wsh_tick_producers {} {
+    foreach pane [weft::ws::panes] {
+        let vid [weft::ws::pane-view $pane]
+        let bid [weft::ws::view-buffer $vid]
+
+        ;; Authored annotations (annotation editor, orphan adoption,
+        ;; Lk::annot_add from the REPL) are not producer output, so a
+        ;; tick alone would never reproject them: the store's change
+        ;; sequence is the other trigger.  One int compare per pane.
+        let seq [Lk::annot_store_seq [weft::ws::buffer-store $bid]]
+        var seen -1
+
+        if [has? $wsh_proj_seq $bid] { set! seen [get $wsh_proj_seq $bid] }
+
+        if [not [== $seq $seen]] {
+            set! wsh_proj_seq [put $wsh_proj_seq $bid $seq]
+
+            var g0 0
+
+            if [has? $wsh_proj_gen $bid] { set! g0 [get $wsh_proj_gen $bid] }
+
+            set! wsh_proj_gen [put $wsh_proj_gen $bid [+ $g0 1]]
+        }
+
+        if $weft_have_regex {
+            weft::producer::attach! $bid plumb
+        }
+
+        if $weft_have_ts {
+            weft::producer::attach! $bid ts
+        }
+
+        weft::producer::attach! $bid search
+
+        if [> [weft::producer::tick! $bid] 0] {
+            var g 0
+
+            if [has? $wsh_proj_gen $bid] {
+                set! g [get $wsh_proj_gen $bid]
+            }
+
+            set! wsh_proj_gen [put $wsh_proj_gen $bid [+ $g 1]]
+        }
+
+        var g 0
+
+        if [has? $wsh_proj_gen $bid] {
+            set! g [get $wsh_proj_gen $bid]
+        }
+
+        let key "$bid:$g"
+        var have ""
+
+        if [has? $wsh_proj_done $vid] {
+            set! have [get $wsh_proj_done $vid]
+        }
+
+        if [not [== $key $have]] {
+            ::wsh_project_spans $vid $bid
+            set! wsh_proj_done [put $wsh_proj_done $vid $key]
+        }
+    }
+
+    return ""
+}
+
+;; Sort spans by start and keep the first of any overlapping pair
+;; (stable sort: equal starts resolve to insertion order).
+proc wsh_flatten_spans {spans} {
+    let sorted [List::sort_by $spans [lambda {sp} { get $sp start }]]
+    var flat ()
+    var prev 0
+
+    foreach sp $sorted {
+        if [>= [get $sp start] $prev] {
+            set! flat [List::push $flat $sp]
+            set! prev [get $sp end]
+        }
+    }
+
+    return $flat
+}
+
+;; Clip each low-priority span against the high-priority spans (both
+;; lists sorted by start, high non-overlapping): the parts a high
+;; span covers are cut away, the rest survives.  This is why a search
+;; match inside a syntax-colored comment still glows -- the comment
+;; span yields exactly the matched bytes and keeps the rest.  Linear
+;; two-pointer walk: per-frame quadratic clipping was a measured
+;; frame-time cliff (1-char queries make hundreds of high spans).
+proc wsh_clip_spans {low high} {
+    let hn [len $high]
+
+    if [== 0 $hn] { return $low }
+
+    var out ()
+    var hi 0
+
+    foreach sp $low {
+        var s [get $sp start]
+        let e [get $sp end]
+        var adv 1
+
+        while [and $adv [< $hi $hn]] {
+            if [<= [get [get $high $hi] end] $s] {
+                set! hi [+ $hi 1]
+            } else { set! adv 0 }
+        }
+
+        var j $hi
+        var going 1
+
+        while [and $going [< $j $hn]] {
+            let h [get $high $j]
+
+            if [>= [get $h start] $e] { set! going 0 } else {
+                if [< $s [get $h start]] {
+                    set! out [List::push $out \
+                        [Dict::merge $sp #{start $s end [get $h start]}]]
+                }
+
+                if [> [get $h end] $s] {
+                    set! s [get $h end]
+                }
+
+                set! j [+ $j 1]
+            }
+        }
+
+        if [< $s $e] {
+            set! out [List::push $out [Dict::merge $sp #{start $s end $e}]]
+        }
+    }
+
+    return $out
+}
+
+;; Merge two start-sorted span lists, dropping overlaps as we go
+;; (ties go to `a`, the gesture layers).  Linear -- no combined sort.
+proc wsh_merge_spans {a b} {
+    let an [len $a]
+    let bn [len $b]
+    var out ()
+    var i 0
+    var j 0
+    var prev 0
+
+    while [or [< $i $an] [< $j $bn]] {
+        var take_a 1
+
+        if [>= $i $an] { set! take_a 0 } else {
+            if [< $j $bn] {
+                if [> [get [get $a $i] start] [get [get $b $j] start]] {
+                    set! take_a 0
+                }
+            }
+        }
+
+        var sp ""
+
+        if $take_a {
+            set! sp [get $a $i]
+            set! i [+ $i 1]
+        } else {
+            set! sp [get $b $j]
+            set! j [+ $j 1]
+        }
+
+        if [>= [get $sp start] $prev] {
+            set! out [List::push $out $sp]
+            set! prev [get $sp end]
+        }
+    }
+
+    return $out
+}
+
+proc wsh_project_spans {vid bid} {
+    let store [weft::ws::buffer-store $bid]
+    let doc [weft::ws::buffer-doc $bid]
+
+    ;; Gesture layers (plumb links, search matches) claim their ranges
+    ;; first; syntax highlighting fills whatever they leave.  The ts
+    ;; list comes pre-styled and pre-sorted from its own scan -- the
+    ;; per-span work here stays proportional to the gesture layers.
+    var high ()
+
+    foreach id [Lk::annot_by_layer $store "plumb"] {
+        let sp [Lk::annot_span $store $id]
+
+        if [> [get $sp 1] [get $sp 0]] {
+            set! high [List::push $high [Dict::merge \
+                #{start [get $sp 0] end [get $sp 1]} \
+                [weft::plumb::style-of [Lk::annot_meta $store $id rule]]]]
+        }
+    }
+
+    foreach id [Lk::annot_by_layer $store "search"] {
+        let sp [Lk::annot_span $store $id]
+
+        if [> [get $sp 1] [get $sp 0]] {
+            set! high [List::push $high [Dict::merge \
+                #{start [get $sp 0] end [get $sp 1]} \
+                [weft::search::style]]]
+        }
+    }
+
+    ;; Show-projection jump rows: dim link styling.
+    foreach id [Lk::annot_by_layer $store "qjump"] {
+        let sp [Lk::annot_span $store $id]
+
+        if [> [get $sp 1] [get $sp 0]] {
+            set! high [List::push $high [Dict::merge \
+                #{start [get $sp 0] end [get $sp 1]} \
+                #{fg (150 180 230)}]]
+        }
+    }
+
+    ;; Recognized locations in command output (stage C): link styling.
+    foreach id [Lk::annot_by_layer $store "loc"] {
+        let sp [Lk::annot_span $store $id]
+
+        if [> [get $sp 1] [get $sp 0]] {
+            set! high [List::push $high [Dict::merge \
+                #{start [get $sp 0] end [get $sp 1]} \
+                #{fg (120 190 255) underline 1}]]
+        }
+    }
+
+    ;; Query-rule layers (weft::q::annotate) style like gestures:
+    ;; user rules claim their ranges over syntax.
+    foreach qlayer [weft::q::annotated-layers] {
+        let qstyle [weft::q::style-of $qlayer]
+
+        foreach id [Lk::annot_by_layer $store $qlayer] {
+            let sp [Lk::annot_span $store $id]
+
+            if [> [get $sp 1] [get $sp 0]] {
+                set! high [List::push $high [Dict::merge \
+                    #{start [get $sp 0] end [get $sp 1]} $qstyle]]
+            }
+        }
+    }
+
+    ;; Authored layers: anything not producer-owned and not one of the
+    ;; machine layers above styles by its own `style:` metadata
+    ;; (weft::annot::style-of) -- the annotation editor's `style:fg
+    ;; "#ffc864"` shows up on the next frame.
+    let owned [weft::producer::owned-layers]
+    let machine (plumb search qjump loc)
+
+    foreach layer [Lk::annot_layers $store] {
+        if [or [has? $owned $layer] [has? $machine $layer]] { continue }
+
+        foreach id [Lk::annot_by_layer $store $layer] {
+            let st [weft::annot::style-of [Lk::annot_meta_all $store $id]]
+
+            if [== 0 [len [Dict::keys $st]]] { continue }
+
+            let sp [Lk::annot_span $store $id]
+
+            if [> [get $sp 1] [get $sp 0]] {
+                set! high [List::push $high [Dict::merge \
+                    #{start [get $sp 0] end [get $sp 1]} $st]]
+            }
+        }
+    }
+
+    set! high [wsh_flatten_spans $high]
+
+    let low [wsh_clip_spans [weft::ts::spans-for $bid] $high]
+
+    Lk::editor_set_spans [weft::ws::view-editor $vid] $doc \
+        [wsh_merge_spans $high $low]
+    return ""
+}
+
+;; Splits are CONTROLLED: the workspace ratio is authoritative, drags
+;; emit SplitMoved (per-mille in source_value, split node id in the
+;; presentation args) and the prop is re-supplied here each frame.
+proc wsh_render_node {node_id} {
+    let n [weft::ws::node $node_id]
+
+    if [== [get $n kind] pane] {
+        ;; The pane presentation is what keybindings match against
+        ;; (translators only fire at nodes carrying presentations) and
+        ;; it stamps every command with the pane it fired in.
+        editor "ed_$node_id" \
+            #{editor [weft::ws::view-editor [get $n view]] grow 1
+              focusable 1 present (pane ($node_id))}
+    } else {
+        let pm [int [* [weft::ws::split-ratio $node_id] 1000]]
+        if [== [get $n axis] h] {
+            split_h "sp_$node_id" #{split_ratio $pm split_controlled 1
+                                    present (split_drag ($node_id)) grow 1} {
+                wsh_render_node [get $n a]
+                wsh_render_node [get $n b]
+            }
+        } else {
+            split_v "sp_$node_id" #{split_ratio $pm split_controlled 1
+                                    present (split_drag ($node_id)) grow 1} {
+                wsh_render_node [get $n a]
+                wsh_render_node [get $n b]
+            }
+        }
+    }
+
+    return ""
+}
+
+proc wsh_status_name {} {
+    let f [weft::ws::focused-ctx-fields]
+
+    if [not [has? $f buffer]] { return "" }
+
+    let b [weft::ws::buffer [get $f buffer]]
+    var mark ""
+
+    if [weft::ws::buffer-dirty? [get $f buffer]] { set! mark " *" }
+
+    return "[get $b name]$mark"
+}
+
+proc wsh_status_pos {} {
+    let f [weft::ws::focused-ctx-fields]
+
+    if [not [has? $f view]] { return "" }
+
+    let doc [weft::ws::buffer-doc [get $f buffer]]
+    let cur [Lk::editor_cursor [weft::ws::view-editor [get $f view]]]
+
+    return "[+ [Lk::doc_pos_to_line $doc $cur] 1]:[Lk::doc_char_col $doc $cur]"
+}
+
+proc wsh_status_flash {} {
+    if [> [Lk::time_ms $wsh_ui] $wsh_flash_until] { return "" }
+    return $wsh_flash
+}
+
+;; ---- entry point ----
+
+;; The font must exist: lk degrades an unreadable face to a STUB text
+;; backend (a window with no glyphs at all), so a stale font_path --
+;; a user config written when the font lived elsewhere -- would open a
+;; blank editor.  Fall back to the bundled face and say so.
+proc wsh_font_path {} {
+    let fp [String::from [weft::config::value-or font_path ""]]
+    let bundled "$weft_root/assets/fonts/Roboto_Mono/static/RobotoMono-Regular.ttf"
+
+    if [empty? $fp] { return $bundled }
+
+    let t [weft::cap::invoke "fs.exists?" #{path $fp} [weft::ctx::make #{}]]
+
+    if [and [== [weft::task::state $t] succeeded] [weft::task::result $t]] {
+        return $fp
+    }
+
+    puts "weft: warning: font_path '$fp' is not readable; using $bundled"
+
+    return $bundled
+}
+
+;; The window icon is best-effort: lk's `app #{icon ..}` silently keeps
+;; the default when the file is unreadable or undecodable (PNG needs
+;; lk built with SDL3_image), so there is nothing to validate here --
+;; an empty icon_path means "no icon" and omits the key.
+
+;; ---- input registration: translators + the keymap ----
+;; Called once from the app body, and again whenever weft::keymap's
+;; generation moves (a bind!/chord! from the REPL or init.lcl reload)
+;; on an lk that exposes clear_translators -- so rebinding is live.
+;; On an lk without it the new rows stay `pending` in the table (the
+;; listing says so) until the next start.
+var wsh_keys_gen -1
+
+proc wsh_register_input! {} {
+    ;; "Registering as of THIS generation" comes first: rows added
+    ;; since the last registration are pending until this call, and
+    ;; the table only activates them once told -- marking afterwards
+    ;; would skip exactly the rows a refresh exists to pick up.
+    weft::keymap::registered!
+
+    translator value_changed split_drag SplitMoved
+    ;; Pointer translators demand EXACT mods, so the shift
+    ;; spellings are separate registrations -- and a plain
+    ;; right-click can never be mistaken for one.
+    translator pointer_down #{button secondary} plumb PlumbHit
+    translator pointer_down #{button secondary} qjump QjumpHit
+    translator pointer_down #{button secondary} loc LocHit
+    translator pointer_down #{button secondary mods shift} plumb PlumbHitNew
+    translator pointer_down #{button secondary mods shift} qjump QjumpHitNew
+    translator pointer_down #{button secondary mods shift} loc LocHitNew
+    translator value_changed search_edit SearchEdit
+    translator value_changed replace_edit ReplaceEdit
+    translator value_changed goto_edit GotoEdit
+    translator value_changed transform_edit TransformEdit
+    translator value_changed open_edit OpenEdit
+    translator value_changed show_edit ShowEdit
+    translator value_changed filter_edit FilterEdit
+
+    ;; Keybindings come from weft::keymap::table -- the profile's
+    ;; chords over the intents declared in ui/intents.lcl, plus
+    ;; config's bind! scripts -- ONE loop, so `weft::keys` lists
+    ;; exactly what is registered.  Rows are ptype'd on their
+    ;; scope (the pane presentation, or a bar's editor): they fire
+    ;; from the focused widget and the command carries its pane
+    ;; id.  Shadowed/unbound rows are never registered.
+    var _ubi 0
+
+    foreach kr [weft::keymap::table] {
+        if [== active [get $kr status]] {
+            if [== intent [get $kr kind]] {
+                foreach sc [get $kr scopes] {
+                    keybinding [get $kr key] [get $kr mods] $sc \
+                        [get $kr intent]
+                }
+            } else {
+                ;; A bind! script evaluates in the image with the
+                ;; focused pane's buffer and live selection as ctx
+                ;; -- so bound transforms act on the selection,
+                ;; previews and prompts included.
+                set! _ubi [+ $_ubi 1]
+                let cmd_name "UserBind$_ubi"
+                let script [get $kr script]
+
+                keybinding [get $kr key] [get $kr mods] pane $cmd_name
+
+                on $cmd_name [lambda {cmd} {
+                    wsh_cmd_pane $cmd
+                    let f [weft::ws::focused-ctx-fields]
+                    var cf [Dict::merge $f #{ns user}]
+                    let sel [weft::ws::view-selection [get $f view]]
+
+                    if [== 2 [len $sel]] {
+                        set! cf [Dict::merge $cf \
+                            #{start [get $sel 0] end [get $sel 1]}]
+                    }
+
+                    let sels [weft::ws::view-selections [get $f view]]
+
+                    if [>= [len $sels] 2] {
+                        set! cf [Dict::merge $cf #{selections $sels}]
+                    }
+
+                    let r [weft::image::eval-in! user $script \
+                        [weft::ctx::make $cf]]
+
+                    if [get $r ok] {
+                        wsh_after_eval [get $r value]
+
+                        ;; A bound buffer/pane command (weft::only,
+                        ;; close) may have changed which pane is
+                        ;; focused: re-home focus unless the value
+                        ;; opened a bar.
+                        if [empty? $wsh_bar] { wsh_focus_editor }
+                    } else {
+                        wsh_flash_set \
+                            "bind: [weft::error::message [get $r error]]"
+                    }
+                }]
+            }
+        }
+    }
+
+    set! wsh_keys_gen [weft::keymap::generation]
+    return $wsh_keys_gen
+}
+
+proc wsh_keys_refresh! {} {
+    if [== $wsh_keys_gen [weft::keymap::generation]] { return 0 }
+
+    if [not [has? ${::Lk} clear_translators]] {
+        ;; Cannot re-register on this lk: remember we looked, the
+        ;; rows stay pending.
+        set! wsh_keys_gen [weft::keymap::generation]
+        return 0
+    }
+
+    Lk::clear_translators $wsh_ui
+    wsh_register_input!
+    return 1
+}
+
+proc wsh_run {files} {
+    weft::shell::intents!
+    let fp [wsh_font_path]
+    let ip [String::from [weft::config::value-or icon_path ""]]
+    let fs [weft::config::value-or font_size 15]
+    let ww [weft::config::value-or window_width 1100]
+    let wh [weft::config::value-or window_height 700]
+
+    var appcfg #{font $fp font_size $fs width $ww height $wh}
+    if [not [empty? $ip]] { set! appcfg [Dict::merge $appcfg #{icon $ip}] }
+
+    app "weft" $appcfg {
+
+        theme {
+            rule window #{bg (24 26 32)}
+            rule * #{fg (205 210 220)}
+            rule editor #{bg (28 31 40) padding 8}
+            rule split_h #{border_color (60 65 80)}
+            rule split_v #{border_color (60 65 80)}
+            rule label #{tag dim} #{fg (125 132 148)}
+        }
+
+        wsh_register_input!
+
+        on SplitMoved [lambda {cmd} {
+            weft::ws::split-ratio-set! [get [get $cmd args] 0] \
+                [/ [int [get $cmd source_value]] 1000.0]
+        }]
+
+        on Save [lambda {cmd} { wsh_cmd_pane $cmd ; wsh_save }]
+        on SplitH [lambda {cmd} { wsh_cmd_pane $cmd ; wsh_split h }]
+        on SplitV [lambda {cmd} { wsh_cmd_pane $cmd ; wsh_split v }]
+        on ClosePane [lambda {cmd} { wsh_cmd_pane $cmd ; wsh_close_pane }]
+        on NextPane [lambda {cmd} { wsh_cmd_pane $cmd ; wsh_next_pane }]
+        on NextBuffer [lambda {cmd} { wsh_cmd_pane $cmd ; wsh_next_buffer }]
+        on Execute [lambda {cmd} { wsh_cmd_pane $cmd ; wsh_execute }]
+        on ReplOpen [lambda {cmd} { wsh_cmd_pane $cmd ; wsh_open_repl }]
+        on ShellOpen [lambda {cmd} { wsh_cmd_pane $cmd ; wsh_open_shell }]
+        on Inspect [lambda {cmd} { wsh_cmd_pane $cmd ; wsh_inspect }]
+        on AnnotEdit [lambda {cmd} { wsh_cmd_pane $cmd ; wsh_annot_edit }]
+        on OpenBar [lambda {cmd} { wsh_cmd_pane $cmd ; wsh_open_bar }]
+
+        on SearchOpen [lambda {cmd} {
+            wsh_cmd_pane $cmd ; wsh_bar_open search "search_in"
+        }]
+
+        on ReplaceOpen [lambda {cmd} {
+            wsh_cmd_pane $cmd ; wsh_bar_open replace "search_in"
+        }]
+
+        on GotoOpen [lambda {cmd} {
+            wsh_cmd_pane $cmd ; wsh_bar_open goto "goto_in"
+        }]
+
+        on BarClose [lambda {cmd} { wsh_bar_close }]
+
+        ;; Live search: retype searches from where the bar was opened,
+        ;; so a growing needle keeps matching the same region.  The
+        ;; search producer lights every match; the bar owns the active
+        ;; one.
+        on SearchEdit [lambda {cmd} {
+            set! wsh_search_val [get $cmd source_value]
+            weft::search::query! [wsh_focused_buf] $wsh_search_val
+            wsh_search_from $wsh_search_anchor
+        }]
+
+        on SearchNext [lambda {cmd} {
+            wsh_search_from [Lk::editor_cursor [wsh_focused_ed]]
+        }]
+
+        on ReplaceEdit [lambda {cmd} {
+            set! wsh_replace_val [get $cmd source_value]
+        }]
+
+        on ReplaceOne [lambda {cmd} { wsh_replace_one }]
+        on ReplaceAll [lambda {cmd} { wsh_replace_all }]
+        on GotoEdit [lambda {cmd} {
+            set! wsh_goto_val [get $cmd source_value]
+        }]
+        on GotoJump [lambda {cmd} { wsh_goto_jump }]
+        on FilterOpen [lambda {cmd} { wsh_cmd_pane $cmd; wsh_filter_bar }]
+        on ExecuteWith [lambda {cmd} { wsh_cmd_pane $cmd; wsh_execute_with }]
+        on ExecuteHere [lambda {cmd} { wsh_cmd_pane $cmd; wsh_execute_here }]
+        on TransformEdit [lambda {cmd} {
+            set! wsh_prompt_val [get $cmd source_value]
+        }]
+        on TransformSubmit [lambda {cmd} { wsh_prompt_submit }]
+        on OpenEdit [lambda {cmd} {
+            set! wsh_open_val [get $cmd source_value]
+        }]
+        on OpenSubmit [lambda {cmd} { wsh_open_submit }]
+        on ShowEdit [lambda {cmd} {
+            set! wsh_show_val [get $cmd source_value]
+        }]
+        on ShowSubmit [lambda {cmd} { wsh_show_submit }]
+        on FilterEdit [lambda {cmd} {
+            set! wsh_filter_val [get $cmd source_value]
+        }]
+        on FilterSubmit [lambda {cmd} { wsh_filter_submit }]
+
+        ;; LOOK on a presented range: the typed presentation value
+        ;; arrives on the command -- no text re-parsing.  The acting
+        ;; pane is the clicked editor's; the shift spelling opens the
+        ;; result beside it instead of in it.
+        on QjumpHit [lambda {cmd} { wsh_qjump_hit $cmd 0 }]
+        on QjumpHitNew [lambda {cmd} { wsh_qjump_hit $cmd 1 }]
+        on PlumbHit [lambda {cmd} { wsh_plumb_hit $cmd 0 }]
+        on PlumbHitNew [lambda {cmd} { wsh_plumb_hit $cmd 1 }]
+        on LocHit [lambda {cmd} { wsh_loc_hit $cmd 0 }]
+        on LocHitNew [lambda {cmd} { wsh_loc_hit $cmd 1 }]
+
+        ;; Raw-event tier: focus mirroring plus the EXECUTE/LOOK
+        ;; fallbacks for clicks that hit no presented range (those were
+        ;; already consumed by the editor's presentation translation).
+        event_handler [lambda {ev node} {
+            if [== [get $ev type] focus_changed] {
+                let p [wsh_pane_of_node [get $ev next_id]]
+
+                if [not [empty? $p]] { weft::ws::focus! $p }
+
+                return 0
+            }
+
+            if [not [== [get $ev type] pointer_down]] { return 0 }
+            if [not [== [get $ev phase] target]] { return 0 }
+            if [not [has? $ev target_id]] { return 0 }
+
+            let pane [wsh_pane_of_node [get $ev target_id]]
+
+            if [empty? $pane] { return 0 }
+
+            let ed [weft::ws::view-editor [weft::ws::pane-view $pane]]
+            let pos [Lk::editor_pos_at $ed [get $ev x] [get $ev y]]
+
+            if [< $pos 0] { return 0 }
+
+            if [== [get $ev button] 2] { return [wsh_execute_at $pane $pos] }
+            if [== [get $ev button] 3] { return [wsh_look_at $pane $pos] }
+
+            return 0
+        }]
+
+        set! wsh_ui ${LkDsl::_ui}
+        weft::ws::init! [wsh_editor_hooks]
+
+        ;; Open every file argument as a buffer; show the first (or a
+        ;; scratch buffer when none was given).
+        let boot_ctx [weft::ctx::make #{}]
+        var first ""
+
+        foreach f $files {
+            let b [weft::ws::buffer-open! $f $boot_ctx]
+
+            if [weft::error::error? $b] {
+                puts "weft: cannot open $f: [weft::error::message $b]"
+            } else {
+                if [empty? $first] { set! first $b }
+            }
+        }
+
+        if [empty? $first] {
+            set! first [weft::ws::scratch-buffer!]
+        }
+
+        weft::ws::tree-init! [weft::ws::view-create! $first]
+
+        ;; No file arguments: pick up where the last session left off
+        ;; (config session_restore 0 opts out; failures never block
+        ;; startup).
+        if [and [== 0 [len $files]] \
+                [weft::config::value-or session_restore 1]] {
+            var _sr ""
+            var _se ""
+
+            catch { weft::session::restore! $boot_ctx } _sr _se
+        }
+
+        wsh_focus_editor
+
+        view {
+            weft::tasks::poll-all!
+            weft::shell::seq-tick!
+            wsh_keys_refresh!
+            wsh_drain_filter_events
+            wsh_tick_producers
+            wsh_follow_output
+
+            column "root" #{align stretch gap 4 padding 6} {
+                wsh_render_node [weft::ws::tree-root]
+
+                if [not [empty? $wsh_bar]] {
+                    row "minibar" #{gap 8} {
+                        if [== $wsh_bar transform] {
+                            label "mb_prompt" #{tag dim text $wsh_prompt_msg}
+                            ;; `text` seeds the widget's buffer; state
+                            ;; wins after the first keystroke, and the
+                            ;; id is fresh per prompt, so this prefills
+                            ;; exactly once with the current default.
+                            text_input $wsh_prompt_node \
+                                #{grow 1 focusable 1 text $wsh_prompt_val
+                                  present (transform_edit (q))}
+                        } else {
+                        if [== $wsh_bar open] {
+                            label "mb_open" #{tag dim text "open:"}
+                            text_input $wsh_open_node \
+                                #{grow 1 focusable 1 text $wsh_open_val
+                                  present (open_edit (q))}
+                        } else {
+                        if [== $wsh_bar show] {
+                            label "mb_show" #{tag dim text "buffer:"}
+                            text_input $wsh_show_node \
+                                #{grow 1 focusable 1 text $wsh_show_val
+                                  present (show_edit (q))}
+                        } else {
+                        if [== $wsh_bar filter] {
+                            label "mb_filter" #{tag dim text "filter (|cmd <cmd >cmd):"}
+                            text_input $wsh_filter_node \
+                                #{grow 1 focusable 1 text $wsh_filter_val
+                                  present (filter_edit (q))}
+                        } else {
+                        if [== $wsh_bar goto] {
+                            label "mb_goto" #{tag dim text "goto line:"}
+                            text_input "goto_in" \
+                                #{grow 1 focusable 1 present (goto_edit (q))}
+                        } else {
+                            label "mb_find" #{tag dim text "find:"}
+                            text_input "search_in" \
+                                #{grow 1 focusable 1 present (search_edit (q))}
+                            if [== $wsh_bar replace] {
+                                label "mb_repl" #{tag dim text "replace:"}
+                                text_input "replace_in" \
+                                    #{grow 1 focusable 1 present (replace_edit (q))}
+                            }
+                        }
+                        }
+                        }
+                        }
+                        }
+                    }
+                }
+
+                row "status" #{gap 12} {
+                    label "st_name" #{text [wsh_status_name]}
+                    label "st_pos" #{tag dim text [wsh_status_pos]}
+                    label "st_flash" #{tag dim text [wsh_status_flash]}
+                }
+            }
+        }
+    }
+
+    ;; The window closed: sweep clean buffers' annotations and save
+    ;; the workspace shape (config session_autosave 0 opts out).
+    ;; Failures cannot block quit -- they park in weft::persist.
+    var _q_r ""
+    var _q_e ""
+
+    catch { weft::persist::flush-clean! } _q_r _q_e
+
+    if [weft::config::value-or session_autosave 1] {
+        catch { weft::session::save! } _q_r _q_e
+    }
+}

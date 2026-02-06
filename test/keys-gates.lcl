@@ -1,0 +1,302 @@
+;; Keybinding gates (docs/commands.md "Keys"): one registry
+;; (weft::keymap) of profile chords over shell intents plus config
+;; scripts; later wins with shadowing kept visible; the shell registers
+;; ONLY from the table; `weft::keys` prints it.  Headless -- the
+;; intents are data (lib/weft/ui/intents.lcl, declared by boot), so
+;; the profile resolves here exactly as in the window.
+;;   weft --headless test/keys-gates.lcl
+
+proc gate {name ok} {
+    if [not $ok] { error "GATE FAILED: $name" }
+    puts "ok: $name"
+}
+
+require "weft/host/test.lcl"
+
+weft::ws::init! [weft::testhost::editor-hooks]
+
+;; ================= chord parsing ===================================
+
+let _p [weft::keymap::parse-chord "ctrl+shift+return"]
+gate "parse-chord: key is the last part, mods the rest" \
+    [and [== [get $_p key] return] [== [get $_p mods] "ctrl+shift"]]
+gate "parse-chord: a bare key has empty mods" \
+    [== "" [get [weft::keymap::parse-chord "escape"] mods]]
+
+;; ================= the profile resolves ============================
+;; boot loaded config/default.lcl (source native) and declared the
+;; shell's intents; the gate script itself runs as source live.
+
+gate "gate script binds as source live" [== live [weft::keymap::source]]
+
+let _t0 [weft::keymap::table]
+gate "the native profile registered rows" [> [len $_t0] 20]
+
+var _unbound ()
+var _native_intent_rows 0
+var _native_script_rows 0
+foreach r $_t0 {
+    if [== unbound [get $r status]] {
+        set! _unbound [List::push $_unbound [get $r chord]]
+    }
+    if [== native [get $r source]] {
+        if [== intent [get $r kind]] {
+            set! _native_intent_rows [+ $_native_intent_rows 1]
+        } else {
+            set! _native_script_rows [+ $_native_script_rows 1]
+        }
+    }
+}
+gate "every profile chord names a declared intent (none unbound)" \
+    [empty? $_unbound]
+gate "the profile has both intent chords and bind! scripts" \
+    [and [> $_native_intent_rows 20] [> $_native_script_rows 5]]
+
+;; Every declared intent is reachable by some chord in the profile --
+;; a browser profile may differ, but the native one must be complete.
+var _reached #{}
+foreach r $_t0 {
+    if [== intent [get $r kind]] { set! _reached [put $_reached [get $r intent] 1] }
+}
+var _unreached ()
+foreach kv [weft::keymap::intents] {
+    if [not [has? $_reached [get $kv 0]]] {
+        set! _unreached [List::push $_unreached [get $kv 0]]
+    }
+}
+gate "every shell intent has a chord in the native profile ($_unreached)" \
+    [empty? $_unreached]
+
+;; No two ACTIVE rows share a scope+chord: the shell would register
+;; both and lk would pick one silently.
+var _seen #{}
+var _dup ()
+foreach r [weft::keymap::active] {
+    foreach sc [get $r scopes] {
+        let k "$sc|[get $r chord]"
+        if [has? $_seen $k] { set! _dup [List::push $_dup $k] }
+        set! _seen [put $_seen $k 1]
+    }
+}
+gate "no two active rows share a scope+chord ($_dup)" [empty? $_dup]
+
+;; The pinned chords of the surface (CLAUDE.md "Current UI Surface").
+proc chord-intent {chord} {
+    foreach r [weft::keymap::lookup $chord] {
+        if [and [== active [get $r status]] [== intent [get $r kind]]] {
+            return [get $r intent]
+        }
+    }
+    return ""
+}
+gate "ctrl+s -> Save" [== Save [chord-intent "ctrl+s"]]
+gate "ctrl+e -> SplitH, ctrl+shift+d -> SplitV (plain ctrl+d is lk's)" \
+    [and [== SplitH [chord-intent "ctrl+e"]] \
+         [and [== SplitV [chord-intent "ctrl+shift+d"]] \
+              [== "" [chord-intent "ctrl+d"]]]]
+gate "ctrl+return / ctrl+shift+return / ctrl+alt+return -> the EXECUTE family" \
+    [and [== Execute [chord-intent "ctrl+return"]] \
+         [and [== ExecuteWith [chord-intent "ctrl+shift+return"]] \
+              [== ExecuteHere [chord-intent "ctrl+alt+return"]]]]
+
+;; A multi-scope intent: escape closes every bar, as one row that
+;; expands to one keybinding per scope.
+var _esc ()
+foreach r [weft::keymap::lookup "escape"] { set! _esc [get $r scopes] }
+gate "escape -> BarClose across all seven bar scopes" \
+    [and [== 7 [len $_esc]] [has? $_esc filter_edit]]
+
+;; `return` is bound in several bar scopes and NEVER in the pane:
+;; scopes keep same-key rows apart.
+var _ret_pane 0
+foreach r [weft::keymap::lookup "return"] {
+    if [has? [get $r scopes] pane] { set! _ret_pane 1 }
+}
+gate "return rows live in bar scopes only" [not $_ret_pane]
+
+;; Intent rows carry the intent's doc, group and command form.
+var _splith #{}
+foreach r [weft::keymap::lookup "ctrl+e"] { set! _splith $r }
+gate "an intent row resolves doc/group/form from the intent" \
+    [and [== "weft::split-h" [get $_splith form]] \
+         [and [not [empty? [get $_splith doc]]] \
+              [== "Buffers and panes" [get $_splith group]]]]
+
+;; ================= later wins, shadowing visible ===================
+
+let _n_before [len [weft::keymap::table]]
+weft::config::bind! "ctrl+s" {weft::version} {a test rebinding}
+let _rows_s [weft::keymap::lookup "ctrl+s"]
+gate "a live bind! on a native chord adds a row (nothing is dropped)" \
+    [and [== 2 [len $_rows_s]] \
+         [== [+ $_n_before 1] [len [weft::keymap::table]]]]
+gate "the native row is shadowed, by source live" \
+    [and [== shadowed [get [get $_rows_s 0] status]] \
+         [== live [get [get $_rows_s 0] shadowed_by]]]
+gate "the live row is the active one, with its doc" \
+    [and [== active [get [get $_rows_s 1] status]] \
+         [== "a test rebinding" [get [get $_rows_s 1] doc]]]
+
+var _active_s 0
+foreach r [weft::keymap::active] {
+    if [== "ctrl+s" [get $r chord]] { set! _active_s [+ $_active_s 1] }
+}
+gate "the shell would register exactly one ctrl+s" [== 1 $_active_s]
+
+;; A profile chord! after a bind! wins too -- order, not source rank.
+weft::keymap::chord! "ctrl+s" Save
+let _rows_s2 [weft::keymap::lookup "ctrl+s"]
+gate "a later chord! takes the chord back" \
+    [and [== 3 [len $_rows_s2]] \
+         [and [== shadowed [get [get $_rows_s2 1] status]] \
+              [== active [get [get $_rows_s2 2] status]]]]
+
+;; Different scope, same chord: no shadowing across scopes.
+weft::config::bind! "return" {weft::version}
+var _ret_shadowed 0
+foreach r [weft::keymap::lookup "return"] {
+    if [== shadowed [get $r status]] { set! _ret_shadowed 1 }
+}
+gate "a pane bind! on `return` shadows no bar row" [not $_ret_shadowed]
+
+;; An unknown intent is an unbound row: listed, never registered.
+weft::keymap::chord! "f9" NoSuchIntent
+var _f9 #{}
+foreach r [weft::keymap::lookup "f9"] { set! _f9 $r }
+gate "a chord naming no intent is unbound" [== unbound [get $_f9 status]]
+var _f9_active 0
+foreach r [weft::keymap::active] {
+    if [== f9 [get $r chord]] { set! _f9_active 1 }
+}
+gate "unbound rows are not active" [not $_f9_active]
+
+;; ================= pending: never claim a chord the widget lacks ===
+;; Once a shell has registered the table, later rows are `pending`
+;; (they shadow nothing) until it registers again.
+
+gate "headless: nothing is pending before any registration" \
+    [< [weft::keymap::registered-gen] 0]
+weft::keymap::registered!
+weft::config::bind! "ctrl+e" {weft::version} {late}
+let _late [weft::keymap::lookup "ctrl+e"]
+gate "a row bound after registration is pending" \
+    [== pending [get [get $_late 1] status]]
+gate "a pending row shadows nothing (the native ctrl+e stays active)" \
+    [== active [get [get $_late 0] status]]
+var _pending_active 0
+foreach r [weft::keymap::active] {
+    if [== late [get $r doc]] { set! _pending_active 1 }
+}
+gate "pending rows are not in the active set" [not $_pending_active]
+weft::keymap::registered!
+let _late2 [weft::keymap::lookup "ctrl+e"]
+gate "re-registering activates it and it shadows the native row" \
+    [and [== active [get [get $_late2 1] status]] \
+         [== shadowed [get [get $_late2 0] status]]]
+
+;; ================= config compatibility ============================
+
+let _bl [weft::config::bindings-list]
+gate "bindings-list is the script rows, with the old keys" \
+    [and [> [len $_bl] 5] \
+         [and [has? [get $_bl 0] script] [has? [get $_bl 0] mods]]]
+var _bl_intent 0
+foreach b $_bl { if [== intent [get $b kind]] { set! _bl_intent 1 } }
+gate "bindings-list carries no intent rows" [not $_bl_intent]
+
+;; The memo: same generation, same table; any writer bumps it.
+let _g0 [weft::keymap::generation]
+let _ta [weft::keymap::table]
+let _tb [weft::keymap::table]
+gate "table is memoised per generation" \
+    [and [== $_g0 [weft::keymap::generation]] [== [len $_ta] [len $_tb]]]
+weft::keymap::gesture! "test-gesture" "a gesture"
+gate "a writer bumps the generation" [> [weft::keymap::generation] $_g0]
+
+;; ================= the intents are the shell's handlers ============
+;; ui/intents.lcl must not drift from shell.lcl: every intent has an
+;; `on Name [` handler there, and shell.lcl registers keybindings ONLY
+;; through the table (exactly the two generator spellings).
+
+if [not $weft_have_io] {
+    puts "deferred: intents-vs-shell source scan (host built without io)"
+} else {
+    let _shell_src [Io::read_file "$weft_lib_dir/weft/ui/shell.lcl"]
+    var _no_handler ()
+    foreach kv [weft::keymap::intents] {
+        if [< [String::find $_shell_src "on [get $kv 0] \["] 0] {
+            set! _no_handler [List::push $_no_handler [get $kv 0]]
+        }
+    }
+    gate "every intent has an `on` handler in shell.lcl ($_no_handler)" \
+        [empty? $_no_handler]
+
+    var _kb_lines 0
+    foreach ln [String::split $_shell_src "\n"] {
+        let t [String::trim $ln]
+        if [== 0 [String::find $t "keybinding "]] {
+            set! _kb_lines [+ $_kb_lines 1]
+        }
+    }
+    gate "shell.lcl has no hand-written keybinding rows (2 generator lines)" \
+        [== 2 $_kb_lines]
+
+    let _ni [len [weft::keymap::intents]]
+    weft::shell::intents!
+    gate "intents! is idempotent" [== $_ni [len [weft::keymap::intents]]]
+}
+
+;; ================= weft::keys, the listing =========================
+
+let _r [weft::keys]
+gate "weft::keys emits" [== emitted [get $_r kind]]
+let _out [weft::shell::out-buffer! [weft::image::ctx]]
+let _text [Lk::doc_text [weft::ws::buffer-doc $_out]]
+gate "listing has the intent groups" \
+    [and [>= [String::find $_text "Buffers and panes"] 0] \
+         [>= [String::find $_text "Execute"] 0]]
+gate "listing shows the chord, the command form and the doc" \
+    [and [>= [String::find $_text "ctrl+e"] 0] \
+         [and [>= [String::find $_text "weft::split-h"] 0] \
+              [>= [String::find $_text "side by side"] 0]]]
+gate "listing says what shadows what" \
+    [>= [String::find $_text "shadowed by a live binding"] 0]
+gate "listing flags the unbound chord as a profile error" \
+    [>= [String::find $_text "PROFILE ERROR: no intent named NoSuchIntent"] 0]
+gate "listing has the live bindings with their docs" \
+    [>= [String::find $_text "a test rebinding"] 0]
+weft::config::bind! "ctrl+shift+9" {weft::version} {pending-marker}
+weft::keys
+let _text2 [Lk::doc_text [weft::ws::buffer-doc $_out]]
+gate "listing marks a row bound after registration as PENDING" \
+    [>= [String::find $_text2 "PENDING:"] 0]
+
+;; The lk editor widget's own bindings, reflected (lk 0e749ef).
+if [not [has? ${::Lk} editor_keys]] {
+    puts "deferred: lk editor_keys group (this lk does not reflect editor keys)"
+} else {
+    let _ek [Lk::editor_keys]
+    gate "Lk::editor_keys reflects the widget's tables" [> [len $_ek] 20]
+    gate "listing carries the widget's key rows in editor_command vocabulary" \
+        [and [>= [String::find $_text2 "select_next_match"] 0] \
+             [>= [String::find $_text2 "ctrl+d (alone)"] 0]]
+    gate "listing carries the widget's pointer gestures with their actions" \
+        [and [>= [String::find $_text2 "alt+drag"] 0] \
+             [>= [String::find $_text2 "box_select"] 0]]
+    gate "shift-extending motions say so on one row" \
+        [>= [String::find $_text2 "shift extends the selection"] 0]
+}
+gate "this lk exposes clear_translators (live rebinding path is armed)" \
+    [has? ${::Lk} clear_translators]
+gate "listing has the mouse gestures" \
+    [>= [String::find $_text "middle-click"] 0]
+gate "listing has the lk widget group (reflected or honestly absent)" \
+    [>= [String::find $_text "lk editor widget"] 0]
+
+;; The command menu lists weft::keys, and its head resolves.
+let _cm [weft::commands]
+let _cm_text [Lk::doc_text [weft::ws::buffer-doc $_out]]
+gate "weft::commands lists weft::keys" \
+    [>= [String::find $_cm_text "weft::keys"] 0]
+
+puts "keys gates: all passed"

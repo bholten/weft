@@ -1,0 +1,91 @@
+;;; weft::tasks -- the live half of the task contract (plan sections 5,
+;;; 11/P2): a registry of PENDING tasks, polled once per frame by the
+;;; shell (or by a test loop, headless).
+;;;
+;;; Task VALUES stay immutable data (weft::task); what lives here is the
+;;; machinery a pending task needs: a poll closure, a cancel closure,
+;;; and meta naming what the task belongs to.  Poll closures do their
+;;; own streaming side effects and return a weft::task value; the first
+;;; non-pending return retires the entry.
+;;;
+;;;   weft::tasks::register! id #{poll <fn {} -> task-value>
+;;;                               cancel <fn {} -> "">
+;;;                               meta #{buffer <id> execution <id>}}
+;;;
+;;; Cancellation and buffer teardown route through here: closing a
+;;; buffer cancels every task whose meta names it (the workspace kernel
+;;; calls cancel-for-buffer!).
+
+namespace weft::tasks {
+
+    var registry #{}
+
+    proc register! {id entry} {
+        set! registry [put $registry $id $entry]
+        return $id
+    }
+
+    proc pending-ids {} {
+        return [List::sort [Dict::keys $registry]]
+    }
+
+    proc meta {id} {
+        if [not [has? $registry $id]] { return #{} }
+        return [get [get $registry $id] meta]
+    }
+
+    ;; Poll every pending task once.  Entries whose poll returns a
+    ;; completed task are retired; a poll that raises retires the task
+    ;; as failed (a broken poll must not wedge the frame loop forever).
+    ;; Returns the number of tasks still pending.
+    proc poll-all! {} {
+        foreach id [Dict::keys $registry] {
+            if [has? $registry $id] {
+                let entry [get $registry $id]
+                var r ""
+                var e ""
+
+                if [== 0 [catch { apply [get $entry poll] } r e]] {
+                    if [not [== [weft::task::state $r] pending]] {
+                        set! registry [del $registry $id]
+                    }
+                } else {
+                    set! registry [del $registry $id]
+                    puts "weft: task $id poll failed: $e"
+                }
+            }
+        }
+        return [len [Dict::keys $registry]]
+    }
+
+    proc cancel! {id} {
+        if [not [has? $registry $id]] { return 0 }
+
+        let entry [get $registry $id]
+        set! registry [del $registry $id]
+
+        var r ""
+        var e ""
+
+        if [not [== 0 [catch { apply [get $entry cancel] } r e]]] {
+            puts "weft: task $id cancel failed: $e"
+        }
+
+        return 1
+    }
+
+    proc cancel-for-buffer! {buffer_id} {
+        var n 0
+
+        foreach id [Dict::keys $registry] {
+            let m [weft::tasks::meta $id]
+
+            if [and [has? $m buffer] [== $buffer_id [get $m buffer]]] {
+                weft::tasks::cancel! $id
+                set! n [+ $n 1]
+            }
+        }
+
+        return $n
+    }
+}

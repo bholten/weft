@@ -1,0 +1,1043 @@
+;;; weft::q -- the range-query algebra (plan section 14, Q1).
+;;;
+;;; A query is a PLAN AS DATA: a source (document, selection, range,
+;;; annotation set) plus a stage list.  Operators append stages and
+;;; return a new plan value; nothing runs until a terminal interprets
+;;; it.  Built for lcl's thread-first operator:
+;;;
+;;;   -> [weft::q::doc]
+;;;      {weft::q::lines}
+;;;      {weft::q::select [lambda {r} { ... }]}
+;;;      {weft::q::preview 5}
+;;;
+;;; Load-bearing rules (section 14, short form):
+;;;   - Records are range-bearing: buffer + revision + [start, end) --
+;;;     provenance always; text rides along only when a stage needs it.
+;;;   - Queries are snapshots: the evaluator reads the document ONCE
+;;;     and stamps every record with that revision.  Effect terminals
+;;;     (Q2/Q3) validate it and refuse when stale.
+;;;   - The evaluator is terminal-aware and per-record: segmenters
+;;;     push records through the stage chain one at a time, `take` and
+;;;     bounded terminals halt segmentation early, and no intermediate
+;;;     list of the whole document ever exists.
+;;;   - Segmenters apply to every incoming record, so they nest:
+;;;     lines of a document, then matches within each line.
+;;;
+;;; matches rides Regex::search (R0, landed 2026-08-07): resumable
+;;; absolute offsets, so match records carry the full-match range AND
+;;; capture RANGES (`caps`; unmatched groups keep the (-1 -1)
+;;; sentinel).  weft::q::cap / cap-text are the accessors -- detached
+;;; capture strings never enter records (rule 1).
+
+namespace weft::q {
+
+    ;; ---- plan construction ----
+
+    proc _plan {source} {
+        return #{kind query source $source stages ()}
+    }
+
+    proc _check {plan op} {
+        if [not [and [dict? $plan] [== query [get $plan kind]]]] {
+            error "weft::q::$op: first argument is not a query (thread from a source, e.g. \[weft::q::doc\])"
+        }
+
+        return ""
+    }
+
+    proc _stage {plan st} {
+        return [put $plan stages [List::push [get $plan stages] $st]]
+    }
+
+    proc _ctx-buffer {who} {
+        let bid [weft::ctx::field [weft::image::ctx] buffer]
+
+        if [not [weft::ws::buffer? $bid]] {
+            error "weft::q::$who: no buffer in ctx (pass a buffer id, or run from an execution that has one)"
+        }
+
+        return $bid
+    }
+
+    ;; The executing evaluation's document (like no-arg repl::attach),
+    ;; or an explicit buffer id.
+    proc doc {*rest} {
+        var bid ""
+
+        if [== 1 [len $rest]] {
+            set! bid [get $rest 0]
+        } else {
+            set! bid [weft::q::_ctx-buffer doc]
+        }
+
+        if [not [weft::ws::buffer? $bid]] {
+            error "weft::q::doc: no buffer '$bid'"
+        }
+
+        return [weft::q::_plan #{type doc buffer $bid}]
+    }
+
+    ;; The selection handed to the executing evaluation, via the
+    ;; operand primitive (docs/commands.md D2): an explicit ctx
+    ;; `operand` wins -- EXECUTE WITH (ctrl+shift+enter) pools one from
+    ;; this view or the previously focused pane, so the operand may
+    ;; live in ANOTHER buffer than the one running the query -- else
+    ;; the ctx's own start/end (an attached REPL, a config `bind!`).
+    ;; A selection that IS the program (ctrl+enter over it) is never
+    ;; the operand: select the text, write the query elsewhere.
+    proc selection {} {
+        let ctx [weft::image::ctx]
+        let o [weft::cmd::operand-of $ctx]
+
+        if [not [and [has? $o buffer] [has? $o start]]] {
+            error "weft::q::selection: no selection handed to this evaluation (attach the REPL, or EXECUTE WITH a selection outside the query line)"
+        }
+
+        let bid [get $o buffer]
+
+        if [not [weft::ws::buffer? $bid]] {
+            error "weft::q::selection: no buffer '$bid'"
+        }
+
+        return [weft::q::_plan #{type range buffer $bid
+            start [get $o start] end [get $o end]}]
+    }
+
+    proc range {bid start end} {
+        if [not [weft::ws::buffer? $bid]] {
+            error "weft::q::range: no buffer '$bid'"
+        }
+
+        return [weft::q::_plan #{type range buffer $bid
+            start $start end $end}]
+    }
+
+    ;; Annotation records as a source: ?layer? scopes, ?bid layer?
+    ;; addresses another buffer ("" layer = all layers).
+    proc annots {*rest} {
+        var bid ""
+        var layer ""
+
+        if [== 2 [len $rest]] {
+            set! bid [get $rest 0]
+            set! layer [get $rest 1]
+        } else {
+            set! bid [weft::q::_ctx-buffer annots]
+
+            if [== 1 [len $rest]] {
+                set! layer [get $rest 0]
+            }
+        }
+
+        return [weft::q::_plan #{type annots buffer $bid layer $layer}]
+    }
+
+    ;; ---- segmenters ----
+
+    proc lines {plan} {
+        weft::q::_check $plan lines
+
+        return [weft::q::_stage $plan #{op lines}]
+    }
+
+    ;; NB patterns are BRACED at the call site.  Accepts either a
+    ;; pattern string (compiled here once) or an already-compiled
+    ;; regex handle (Q5 convergence: plumb hands its rule regexes
+    ;; straight in, keeping its compile-once contract).
+    proc matches {plan pattern} {
+        weft::q::_check $plan matches
+
+        if [not $weft_have_regex] {
+            error "unsupported: weft::q::matches needs the regex package"
+        }
+
+        if [string? $pattern] {
+            return [weft::q::_stage $plan #{op matches pattern $pattern
+                compiled [Regex::compile $pattern]}]
+        }
+
+        return [weft::q::_stage $plan
+            #{op matches pattern "<compiled>" compiled $pattern}]
+    }
+
+    proc split {plan sep} {
+        weft::q::_check $plan split
+
+        if [empty? $sep] {
+            error "weft::q::split: separator must be non-empty"
+        }
+
+        return [weft::q::_stage $plan #{op split sep $sep}]
+    }
+
+    proc fields {plan} {
+        weft::q::_check $plan fields
+
+        return [weft::q::_stage $plan #{op fields}]
+    }
+
+    ;; ---- sequence operators ----
+
+    proc select {plan fn} {
+        weft::q::_check $plan select
+
+        return [weft::q::_stage $plan #{op select fn $fn}]
+    }
+
+    proc reject {plan fn} {
+        weft::q::_check $plan reject
+
+        return [weft::q::_stage $plan #{op reject fn $fn}]
+    }
+
+    proc take {plan n} {
+        weft::q::_check $plan take
+
+        return [weft::q::_stage $plan #{op take n $n}]
+    }
+
+    proc drop {plan n} {
+        weft::q::_check $plan drop
+
+        return [weft::q::_stage $plan #{op drop n $n}]
+    }
+
+    proc map {plan fn} {
+        weft::q::_check $plan map
+
+        return [weft::q::_stage $plan #{op map fn $fn}]
+    }
+
+    proc derive {plan name fn} {
+        weft::q::_check $plan derive
+
+        return [weft::q::_stage $plan #{op derive name $name fn $fn}]
+    }
+
+    ;; Capture access (R0 landed: Regex::search offset pairs).
+    ;; cap = group i's absolute range; cap-text slices it from the
+    ;; record's own text.  Unmatched groups: cap returns the (-1 -1)
+    ;; sentinel dict, cap-text "".
+    proc cap {rec i} {
+        if [not [has? $rec caps]] {
+            error "weft::q::cap: not a match record (no captures)"
+        }
+
+        let caps [get $rec caps]
+
+        if [or [< $i 1] [> $i [len $caps]]] {
+            error "weft::q::cap: no group $i (match has [len $caps])"
+        }
+
+        return [get $caps [- $i 1]]
+    }
+
+    proc cap-text {rec i} {
+        let c [weft::q::cap $rec $i]
+
+        if [< [get $c start] 0] { return "" }
+
+        let rel [- [get $c start] [get $rec start]]
+
+        return [String::range [get $rec text] $rel \
+            [- [get $c end] [get $rec start]]]
+    }
+
+    ;; ---- inspection (no evaluation) ----
+
+    proc _stage-word {st} {
+        let op [get $st op]
+
+        if [== $op matches] { return "matches [get $st pattern]" }
+        if [== $op split] { return "split [get $st sep]" }
+        if [== $op take] { return "take [get $st n]" }
+        if [== $op drop] { return "drop [get $st n]" }
+        if [== $op derive] { return "derive [get $st name]" }
+
+        return "$op"
+    }
+
+    proc _source-word {src} {
+        let t [get $src type]
+
+        if [== $t range] {
+            return "range [get $src buffer] \[[get $src start], [get $src end])"
+        }
+
+        if [== $t annots] {
+            var l [get $src layer]
+
+            if [empty? $l] { set! l "*" }
+
+            return "annots [get $src buffer] layer $l"
+        }
+
+        return "doc [get $src buffer]"
+    }
+
+    ;; One line for humans -- the REPL echoes this for kind=query.
+    proc describe {plan} {
+        var parts ([weft::q::_source-word [get $plan source]])
+
+        foreach st [get $plan stages] {
+            set! parts [List::push $parts [weft::q::_stage-word $st]]
+        }
+
+        return "#<query [String::join $parts " | "]>"
+    }
+
+    proc explain {plan} {
+        weft::q::_check $plan explain
+
+        var out "query (plan as data; nothing has run)\n"
+        set! out "$out  source: [weft::q::_source-word [get $plan source]]\n"
+
+        foreach st [get $plan stages] {
+            set! out "$out  [weft::q::_stage-word $st]\n"
+        }
+
+        set! out "$out;; terminals: preview ?n? | count | explain\n"
+
+        return $out
+    }
+
+    ;; ---- the snapshot evaluator ----
+    ;; Run state is namespace-local (one run at a time; recursion
+    ;; within a run shares it by design, like the wire decoder).
+
+    var _text ""       ;; document snapshot
+    var _halt 0        ;; set by take exhaustion / sink bound
+    var _counts #{}    ;; stage index -> take/drop counter
+    var _need_text 0
+    var _sink ()       ;; collected records
+    var _bound -1      ;; sink capacity (-1 = unbounded)
+    var _total 0       ;; records that reached the sink counter
+    var _bound_hit 0   ;; sink bound stopped the run (total is a floor)
+
+    proc _rec-text {rec} {
+        if [has? $rec text] { return [get $rec text] }
+
+        return [String::range $_text [get $rec start] [get $rec end]]
+    }
+
+    proc _attach {rec} {
+        if [and $_need_text [not [has? $rec text]]] {
+            return [put $rec text
+                [String::range $_text [get $rec start] [get $rec end]]]
+        }
+
+        return $rec
+    }
+
+    ;; Push one record through stages[idx..]; terminal sink at the end.
+    proc _push {stages idx rec} {
+        if $_halt { return "" }
+
+        if [>= $idx [len $stages]] {
+            set! _total [+ $_total 1]
+
+            if [or [== $_bound -1] \
+                   [and [>= $_bound 0] [< [len $_sink] $_bound]]] {
+                set! _sink [List::push $_sink [weft::q::_attach $rec]]
+            }
+
+            if [and [>= $_bound 0] [>= [len $_sink] $_bound]] {
+                ;; Bounded terminals stop the whole run here; count
+                ;; runs unbounded and never trips this.
+                set! _halt 1
+                set! _bound_hit 1
+            }
+
+            return ""
+        }
+
+        let st [get $stages $idx]
+        let op [get $st op]
+
+        if [== $op lines] {
+            return [weft::q::_seg-pieces $stages $idx $rec "\n" line]
+        }
+
+        if [== $op split] {
+            ;; Single-byte separators take the copy-free reconstruction
+            ;; path; multi-byte ones need the literal find loop
+            ;; (String::split is char-set semantics).
+            if [== 1 [String::length [get $st sep]]] {
+                return [weft::q::_seg-pieces $stages $idx $rec \
+                    [get $st sep] piece]
+            }
+
+            return [weft::q::_seg-split $stages $idx $rec [get $st sep]]
+        }
+
+        if [== $op fields] {
+            return [weft::q::_seg-fields $stages $idx $rec]
+        }
+
+        if [== $op matches] {
+            return [weft::q::_seg-matches $stages $idx $rec [get $st compiled]]
+        }
+
+        if [== $op select] {
+            let r2 [put [weft::q::_attach $rec] text [weft::q::_rec-text $rec]]
+
+            if [apply [get $st fn] $r2] {
+                return [weft::q::_push $stages [+ $idx 1] $r2]
+            }
+
+            return ""
+        }
+
+        if [== $op reject] {
+            let r2 [put $rec text [weft::q::_rec-text $rec]]
+
+            if [not [apply [get $st fn] $r2]] {
+                return [weft::q::_push $stages [+ $idx 1] $r2]
+            }
+
+            return ""
+        }
+
+        if [== $op drop] {
+            var c 0
+
+            if [has? $_counts "$idx"] { set! c [get $_counts "$idx"] }
+
+            set! _counts [put $_counts "$idx" [+ $c 1]]
+
+            if [< $c [get $st n]] { return "" }
+
+            return [weft::q::_push $stages [+ $idx 1] $rec]
+        }
+
+        if [== $op take] {
+            var c 0
+
+            if [has? $_counts "$idx"] { set! c [get $_counts "$idx"] }
+
+            if [>= $c [get $st n]] {
+                set! _halt 1
+
+                return ""
+            }
+
+            set! _counts [put $_counts "$idx" [+ $c 1]]
+            weft::q::_push $stages [+ $idx 1] $rec
+
+            ;; The last permitted record halts segmentation upstream.
+            if [>= [+ $c 1] [get $st n]] {
+                set! _halt 1
+            }
+
+            return ""
+        }
+
+        if [== $op map] {
+            let r2 [put $rec text [weft::q::_rec-text $rec]]
+
+            return [weft::q::_push $stages [+ $idx 1]
+                [put $r2 value [apply [get $st fn] $r2]]]
+        }
+
+        if [== $op derive] {
+            let r2 [put $rec text [weft::q::_rec-text $rec]]
+
+            return [weft::q::_push $stages [+ $idx 1]
+                [put $r2 [get $st name] [apply [get $st fn] $r2]]]
+        }
+
+        error "weft::q: unknown stage op '$op'"
+    }
+
+    proc _sub {rec s e kind} {
+        return #{buffer [get $rec buffer] revision [get $rec revision]
+            start $s end $e kind $kind}
+    }
+
+    ;; Literal multi-byte separator segmentation via a String::find
+    ;; tail loop (String::split is CHAR-SET semantics -- "\n\n" would
+    ;; split on every newline; the from-offset find that avoids tail
+    ;; copies is lcl #76).  Trailing separator yields no empty final
+    ;; piece; interior empties are real records.
+    proc _seg-split {stages idx rec sep} {
+        let text [weft::q::_rec-text $rec]
+        let sl [String::length $sep]
+        var base 0
+        var rest $text
+        var going 1
+
+        while [and $going [not $_halt]] {
+            let hit [String::find $rest $sep]
+
+            if [< $hit 0] {
+                set! going 0
+
+                if [not [and [empty? $rest] [> $base 0]]] {
+                    weft::q::_push $stages [+ $idx 1] \
+                        [put [weft::q::_sub $rec \
+                            [+ [get $rec start] $base] \
+                            [+ [get $rec start] [+ $base [String::length $rest]]] \
+                            piece] text $rest]
+                }
+            } else {
+                weft::q::_push $stages [+ $idx 1] \
+                    [put [weft::q::_sub $rec \
+                        [+ [get $rec start] $base] \
+                        [+ [get $rec start] [+ $base $hit]] \
+                        piece] text [String::range $rest 0 $hit]]
+
+                set! base [+ $base [+ $hit $sl]]
+                set! rest [String::range $rest [+ $hit $sl] \
+                    [String::length $rest]]
+            }
+        }
+
+        return ""
+    }
+
+    ;; Single-char separator segmentation (lines) with offset
+    ;; reconstruction over String::split -- O(n), no tail copies.
+    ;; A trailing separator yields no empty final piece; interior
+    ;; empties are real records.
+    proc _seg-pieces {stages idx rec sep kind} {
+        let text [weft::q::_rec-text $rec]
+        let pieces [String::split $text $sep]
+        let np [len $pieces]
+        let sl [String::length $sep]
+        var base [get $rec start]
+        var i 0
+
+        while [and [< $i $np] [not $_halt]] {
+            let p [get $pieces $i]
+            let e [+ $base [String::length $p]]
+
+            if [not [and [== $i [- $np 1]] [empty? $p]]] {
+                weft::q::_push $stages [+ $idx 1] \
+                    [put [weft::q::_sub $rec $base $e $kind] text $p]
+            }
+
+            set! base [+ $e $sl]
+            set! i [+ $i 1]
+        }
+
+        return ""
+    }
+
+    ;; Whitespace-run field segmentation (space/tab/newline).
+    proc _seg-fields {stages idx rec} {
+        let text [weft::q::_rec-text $rec]
+        let n [String::length $text]
+        let base [get $rec start]
+        var i 0
+        var fs -1
+
+        while [and [<= $i $n] [not $_halt]] {
+            var ws 1
+
+            if [< $i $n] {
+                let c [String::index $text $i]
+                set! ws [or [or [== $c " "] [== $c "\t"]]
+                    [or [== $c "\n"] [== $c "\r"]]]
+            }
+
+            if [and [not $ws] [< $fs 0]] {
+                set! fs $i
+            }
+
+            if [and $ws [>= $fs 0]] {
+                weft::q::_push $stages [+ $idx 1] \
+                    [put [weft::q::_sub $rec [+ $base $fs] [+ $base $i] field]
+                        text [String::range $text $fs $i]]
+                set! fs -1
+            }
+
+            set! i [+ $i 1]
+        }
+
+        return ""
+    }
+
+    ;; Match segmentation on Regex::search (R0): resumable ?from?
+    ;; with ABSOLUTE offsets -- no tail copies -- and group offset
+    ;; pairs, so match records carry capture RANGES (`caps`, absolute;
+    ;; unmatched groups keep the (-1 -1) sentinel).  Zero-width
+    ;; matches yield no record and advance by one (the documented
+    ;; progress rule).
+    proc _seg-matches {stages idx rec compiled} {
+        let text [weft::q::_rec-text $rec]
+        let n [String::length $text]
+        let base [get $rec start]
+        var pos 0
+        var going 1
+
+        while [and $going [not $_halt]] {
+            if [> $pos $n] {
+                set! going 0
+            } else {
+                let m [Regex::search $compiled $text $pos]
+
+                if [== 0 [len $m]] {
+                    set! going 0
+                } else {
+                    let span [get $m 0]
+                    let so [get $span 0]
+                    let eo [get $span 1]
+
+                    if [> $eo $so] {
+                        var caps ()
+                        var gi 1
+
+                        while [< $gi [len $m]] {
+                            let g [get $m $gi]
+
+                            if [< [get $g 0] 0] {
+                                set! caps [List::push $caps \
+                                    #{start -1 end -1}]
+                            } else {
+                                set! caps [List::push $caps \
+                                    #{start [+ $base [get $g 0]]
+                                        end [+ $base [get $g 1]]}]
+                            }
+
+                            set! gi [+ $gi 1]
+                        }
+
+                        weft::q::_push $stages [+ $idx 1] \
+                            [put [put [weft::q::_sub $rec [+ $base $so] \
+                                    [+ $base $eo] match] caps $caps] \
+                                text [String::range $text $so $eo]]
+
+                        set! pos $eo
+                    } else {
+                        set! pos [+ $so 1]
+                    }
+                }
+            }
+        }
+
+        return ""
+    }
+
+    ;; Resolve the source, snapshot the document, and stream records
+    ;; into the sink.  Returns #{records .. revision .. total ..}.
+    ;; `total` counts every record that survived the stages, even past
+    ;; a sink bound (count uses it; preview reports truncation).
+    proc _run {plan bound} {
+        weft::q::_check $plan run
+
+        let src [get $plan source]
+        let bid [get $src buffer]
+
+        if [not [weft::ws::buffer? $bid]] {
+            error "weft::q: buffer '$bid' is gone (plans hold ids, not buffers)"
+        }
+
+        let doc [weft::ws::buffer-doc $bid]
+        let rev [Lk::doc_revision $doc]
+        let stages [get $plan stages]
+
+        set! _text [Lk::doc_text $doc]
+        set! _halt 0
+        set! _counts #{}
+        set! _sink ()
+        set! _bound $bound
+        set! _total 0
+        set! _bound_hit 0
+
+        ;; Attach text eagerly only when something will read it:
+        ;; predicate/derivation stages, and every collecting terminal
+        ;; (records may be consumed after the snapshot is released).
+        ;; Count-mode (-2) stays textless unless a stage needs it.
+        set! _need_text 0
+
+        foreach st $stages {
+            if [has? #{select 1 reject 1 map 1 derive 1} [get $st op]] {
+                set! _need_text 1
+            }
+        }
+
+        if [not [== $bound -2]] {
+            set! _need_text 1
+        }
+
+        if [== [get $src type] annots] {
+            let store [weft::ws::buffer-store $bid]
+
+            foreach id [Lk::annot_in_range $store 0 [String::length $_text]] {
+                let al [Lk::annot_layer $store $id]
+
+                if [and [not $_halt]
+                        [or [empty? [get $src layer]]
+                            [== $al [get $src layer]]]] {
+                    let span [Lk::annot_span $store $id]
+
+                    weft::q::_push $stages 0 \
+                        [put [put #{buffer $bid revision $rev
+                            start [get $span 0] end [get $span 1]
+                            kind annot} layer $al]
+                            meta [Lk::annot_meta_all $store $id]]
+                }
+            }
+        } else {
+            var s0 0
+            var e0 [String::length $_text]
+
+            if [== [get $src type] range] {
+                set! s0 [get $src start]
+                set! e0 [get $src end]
+            }
+
+            weft::q::_push $stages 0 \
+                #{buffer $bid revision $rev start $s0 end $e0 kind extent}
+        }
+
+        let out #{records $_sink revision $rev total $_total
+            truncated $_bound_hit}
+
+        set! _text ""
+        set! _sink ()
+
+        return $out
+    }
+
+    ;; ---- terminals ----
+
+    ;; Count-only mode (-2) streams without storing records -- no
+    ;; intermediate list of the document, per the section 14 rule.
+    proc count {plan} {
+        return [get [weft::q::_run $plan -2] total]
+    }
+
+    proc _row-text {rec} {
+        var t ""
+
+        if [has? $rec value] {
+            ;; map values may be typed numbers -- render for the row.
+            set! t [String::from [get $rec value]]
+        } else {
+            set! t [weft::q::_rec-text $rec]
+        }
+
+        set! t [String::replace $t "\n" " "]
+
+        if [> [String::length $t] 60] {
+            set! t "[String::range $t 0 57].."
+        }
+
+        return $t
+    }
+
+    proc preview {plan *rest} {
+        var n 10
+
+        if [== 1 [len $rest]] { set! n [get $rest 0] }
+
+        let r [weft::q::_run $plan $n]
+        let recs [get $r records]
+        var more ""
+
+        if [get $r truncated] { set! more "+" }
+
+        ;; No comment prefix: preview is a VALUE; the REPL's echo adds
+        ;; its own ;; framing.
+        var out "[weft::q::describe $plan] @ rev [get $r revision] -- [len $recs] of [get $r total]$more\n"
+
+        foreach rec $recs {
+            var extra ""
+
+            if [has? $rec layer] { set! extra " [get $rec layer]" }
+
+            set! out "$out\[[get $rec start], [get $rec end]) [get $rec kind]$extra: [weft::q::_row-text $rec]\n"
+        }
+
+        if [== 0 [len $recs]] {
+            set! out "$out(no records)\n"
+        }
+
+        return $out
+    }
+
+    ;; Bounded record list for programmatic use and the Q2/Q3 sinks --
+    ;; a materialized result, not an iterator protocol.
+    proc _records {plan n} {
+        return [weft::q::_run $plan $n]
+    }
+
+    ;; ---- the annotation sink (Q2) ----
+    ;;
+    ;; annotate turns a plan into a LIVE RULE: a producer in the
+    ;; existing registry re-runs the plan on every document revision
+    ;; (and on rule replacement, via the generation token) and
+    ;; drop-rebuilds its layer -- v1 reconciliation per section 14;
+    ;; identity-preserving reconciliation arrives later inside this
+    ;; sink without touching the query API.  Each annotation carries
+    ;; provenance meta (the query one-liner + record kind).
+    ;;
+    ;; The layer becomes producer-OWNED, so persistence classifies it
+    ;; derived and never writes it (P5): rules live in the image;
+    ;; persisting their SOURCE FORMS is the plan's P5/section 14
+    ;; convergence item.
+
+    var rules #{}    ;; layer -> #{plan .. style .. gen N}
+
+    proc annotated-layers {} {
+        return [List::sort [Dict::keys $rules]]
+    }
+
+    proc style-of {layer} {
+        if [not [has? $rules $layer]] { return #{} }
+
+        return [get [get $rules $layer] style]
+    }
+
+    proc _rule-gen {layer} {
+        if [not [has? $rules $layer]] { return "" }
+
+        return [get [get $rules $layer] gen]
+    }
+
+    proc _annotate-scan! {ctx layer} {
+        let store [get $ctx store]
+        let plan [get [get $rules $layer] plan]
+
+        foreach id [Lk::annot_by_layer $store $layer] {
+            Lk::annot_remove $store $id
+        }
+
+        let tag [weft::q::describe $plan]
+
+        foreach rec [get [weft::q::_run $plan -1] records] {
+            Lk::annot_add $store [get $rec start] [get $rec end] $layer \
+                #{q $tag kind [get $rec kind]}
+        }
+
+        return ""
+    }
+
+    ;; annotate plan layer ?style? -- style is a span-style dict
+    ;; (#{bg (..)} / #{fg (..) underline 1}); the shell projects it.
+    proc annotate {plan layer *rest} {
+        weft::q::_check $plan annotate
+
+        if [and [has? [weft::producer::owned-layers] $layer] \
+                [not [has? $rules $layer]]] {
+            error "weft::q::annotate: layer '$layer' belongs to another producer"
+        }
+
+        var style #{fg (240 200 120) underline 1}
+
+        if [== 1 [len $rest]] { set! style [get $rest 0] }
+
+        var gen 1
+
+        if [has? $rules $layer] {
+            set! gen [+ 1 [get [get $rules $layer] gen]]
+        }
+
+        set! rules [put $rules $layer #{plan $plan style $style gen $gen}]
+
+        weft::producer::define! #{name "q-$layer" layers ($layer)
+            update [lambda {ctx} {
+                return [weft::q::_annotate-scan! $ctx $layer]
+            }]
+            generation [lambda {} { return [weft::q::_rule-gen $layer] }]}
+        weft::producer::attach! [get [get $plan source] buffer] "q-$layer"
+
+        return "annotating '$layer' <- [weft::q::describe $plan]"
+    }
+
+    ;; ---- the edit sink (Q3) ----
+    ;;
+    ;; replace maps each record to its replacement text and pends the
+    ;; result as a weft::transform PLAN -- diff preview, staleness
+    ;; refusal, apply/reject, one-transaction apply all reused
+    ;; unchanged (section 14 rule 4).  Queries are snapshots; effects
+    ;; are transactions (rule 3): the plan carries the revision the
+    ;; query saw, and weft::transform::apply refuses when the document
+    ;; has moved.  Never mutates anything here.
+    ;;
+    ;; fn receives the record (text + caps attached) and returns the
+    ;; new text; returning the record's own text drops the edit.
+
+    proc replace {plan fn} {
+        weft::q::_check $plan replace
+
+        let r [weft::q::_run $plan -1]
+        var edits ()
+        var bad ""
+
+        foreach rec [get $r records] {
+            if [empty? $bad] {
+                var nt ""
+                var fe ""
+
+                if [not [== 0 [catch { apply $fn $rec } nt fe]]] {
+                    set! bad [weft::error::from-caught $fe]
+                } else {
+                    ;; Replacement text is TEXT: a numeric-valued fn
+                    ;; (renumbering) yields a typed int, which the edit
+                    ;; plan's diff/apply would refuse.
+                    let ntx [String::from $nt]
+
+                    if [not [== $ntx [get $rec text]]] {
+                        set! edits [List::push $edits #{start [get $rec start]
+                            end [get $rec end] text $ntx}]
+                    }
+                }
+            }
+        }
+
+        if [not [empty? $bad]] {
+            return #{kind error error $bad}
+        }
+
+        return [weft::transform::propose! [weft::q::describe $plan] \
+            [get [get $plan source] buffer] $edits]
+    }
+
+    ;; ---- projections (Q4) ----
+    ;;
+    ;; show = the regenerated, source-linked projection: ONE ordinary
+    ;; buffer (*query*), read-only BY POLICY (keystrokes rejected at
+    ;; the editor; this rewrite and any transform still apply), whose
+    ;; header carries the query + snapshot revision and whose rows
+    ;; carry jump presentations back to their source ranges.
+    ;; Re-running a show replaces the content -- section 14 rule 6.
+    ;;
+    ;; materialize = an independent EDITABLE snapshot: a fresh buffer
+    ;; of the record texts, no links, no policy -- the "dump matches
+    ;; to a scratch buffer and poke at them" flow.
+
+    var _mat_n 0
+
+    proc _show-buffer {} {
+        let existing [weft::ws::buffer-for-name "*query*"]
+
+        if [not [empty? $existing]] { return $existing }
+
+        return [weft::ws::buffer-create! "*query*" "" ""]
+    }
+
+    proc show {plan *rest} {
+        weft::q::_check $plan show
+
+        var n 200
+
+        if [== 1 [len $rest]] { set! n [get $rest 0] }
+
+        let r [weft::q::_run $plan $n]
+        let recs [get $r records]
+        let src [get [get $plan source] buffer]
+        let bid [weft::q::_show-buffer]
+        let doc [weft::ws::buffer-doc $bid]
+        let store [weft::ws::buffer-store $bid]
+
+        var more ""
+
+        if [get $r truncated] { set! more "+" }
+
+        var text ";; [weft::q::describe $plan]\n;; @ rev [get $r revision] -- [len $recs] of [get $r total]$more rows; re-run to refresh; right-click a row jumps\n\n"
+        var rows ()
+
+        foreach rec $recs {
+            let row "\[[get $rec start], [get $rec end]) [get $rec kind]: [weft::q::_row-text $rec]"
+
+            set! rows [List::push $rows #{s [String::length $text]
+                e [+ [String::length $text] [String::length $row]]
+                v #{buffer $src start [get $rec start] end [get $rec end]}}]
+            set! text "$text$row\n"
+        }
+
+        if [== 0 [len $recs]] {
+            set! text "$text(no records)\n"
+        }
+
+        Lk::doc_transact $doc {
+            if [> [Lk::doc_len $doc] 0] {
+                Lk::doc_delete $doc 0 [Lk::doc_len $doc]
+            }
+
+            Lk::doc_insert $doc 0 $text
+        }
+
+        var lr ""
+        var le ""
+
+        catch { Lk::annot_layer_register $store "qjump" } lr le
+
+        foreach id [Lk::annot_by_layer $store "qjump"] {
+            Lk::annot_remove $store $id
+        }
+
+        foreach row $rows {
+            let aid [Lk::annot_add $store [get $row s] [get $row e] \
+                "qjump" #{}]
+
+            weft::ws::present! $store $aid "qjump" [get $row v]
+        }
+
+        weft::ws::buffer-set-editable! $bid 0
+
+        return #{kind show buffer $bid shown [len $recs]
+            total [get $r total]}
+    }
+
+    proc materialize {plan *rest} {
+        weft::q::_check $plan materialize
+
+        var n -1
+
+        if [== 1 [len $rest]] { set! n [get $rest 0] }
+
+        let r [weft::q::_run $plan $n]
+        var text ""
+
+        foreach rec [get $r records] {
+            var t [weft::q::_rec-text $rec]
+
+            if [has? $rec value] { set! t "[get $rec value]" }
+
+            set! text "$text$t\n"
+        }
+
+        set! _mat_n [+ $_mat_n 1]
+
+        let bid [weft::ws::buffer-create! "*mat-$_mat_n*" "" $text]
+
+        return #{kind show buffer $bid shown [len [get $r records]]
+            total [get $r total]}
+    }
+
+    ;; A jump presentation fired (right-click on a show row): surface
+    ;; the source buffer in the acting pane at the record's range.
+    proc jump! {value ctx} {
+        let bid [get $value buffer]
+
+        if [not [weft::ws::buffer? $bid]] {
+            return [weft::error::make invalid-args
+                "the source buffer of this row is gone"]
+        }
+
+        let pane [weft::ctx::field $ctx pane]
+        let vid [weft::ws::pane-show-buffer! $pane $bid]
+
+        weft::ws::view-goto! $vid [get $value start]
+
+        return ""
+    }
+
+    ;; Retire a rule: detach its producer (which clears the layer) and
+    ;; forget it.
+    proc unannotate {layer} {
+        if [not [has? $rules $layer]] {
+            error "weft::q::unannotate: no rule owns layer '$layer'"
+        }
+
+        let bid [get [get [get [get $rules $layer] plan] source] buffer]
+
+        weft::producer::detach! $bid "q-$layer"
+        set! rules [del $rules $layer]
+
+        return "layer '$layer' retired"
+    }
+}

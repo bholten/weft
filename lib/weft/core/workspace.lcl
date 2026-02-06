@@ -1,0 +1,1073 @@
+;;; weft::ws -- the workspace kernel (plan section 6).
+;;;
+;;; Buffer / View / Pane / Split / Workspace, with the state classes and
+;;; stable identities the plan requires:
+;;;
+;;;   Buffer  durable:   id, path (resource identity), document content
+;;;                      (held by the lk doc), saved revision, filetype
+;;;           derived:   (producer state, layers -- later phases)
+;;;           ephemeral: doc/history handles, last-view snapshot
+;;;   View    id, buffer id, editor handle, view-local state
+;;;   Pane    tree node holding one view
+;;;   Split   tree node: axis + ratio (authoritative HERE, not in lk)
+;;;
+;;; Buffers exist with no views; several views may share a buffer;
+;;; closing a pane destroys its view, never implicitly its buffer;
+;;; moving a view through the tree never recreates its editor.
+;;;
+;;; Editor creation is host work (a windowed shell makes lk editors, the
+;;; test host makes fakes), so the kernel takes an editor-hooks dict at
+;;; init and stays headless-testable:
+;;;
+;;;   #{make     [lambda {doc hist} -> editor-handle]
+;;;     free     [lambda {ed}]
+;;;     snapshot [lambda {ed} -> #{cursor N ...}]
+;;;     restore  [lambda {ed snap}]}
+;;;
+;;; All mutating procs end in `!`.  Procs return weft::error values on
+;;; failure (callers test with weft::error::error?) -- never raise for
+;;; expectable conditions.
+
+namespace weft::ws {
+
+    var hooks #{}
+    var buffers #{}
+    var views #{}
+    var nodes #{}
+    var root ""
+    var focused ""
+
+    ;; ---- lifecycle ----
+
+    proc init! {editor_hooks} {
+        set! hooks $editor_hooks
+        set! buffers #{}
+        set! views #{}
+        set! nodes #{}
+        set! root ""
+        set! focused ""
+        return 1
+    }
+
+    proc _new-id {kind} {
+        let t [weft::cap::invoke "id.new" #{} #{}]
+        return "$kind-[weft::task::result $t]"
+    }
+
+    ;; ---- buffers ----
+
+    ;; The filetype KEY: a path's extension, or -- for a buffer with no
+    ;; file behind it -- the buffer's own NAME.  Filetype keys are
+    ;; opaque strings to config (`weft::config::filetype!`), so the
+    ;; machine buffers configure exactly like extensions do:
+    ;;
+    ;;   weft::config::filetype! "*lcl*" #{lang lcl}
+    ;;
+    ;; which is how the REPL and *scratch* get syntax highlighting
+    ;; without inventing a second mapping mechanism.
+    proc _filetype {name path} {
+        if [empty? $path] { return $name }
+
+        let parts [String::split $path "."]
+        if [< [len $parts] 2] { return "" }
+        return ".[get $parts [- [len $parts] 1]]"
+    }
+
+    ;; Create a buffer from text.  A freshly created buffer is clean:
+    ;; the history savepoint is marked at creation.  Every buffer gets
+    ;; an attached annotation store (derived state; producers register
+    ;; their layers on it).
+    proc buffer-create! {name path text} {
+        let id [weft::ws::_new-id buf]
+        let doc [Lk::doc_new $text]
+        let hist [Lk::history_new $doc]
+        let store [Lk::annot_store_new]
+
+        Lk::history_mark_saved $hist
+        Lk::annot_attach $store $doc
+
+        set! buffers [put $buffers $id #{id $id name $name path $path
+            filetype [weft::ws::_filetype $name $path]
+            doc $doc hist $hist store $store
+            saved_rev [Lk::doc_revision $doc]
+            editable 1
+            last_view #{}}]
+        return $id
+    }
+
+    ;; Read-only policy (P4-E Q4): a POLICY on the buffer's views,
+    ;; never a document property -- user keystrokes are rejected at
+    ;; the editor while programmatic transactions (producer rebuilds,
+    ;; projection refresh, transforms) keep working.
+    proc buffer-editable? {id} {
+        let b [weft::ws::buffer $id]
+
+        if [not [has? $b editable]] { return 1 }
+
+        return [get $b editable]
+    }
+
+    proc buffer-set-editable! {id flag} {
+        set! buffers [put $buffers $id
+            [put [weft::ws::buffer $id] editable $flag]]
+
+        foreach vid [weft::ws::views-of-buffer $id] {
+            apply [get $hooks set_editable] \
+                [weft::ws::view-editor $vid] $flag
+        }
+
+        return $flag
+    }
+
+    ;; Execution-context cwd (command pipeline stage A): where
+    ;; commands executed from this buffer run.  Explicit (`cd`) beats
+    ;; the file's containing directory beats the host cwd.  Lazy --
+    ;; nothing is computed until a command actually asks.
+    proc buffer-cwd {id} {
+        let b [weft::ws::buffer $id]
+
+        if [has? $b cwd] { return [get $b cwd] }
+
+        let p [get $b path]
+
+        if [not [empty? $p]] {
+            var last -1
+            var j 0
+
+            while [< $j [String::length $p]] {
+                if [== [String::index $p $j] "/"] { set! last $j }
+                set! j [+ $j 1]
+            }
+
+            if [> $last 0] { return [String::range $p 0 $last] }
+            if [== $last 0] { return "/" }
+        }
+
+        let t [weft::cap::invoke "fs.cwd" #{} #{}]
+
+        if [== [weft::task::state $t] succeeded] {
+            return [weft::task::result $t]
+        }
+
+        return ""
+    }
+
+    proc buffer-set-cwd! {id dir} {
+        set! buffers [put $buffers $id
+            [put [weft::ws::buffer $id] cwd $dir]]
+        return $dir
+    }
+
+    ;; ---- the ONE path resolve point (plan section 5) ----
+    ;; Lexical normalization: collapse `//`, drop `.`, fold `..`.
+    ;; Portable and deterministic (no filesystem, so the test host and
+    ;; a web host agree with posix); symlinks are deliberately NOT
+    ;; chased -- the name the user typed is the name they see.
+    proc path-normalize {p} {
+        let abs [== 0 [String::find $p "/"]]
+        var parts ()
+
+        foreach seg [String::split $p "/"] {
+            if [or [empty? $seg] [== $seg "."]] { continue }
+
+            if [== $seg ".."] {
+                if [> [len $parts] 0] {
+                    set! parts [List::slice $parts 0 [- [len $parts] 1]]
+                } else {
+                    if [not $abs] { set! parts [List::push $parts ".."] }
+                }
+                continue
+            }
+
+            set! parts [List::push $parts $seg]
+        }
+
+        let body [String::join $parts "/"]
+
+        if $abs { return "/$body" }
+        if [empty? $body] { return "." }
+
+        return $body
+    }
+
+    ;; Resolve a user-facing path to the buffer's identity: absolute
+    ;; against the ctx buffer's cwd (Acme's rule: `ls`, `weft::open`
+    ;; and the CLI mean the same directory), else the process cwd,
+    ;; then normalized.  Every path that becomes a buffer's `path` --
+    ;; open, session restore, plumb, the CLI -- goes through here, so
+    ;; sessions and the annotation registry see one spelling.
+    proc resolve-path {path ctx} {
+        let p [String::from $path]
+
+        if [== 0 [String::find $p "/"]] {
+            return [weft::ws::path-normalize $p]
+        }
+
+        var cwd ""
+        let bid [weft::ctx::field $ctx buffer]
+
+        if [and [not [empty? $bid]] [weft::ws::buffer? $bid]] {
+            set! cwd [weft::ws::buffer-cwd $bid]
+        } else {
+            let t [weft::cap::invoke "fs.cwd" #{} $ctx]
+
+            if [== [weft::task::state $t] succeeded] {
+                set! cwd [weft::task::result $t]
+            }
+        }
+
+        if [empty? $cwd] { return [weft::ws::path-normalize $p] }
+
+        return [weft::ws::path-normalize "$cwd/$p"]
+    }
+
+    ;; Open a path as a buffer.  Resource identity: a second open of the
+    ;; same path returns the existing buffer id.  A path that does not
+    ;; exist yet becomes an empty buffer bound to that path.  The path
+    ;; is resolved first (resolve-path), so `weft README.md` from the
+    ;; repo root and `weft ../weft/README.md` from a sibling are the
+    ;; same buffer -- and the same session entry.
+    proc buffer-open! {rawpath ctx} {
+        let path [weft::ws::resolve-path $rawpath $ctx]
+        let existing [weft::ws::buffer-for-path $path]
+
+        if [not [empty? $existing]] { return $existing }
+
+        ;; The NAME keeps the user's spelling (normalized): `README.md`
+        ;; reads better in the status row and buffer menu than the
+        ;; absolute path, which is the buffer's identity, not its label.
+        let name [weft::ws::path-normalize [String::from $rawpath]]
+        let t [weft::cap::invoke "fs.read" #{path $path} $ctx]
+
+        if [== [weft::task::state $t] succeeded] {
+            let bid [weft::ws::buffer-create! $name $path
+                [weft::task::result $t]]
+
+            ;; Re-attach persisted annotations (exact when the file is
+            ;; unchanged since the recorded save, re-anchored
+            ;; otherwise; failures park as orphans).  Never blocks the
+            ;; open.
+            var _pr ""
+            var _pe ""
+
+            catch { weft::persist::annots-load! $bid } _pr _pe
+
+            return $bid
+        }
+
+        let et [weft::cap::invoke "fs.exists?" #{path $path} $ctx]
+
+        if [and [== [weft::task::state $et] succeeded] \
+                [not [weft::task::result $et]]] {
+            return [weft::ws::buffer-create! "$name (new)" $path ""]
+        }
+
+        return [weft::task::failure $t]
+    }
+
+    proc buffer {id} {
+        if [has? $buffers $id] { return [get $buffers $id] }
+
+        return #{}
+    }
+
+    proc buffer? {id} {
+        return [has? $buffers $id]
+    }
+
+    proc buffer-for-path {path} {
+        var found ""
+
+        foreach id [Dict::keys $buffers] {
+            if [== [get [get $buffers $id] path] $path] {
+                set! found $id
+            }
+        }
+
+        return $found
+    }
+
+    proc buffer-for-name {name} {
+        var found ""
+
+        foreach id [Dict::keys $buffers] {
+            if [== [get [get $buffers $id] name] $name] {
+                set! found $id
+            }
+        }
+
+        return $found
+    }
+
+    proc buffer-doc {id} {
+        return [get [weft::ws::buffer $id] doc]
+    }
+
+    ;; ---- resolution: human text -> buffer id (docs/buffers.md) ----
+    ;;
+    ;; ONE mechanism, a per-verb POLICY.  Three identities, never
+    ;; conflated: an id is the buffer's identity, a canonical path is
+    ;; the identity of the resource a file buffer represents, a name
+    ;; is presentation.  Names are not unique (foo.lcl opened from two
+    ;; cwds), so "exact name" can itself be ambiguous -- first match is
+    ;; never an answer; ambiguity is a structured value.
+    ;;
+    ;;   exact : id | exact name | canonical path (against the ctx cwd)
+    ;;   fuzzy : exact, then exact basename, unique basename prefix,
+    ;;           unique prefix of any path component of the name
+    ;;
+    ;; No substring matching: "unique today" is unstable (one more
+    ;; buffer changes what a command embedded in reusable text means),
+    ;; and `show uti` finding src/utilities/parser.lcl is search, not
+    ;; addressing.  Basename prefix keeps `show qol` -> docs/qol.md.
+
+    proc _basename {s} {
+        let parts [String::split $s "/"]
+        return [get $parts [- [len $parts] 1]]
+    }
+
+    proc _resolve-error {kind query cands} {
+        var names ()
+
+        foreach c $cands { set! names [List::push $names [get $c name]] }
+
+        var msg "no such buffer '$query'"
+
+        if [== $kind ambiguous-buffer] {
+            set! msg "ambiguous buffer '$query': [String::join $names {, }]"
+        }
+
+        return [weft::error::make-with invalid-args $msg
+            #{kind $kind query $query candidates $cands}]
+    }
+
+    ;; Buffers whose `field` (a lambda over the buffer-list row) passes
+    ;; `pred`, as candidate rows #{id name path}.
+    proc _resolve-scan {pred} {
+        var out ()
+
+        foreach row [weft::ws::buffer-list] {
+            if [apply $pred $row] {
+                set! out [List::push $out #{id [get $row id]
+                    name [get $row name] path [get $row path]}]
+            }
+        }
+
+        return $out
+    }
+
+    proc _resolve-step {query cands} {
+        if [== 1 [len $cands]] { return [get [get $cands 0] id] }
+        if [> [len $cands] 1] {
+            return [weft::ws::_resolve-error ambiguous-buffer $query $cands]
+        }
+        return ""
+    }
+
+    proc buffer-resolve {text policy ctx} {
+        let q [String::trim [String::from $text]]
+
+        if [empty? $q] {
+            return [weft::ws::_resolve-error no-such-buffer $q ()]
+        }
+
+        ;; 1. exact id
+        if [weft::ws::buffer? $q] { return $q }
+
+        ;; 2. exact name (all matches)
+        var r [weft::ws::_resolve-step $q [weft::ws::_resolve-scan \
+            [lambda {row} { return [== [get $row name] $q] }]]]
+        if [not [empty? $r]] { return $r }
+
+        ;; 3. canonical path against the ctx cwd
+        let cp [weft::ws::resolve-path $q $ctx]
+        let byp [weft::ws::buffer-for-path $cp]
+        if [not [empty? $byp]] { return $byp }
+
+        if [== $policy fuzzy] {
+            ;; 4. exact basename (of the path; the name for path-less)
+            set! r [weft::ws::_resolve-step $q [weft::ws::_resolve-scan \
+                [lambda {row} {
+                    var src [get $row path]
+                    if [empty? $src] { set! src [get $row name] }
+                    return [== [weft::ws::_basename $src] $q]
+                }]]]
+            if [not [empty? $r]] { return $r }
+
+            ;; 5. unique basename prefix
+            set! r [weft::ws::_resolve-step $q [weft::ws::_resolve-scan \
+                [lambda {row} {
+                    var src [get $row path]
+                    if [empty? $src] { set! src [get $row name] }
+                    return [== 0 [String::find [weft::ws::_basename $src] $q]]
+                }]]]
+            if [not [empty? $r]] { return $r }
+
+            ;; 6. unique prefix of any component of the NAME
+            set! r [weft::ws::_resolve-step $q [weft::ws::_resolve-scan \
+                [lambda {row} {
+                    var hit 0
+                    foreach part [String::split [get $row name] "/"] {
+                        if [== 0 [String::find $part $q]] { set! hit 1 }
+                    }
+                    return $hit
+                }]]]
+            if [not [empty? $r]] { return $r }
+        }
+
+        return [weft::ws::_resolve-error no-such-buffer $q ()]
+    }
+
+    ;; The *scratch* buffer, created on demand.  The evacuation
+    ;; fallback of last resort (weft::close) and the no-arguments
+    ;; landing buffer share it.
+    proc scratch-buffer! {} {
+        let have [weft::ws::buffer-for-name "*scratch*"]
+
+        if [not [empty? $have]] { return $have }
+
+        return [weft::ws::buffer-create! "*scratch*" "" ";; weft scratch\n"]
+    }
+
+
+    proc buffer-store {id} {
+        return [get [weft::ws::buffer $id] store]
+    }
+
+    proc buffer-hist {id} {
+        return [get [weft::ws::buffer $id] hist]
+    }
+
+    ;; Presentation attachment is host work (Lk::annot_present needs a
+    ;; ui handle); core producers reach it through this hook.
+    proc present! {store annot_id ptype value} {
+        return [apply [get $hooks present] $store $annot_id $ptype $value]
+    }
+
+    ;; Move a view's editor cursor through the restore hook (used by
+    ;; plumb actions; core never touches editors directly).
+    proc view-goto! {view_id pos} {
+        apply [get $hooks restore] [weft::ws::view-editor $view_id] \
+            #{cursor $pos}
+        return 1
+    }
+
+    ;; The view's selection as (start end), or () when none -- via the
+    ;; selection hook (lk editors and test fakes both provide one).
+    ;; With several carets this is the PRIMARY caret's selection.
+    proc view-selection {view_id} {
+        return [apply [get $hooks selection]
+            [weft::ws::view-editor $view_id]]
+    }
+
+    ;; ALL of the view's nonempty selections as ((start end) ...) in
+    ;; document order -- the caret set (lk multi-cursor).  Carets
+    ;; without a selection contribute nothing; one plain selection is
+    ;; a one-entry list.  The ranges are pairwise disjoint by the lk
+    ;; caret-set invariant.
+    proc view-selections {view_id} {
+        var out ()
+
+        foreach s [apply [get $hooks selections]
+                [weft::ws::view-editor $view_id]] {
+            if [== 2 [len $s]] {
+                set! out [List::push $out $s]
+            }
+        }
+
+        return $out
+    }
+
+    ;; The view's caret cursor positions in document order (>= 1).
+    proc view-carets {view_id} {
+        return [apply [get $hooks carets]
+            [weft::ws::view-editor $view_id]]
+    }
+
+    ;; Dirty = history is not at its savepoint.  Undoing back to the
+    ;; saved state reads clean; editing below the savepoint kills it,
+    ;; so the buffer stays dirty until the next save -- both by the
+    ;; lk_history savepoint contract.  (saved_rev is kept on the
+    ;; record as a staleness token for future consumers; revisions are
+    ;; opaque and strictly monotonic, so they cannot express this.)
+    proc buffer-dirty? {id} {
+        return [not [Lk::history_at_saved [get [weft::ws::buffer $id] hist]]]
+    }
+
+    proc buffer-save! {id ctx} {
+        let b [weft::ws::buffer $id]
+
+        if [empty? [get $b path]] {
+            return [weft::error::make invalid-args
+                "buffer [get $b name] has no path"]
+        }
+
+        let t [weft::cap::invoke "fs.write"
+            #{path [get $b path] text [Lk::doc_text [get $b doc]]} $ctx]
+
+        if [not [== [weft::task::state $t] succeeded]] {
+            return [weft::task::failure $t]
+        }
+
+        Lk::history_mark_saved [get $b hist]
+
+        set! buffers [put $buffers $id
+            [put $b saved_rev [Lk::doc_revision [get $b doc]]]]
+
+        ;; Authored annotations persist WITH the document save (P5-B).
+        ;; A persistence failure never fails the save -- the document
+        ;; is on disk; the error parks in weft::persist::last-error.
+        var _pr ""
+        var _pe ""
+
+        catch { weft::persist::annots-save! $id } _pr _pe
+
+        return 1
+    }
+
+    ;; Would buffer-close! refuse, other than for still-open views?
+    ;; Returns 1 or exactly the error it would return.  The views
+    ;; condition is excluded on purpose: evacuating them is the
+    ;; CALLER's job (weft::close), and this predicate is how it
+    ;; establishes, before touching any pane, that the destructive
+    ;; half cannot refuse afterwards (docs/buffers.md: once
+    ;; evacuation begins, buffer-close! cannot refuse).
+    proc buffer-closable? {id force} {
+        if [not [weft::ws::buffer? $id]] {
+            return [weft::error::make invalid-args "no such buffer $id"]
+        }
+
+        if [and [weft::ws::buffer-dirty? $id] [not $force]] {
+            return [weft::error::make denied
+                "[get [weft::ws::buffer $id] name] has unsaved changes -- `weft::close [get [weft::ws::buffer $id] name] force` to discard, ctrl+s to keep"]
+        }
+
+        return 1
+    }
+
+    ;; Close a buffer for real.  Refused while views show it or while it
+    ;; is dirty (pass force 1 to discard changes).  This is the ONLY way
+    ;; buffer content leaves the workspace.  Every refusal except the
+    ;; views one is buffer-closable?'s -- keep them in step.
+    proc buffer-close! {id force} {
+        if [> [len [weft::ws::views-of-buffer $id]] 0] {
+            return [weft::error::make invalid-args
+                "buffer $id still has views"]
+        }
+
+        let ok [weft::ws::buffer-closable? $id $force]
+
+        if [weft::error::error? $ok] { return $ok }
+
+        ;; A CLEAN buffer's annotations may have changed without any
+        ;; text edit (annotation stores are not in dirty tracking);
+        ;; persist them on the way out.  Dirty-and-forced discards
+        ;; annotation positions along with the text -- symmetrical.
+        ;; The mtime is only re-recorded when the file is still OURS
+        ;; (unchanged since our last save); an externally edited file
+        ;; keeps its stale record so the next load re-anchors.
+        if [not [weft::ws::buffer-dirty? $id]] {
+            let _cpath [get [weft::ws::buffer $id] path]
+
+            if [not [empty? $_cpath]] {
+                let _trust [== [weft::persist::file-mtime $_cpath] \
+                    [weft::persist::saved-mtime $_cpath]]
+                var _pr ""
+                var _pe ""
+
+                catch { weft::persist::annots-save! $id $_trust } _pr _pe
+            }
+        }
+
+        ;; Pending tasks streaming into this buffer die with it, and
+        ;; attached producers stop and release their resources.
+        weft::tasks::cancel-for-buffer! $id
+        weft::producer::detach-all! $id
+
+        set! buffers [del $buffers $id]
+
+        return 1
+    }
+
+    ;; Rebind a buffer's filetype (config may map filetypes to
+    ;; languages, wrap modes, rule scopes).  Bumps the metadata
+    ;; generation so producers that read buffer metadata rescan
+    ;; without waiting for an edit.
+    var meta_gen 0
+
+    proc meta-generation {} {
+        return $meta_gen
+    }
+
+    proc buffer-set-filetype! {id ft} {
+        set! buffers [put $buffers $id
+            [put [get $buffers $id] filetype $ft]]
+        set! meta_gen [+ $meta_gen 1]
+
+        return $ft
+    }
+
+    ;; Registry summary for menus/tests: list of
+    ;; #{id .. name .. path .. dirty 0/1 views N}
+    proc buffer-list {} {
+        var out [list]
+
+        foreach id [List::sort [Dict::keys $buffers]] {
+            let b [get $buffers $id]
+            set! out [List::push $out #{id $id
+                name [get $b name] path [get $b path]
+                dirty [weft::ws::buffer-dirty? $id]
+                views [len [weft::ws::views-of-buffer $id]]}]
+        }
+
+        return $out
+    }
+
+    ;; ---- views ----
+
+    ;; A view is a disposable projection of a buffer: its editor is
+    ;; created here and destroyed in view-close!, never serialized.
+    ;; The first view onto a buffer restores the buffer's last-view
+    ;; snapshot (cursor memory across close/reopen).
+    proc view-create! {buffer_id} {
+        let b [weft::ws::buffer $buffer_id]
+        let id [weft::ws::_new-id view]
+        let ed [apply [get $hooks make] [get $b doc] [get $b hist]
+            [get $b store] [get $b filetype]]
+
+        if [and [== 0 [len [weft::ws::views-of-buffer $buffer_id]]]
+                [> [len [Dict::keys [get $b last_view]]] 0]] {
+            apply [get $hooks restore] $ed [get $b last_view]
+        }
+
+        if [not [weft::ws::buffer-editable? $buffer_id]] {
+            apply [get $hooks set_editable] $ed 0
+        }
+
+        set! views [put $views $id #{id $id buffer $buffer_id editor $ed}]
+        return $id
+    }
+
+    proc view {id} {
+        if [has? $views $id] { return [get $views $id] }
+        return #{}
+    }
+
+    proc view-editor {id} {
+        return [get [weft::ws::view $id] editor]
+    }
+
+    proc view-buffer {id} {
+        return [get [weft::ws::view $id] buffer]
+    }
+
+    ;; Editor-state snapshot/restore through the hooks -- portable
+    ;; values (#{cursor N ..}), which is what lets sessions persist
+    ;; them (P5-D).
+    proc view-snapshot {id} {
+        return [apply [get $hooks snapshot] [weft::ws::view-editor $id]]
+    }
+
+    proc view-restore! {id snap} {
+        apply [get $hooks restore] [weft::ws::view-editor $id] $snap
+
+        return 1
+    }
+
+    ;; Place the view's cursor (collapsing any selection) -- the
+    ;; restore hook with a one-field snapshot, so core commands that
+    ;; leave the cursor somewhere deliberate (weft::template) stay
+    ;; host-portable.
+    proc view-set-cursor! {id pos} {
+        apply [get $hooks restore] [weft::ws::view-editor $id] #{cursor $pos}
+
+        return 1
+    }
+
+    proc views-of-buffer {buffer_id} {
+        var out [list]
+
+        foreach id [List::sort [Dict::keys $views]] {
+            if [== [get [get $views $id] buffer] $buffer_id] {
+                set! out [List::push $out $id]
+            }
+        }
+
+        return $out
+    }
+
+    ;; Destroy a view.  If it is the last view of its buffer, its editor
+    ;; state is snapshotted onto the buffer first.  The buffer survives
+    ;; regardless of dirtiness -- pane/view teardown can never lose text.
+    proc view-close! {id} {
+        let v [weft::ws::view $id]
+        let bid [get $v buffer]
+
+        if [== 1 [len [weft::ws::views-of-buffer $bid]]] {
+            set! buffers [put $buffers $bid [put [get $buffers $bid]
+                last_view [apply [get $hooks snapshot] [get $v editor]]]]
+        }
+
+        apply [get $hooks free] [get $v editor]
+
+        set! views [del $views $id]
+
+        return 1
+    }
+
+    ;; ---- pane/split tree ----
+    ;;
+    ;; Flat node registry + root id.  Pane node:
+    ;;   #{id .. kind pane view <view-id> parent <id|"">}
+    ;; Split node (binary; ratio is the a-side share, authoritative):
+    ;;   #{id .. kind split axis <h|v> ratio 0.5 a <id> b <id> parent ..}
+
+    proc tree-init! {view_id} {
+        let id [weft::ws::_new-id pane]
+
+        set! nodes #{}
+        set! nodes [put $nodes $id #{id $id kind pane view $view_id parent ""}]
+        set! root $id
+        set! focused $id
+
+        return $id
+    }
+
+    proc node {id} {
+        if [has? $nodes $id] { return [get $nodes $id] }
+
+        return #{}
+    }
+
+    proc pane-view {pane_id} {
+        return [get [weft::ws::node $pane_id] view]
+    }
+
+    proc _node-put! {id rec} {
+        set! nodes [put $nodes $id $rec]
+
+        return $id
+    }
+
+    proc _reparent! {id new_parent} {
+        weft::ws::_node-put! $id [put [weft::ws::node $id] parent $new_parent]
+        return $id
+    }
+
+    ;; Replace child `old` of split `parent_id` with `new`.
+    proc _replace-child! {parent_id old new} {
+        var p [weft::ws::node $parent_id]
+
+        if [== [get $p a] $old] {
+            set! p [put $p a $new]
+        } else {
+            set! p [put $p b $new]
+        }
+
+        weft::ws::_node-put! $parent_id $p
+
+        return 1
+    }
+
+    ;; Split a pane along axis (h = side by side, v = stacked), showing
+    ;; buffer_id in the new pane (pass the pane's own buffer for the
+    ;; two-views-one-buffer case).  The old pane keeps its view and id;
+    ;; a new split node takes its place in the tree.  Returns the new
+    ;; pane id; focus moves to it.
+    proc pane-split! {pane_id axis buffer_id} {
+        let old [weft::ws::node $pane_id]
+
+        if [not [== [get $old kind] pane]] {
+            return [weft::error::make invalid-args "$pane_id is not a pane"]
+        }
+
+        let vid [weft::ws::view-create! $buffer_id]
+        let new_pane [weft::ws::_new-id pane]
+        let split [weft::ws::_new-id split]
+        let parent [get $old parent]
+
+        weft::ws::_node-put! $new_pane \
+            #{id $new_pane kind pane view $vid parent $split}
+        weft::ws::_node-put! $split #{id $split kind split axis $axis
+            ratio 0.5 a $pane_id b $new_pane parent $parent}
+        weft::ws::_reparent! $pane_id $split
+
+        if [empty? $parent] {
+            set! root $split
+        } else {
+            weft::ws::_replace-child! $parent $pane_id $split
+        }
+
+        set! focused $new_pane
+
+        return $new_pane
+    }
+
+    ;; Close a pane: destroy its view (buffer survives), collapse its
+    ;; parent split so the sibling takes the split's place.  Closing the
+    ;; last pane is refused -- the shell decides what an empty window
+    ;; means, the kernel never does.
+    proc pane-close! {pane_id} {
+        let n [weft::ws::node $pane_id]
+
+        if [not [== [get $n kind] pane]] {
+            return [weft::error::make invalid-args "$pane_id is not a pane"]
+        }
+
+        if [empty? [get $n parent]] {
+            return [weft::error::make denied "cannot close the last pane"]
+        }
+
+        let split_id [get $n parent]
+        let s [weft::ws::node $split_id]
+
+        var sibling [get $s a]
+
+        if [== $sibling $pane_id] {
+            set! sibling [get $s b]
+        }
+
+        let grand [get $s parent]
+
+        weft::ws::view-close! [get $n view]
+
+        set! nodes [del $nodes $pane_id]
+        set! nodes [del $nodes $split_id]
+
+        weft::ws::_reparent! $sibling $grand
+
+        if [empty? $grand] {
+            set! root $sibling
+        } else {
+            weft::ws::_replace-child! $grand $split_id $sibling
+        }
+
+        if [== $focused $pane_id] {
+            set! focused [get [weft::ws::panes-in $sibling] 0]
+        }
+
+        return 1
+    }
+
+    ;; Point a pane at a different view.  Editors travel with their
+    ;; views: neither editor is recreated, so cursor/selection/viewport
+    ;; survive any rearrangement built on this.
+    proc pane-set-view! {pane_id view_id} {
+        weft::ws::_node-put! $pane_id \
+            [put [weft::ws::node $pane_id] view $view_id]
+
+        return 1
+    }
+
+    ;; Show a buffer in a pane: new view in, old view out (closed only
+    ;; after the swap so its editor state snapshots normally).
+    proc pane-show-buffer! {pane_id buffer_id} {
+        let old_view [weft::ws::pane-view $pane_id]
+
+        if [== [weft::ws::view-buffer $old_view] $buffer_id] {
+            return $old_view
+        }
+
+        let vid [weft::ws::view-create! $buffer_id]
+
+        weft::ws::pane-set-view! $pane_id $vid
+        weft::ws::view-close! $old_view
+
+        return $vid
+    }
+
+    proc pane-swap-views! {pane_a pane_b} {
+        let va [weft::ws::pane-view $pane_a]
+        let vb [weft::ws::pane-view $pane_b]
+
+        weft::ws::pane-set-view! $pane_a $vb
+        weft::ws::pane-set-view! $pane_b $va
+
+        return 1
+    }
+
+    ;; Flip the axis of the pane's PARENT split (h <-> v), ratio kept.
+    ;; Immediate parent only -- subtree transpose is a different
+    ;; operation nobody has asked for.  Returns #{split axis}; a root
+    ;; pane returns empty fields (no-op).
+    proc pane-transpose! {pane_id} {
+        let n [weft::ws::node $pane_id]
+
+        if [not [== [get $n kind] pane]] {
+            return [weft::error::make invalid-args "$pane_id is not a pane"]
+        }
+
+        let sid [get $n parent]
+
+        if [empty? $sid] { return #{split "" axis ""} }
+
+        let s [weft::ws::node $sid]
+        var axis v
+
+        if [== [get $s axis] v] { set! axis h }
+
+        weft::ws::_node-put! $sid [put $s axis $axis]
+
+        return #{split $sid axis $axis}
+    }
+
+    ;; The pane after `pane_id` in traversal order (the ctrl+n order),
+    ;; wrapping; itself when it is the only pane.
+    proc pane-next {pane_id} {
+        let ps [weft::ws::panes]
+        var idx 0
+        var i 0
+
+        foreach p $ps {
+            if [== $p $pane_id] { set! idx $i }
+            set! i [+ $i 1]
+        }
+
+        return [get $ps [% [+ $idx 1] [len $ps]]]
+    }
+
+    ;; ---- ratios (workspace-owned) ----
+
+    proc split-ratio {split_id} {
+        return [get [weft::ws::node $split_id] ratio]
+    }
+
+    proc split-ratio-set! {split_id r} {
+        var c $r
+
+        if [< $c 0.05] { set! c 0.05 }
+        if [> $c 0.95] { set! c 0.95 }
+
+        weft::ws::_node-put! $split_id \
+            [put [weft::ws::node $split_id] ratio $c]
+
+        return $c
+    }
+
+    ;; ---- traversal / focus ----
+
+    proc panes-in {node_id} {
+        let n [weft::ws::node $node_id]
+
+        if [== [get $n kind] pane] { return [list $node_id] }
+
+        return [List::concat [weft::ws::panes-in [get $n a]]
+                             [weft::ws::panes-in [get $n b]]]
+    }
+
+    proc panes {} {
+        if [empty? $root] {
+            return ()
+        }
+
+        return [weft::ws::panes-in $root]
+    }
+
+    proc tree-root {} {
+        return $root
+    }
+
+    proc focused-pane {} {
+        return $focused
+    }
+
+    ;; Focus history, most recent first.  It answers "which view of
+    ;; buffer B did the user touch last?" -- the REPL attachment reads
+    ;; the target's selection from THAT view, not from whichever view
+    ;; happened to be created first.  Panes that no longer exist are
+    ;; skipped on read, so closing needs no bookkeeping here.
+    var focus_history ()
+
+    proc focus! {pane_id} {
+        set! focused $pane_id
+
+        var hist [list $pane_id]
+
+        foreach p $focus_history {
+            if [not [== $p $pane_id]] { set! hist [List::push $hist $p] }
+        }
+
+        set! focus_history $hist
+
+        return $pane_id
+    }
+
+    ;; Most-recent-first pane ids (dead panes included; callers skip
+    ;; them against `panes`).
+    proc focus-history {} {
+        return $focus_history
+    }
+
+    ;; The buffer's most recently focused view (falls back to the first
+    ;; view when none of its panes was ever focused; "" when unshown).
+    proc active-view-of-buffer {bid} {
+        let live [weft::ws::panes]
+
+        foreach p $focus_history {
+            if [not [has? $live $p]] { continue }
+
+            let v [weft::ws::pane-view $p]
+
+            if [== [weft::ws::view-buffer $v] $bid] { return $v }
+        }
+
+        let views [weft::ws::views-of-buffer $bid]
+
+        if [== 0 [len $views]] { return "" }
+
+        return [get $views 0]
+    }
+
+    ;; The most recently active buffer other than `bid` -- the focus
+    ;; history walked for the first live pane whose view shows another
+    ;; buffer; "" when none.  (Per-pane history would be kinder when
+    ;; one buffer fills several panes; the kernel keeps none, and
+    ;; docs/buffers.md adds no state for it.)
+    proc mru-buffer-excluding {bid} {
+        let live [weft::ws::panes]
+
+        foreach p $focus_history {
+            if [not [has? $live $p]] { continue }
+
+            let b [weft::ws::view-buffer [weft::ws::pane-view $p]]
+
+            if [not [== $b $bid]] { return $b }
+        }
+
+        foreach p $live {
+            let b [weft::ws::view-buffer [weft::ws::pane-view $p]]
+
+            if [not [== $b $bid]] { return $b }
+        }
+
+        return ""
+    }
+
+    proc focus-next! {} {
+        let ps [weft::ws::panes]
+
+        var idx 0
+        var i 0
+
+        foreach p $ps {
+            if [== $p $focused] {
+                set! idx $i
+            }
+
+            set! i [+ $i 1]
+        }
+
+        set! focused [get $ps [% [+ $idx 1] [len $ps]]]
+
+        return $focused
+    }
+
+    ;; The focused pane's ctx fields, for command dispatch.
+    proc focused-ctx-fields {} {
+        if [empty? $focused] { return #{} }
+
+        let vid [weft::ws::pane-view $focused]
+
+        return #{pane $focused view $vid buffer [weft::ws::view-buffer $vid]}
+    }
+}

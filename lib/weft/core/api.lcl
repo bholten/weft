@@ -1,0 +1,1047 @@
+;;; weft:: -- the user-facing command surface (executable from EXECUTE,
+;;; the future REPL, and config).  Grows deliberately: the full named
+;;; command registry with metadata is P3 work; what lives here now are
+;;; the handful of commands worth middle-clicking today.
+
+namespace weft {
+
+    proc version {} {
+        return $weft_version
+    }
+
+    ;; ---- opening (and therefore creating) files ----
+
+    ;; Open a path.  A path with no file behind it becomes an empty
+    ;; buffer BOUND to that path, so ctrl+s writes it into existence:
+    ;; opening and creating are one gesture because they are one
+    ;; concept.  There is deliberately no `weft::new`.  Relative paths
+    ;; resolve against the EXECUTING buffer's cwd -- the same Acme rule
+    ;; the command pipeline uses for processes.
+    ;; The running evaluation's operand text ("" when none): a
+    ;; selection handed to an lcl command stays a VALUE -- read it,
+    ;; never splice it.  `weft::cmd::operand-of [weft::image::ctx]`
+    ;; is the structured form (buffer, range, verified location).
+    proc operand {} {
+        return [weft::cmd::operand-text [weft::image::ctx]]
+    }
+
+    ;; ---- templates: the prompt is a line ----
+
+    ;; Paste a command as text for the user to complete, on its own
+    ;; line after the cursor's (after the selection's last line when
+    ;; there is one; an empty line is taken in place), and park the
+    ;; cursor inside the first `{}` hole -- else at the end.  Filling
+    ;; the holes and pressing ctrl+enter (or ctrl+shift+enter with the
+    ;; operand selected in another pane) is the whole "prompt": no
+    ;; panel, and nothing here knows what the command is.  Bound to a
+    ;; chord it turns any command into a keyed prompt:
+    ;;   weft::config::bind! "ctrl+shift+r" {weft::template {replace-all {} {}}}
+    ;; The line stays where it was pasted once run -- history in a
+    ;; scratch buffer, a line to delete in a document; deliberately
+    ;; no machinery for that.
+    proc template {text} {
+        let ctx [weft::image::ctx]
+        let bid [weft::ctx::field $ctx buffer]
+
+        if [not [weft::ws::buffer? $bid]] {
+            error "weft::template: no buffer in ctx (run from a buffer, or a bound chord)"
+        }
+
+        let doc [weft::ws::buffer-doc $bid]
+        var vid [weft::ctx::field $ctx view]
+
+        if [empty? $vid] {
+            let vs [weft::ws::views-of-buffer $bid]
+
+            if [> [len $vs] 0] { set! vid [get $vs 0] }
+        }
+
+        ;; Anchor: the selection's end, else the primary caret, else
+        ;; the buffer's tail (no view at all: an unattached eval).
+        var anchor [Lk::doc_len $doc]
+
+        if [and [has? $ctx start] [has? $ctx end]] {
+            set! anchor [get $ctx end]
+        } else {
+            if [not [empty? $vid]] {
+                set! anchor [get [weft::ws::view-carets $vid] 0]
+            }
+        }
+
+        let ln [Lk::doc_pos_to_line $doc $anchor]
+        let ls [Lk::doc_line_start $doc $ln]
+        let le [Lk::doc_line_end $doc $ln]
+        let body [String::from $text]
+        var ins $body
+
+        if [not [== $ls $le]] { set! ins "\n$body" }
+
+        let r [weft::transform::commit! #{transform template buffer $bid
+            base_rev [Lk::doc_revision $doc]
+            edits [list #{start $le end $le text $ins}]}]
+
+        if [weft::error::error? $r] { return $r }
+
+        ;; The body starts after the optional newline.
+        let at [+ $le [- [String::length $ins] [String::length $body]]]
+        let hole [String::find $body "{}"]
+        var cur [+ $at [String::length $body]]
+
+        if [>= $hole 0] { set! cur [+ $at [+ $hole 1]] }
+
+        if [not [empty? $vid]] { weft::ws::view-set-cursor! $vid $cur }
+
+        return ""
+    }
+
+    proc open {*rest} {
+        let ctx [weft::image::ctx]
+        var path ""
+
+        if [> [len $rest] 0] {
+            set! path [String::from [get $rest 0]]
+        } else {
+            ;; No argument: the OPERAND is the path -- a verified
+            ;; location's resolved path first, else its text.
+            let o [weft::cmd::operand-of $ctx]
+
+            if [has? $o location] {
+                if [has? [get $o location] path] {
+                    set! path [get [get $o location] path]
+                }
+            }
+
+            if [and [empty? $path] [has? $o text]] {
+                set! path [String::trim [get $o text]]
+            }
+
+            if [empty? $path] {
+                return [weft::error::make invalid-args \
+                    {weft::open: no path and no operand (select one, or pass it)}]
+            }
+        }
+
+        ;; `weft::open 2024` arrives typed -- a path is text; the
+        ;; workspace resolves it against this buffer's cwd.
+        let b [weft::ws::buffer-open! $path $ctx]
+
+        if [weft::error::error? $b] { return $b }
+
+        return #{kind open buffer $b path [get [weft::ws::buffer $b] path]}
+    }
+
+    ;; ---- buffer and pane management (docs/buffers.md) ----
+    ;;
+    ;; Commands first, chords second: every operation here is the
+    ;; portable vocabulary; config/bindings-native.lcl binds chords on
+    ;; top.  Panes are projections, buffers are content -- so `only` is
+    ;; free and `close` is the one destructive verb.  Results are
+    ;; values another command can consume, naming what was touched.
+
+    ;; The pane a command acts in: the ctx's pane (EXECUTE, a clicked
+    ;; row: Acme's rule -- act where you clicked), else the pane
+    ;; showing the ctx's view (the REPL carries buffer+view), else the
+    ;; focused pane.
+    proc _ctx-pane {ctx} {
+        let p [weft::ctx::field $ctx pane]
+
+        if [and [not [empty? $p]] [== pane [get [weft::ws::node $p] kind]]] {
+            return $p
+        }
+
+        let v [weft::ctx::field $ctx view]
+
+        if [not [empty? $v]] {
+            foreach pn [weft::ws::panes] {
+                if [== [weft::ws::pane-view $pn] $v] { return $pn }
+            }
+        }
+
+        return [weft::ws::focused-pane]
+    }
+
+    ;; Show a buffer in the acting pane.  Resolution is FUZZY: id,
+    ;; exact name, path, exact basename, unique basename prefix,
+    ;; unique name-component prefix -- `weft::show qol` finds
+    ;; docs/qol.md.  Ambiguity comes back as a structured error whose
+    ;; candidates the shell prints as rows.
+    proc show {buf} {
+        let ctx [weft::image::ctx]
+        let bid [weft::ws::buffer-resolve $buf fuzzy $ctx]
+
+        if [weft::error::error? $bid] { return $bid }
+
+        let pane [weft::_ctx-pane $ctx]
+
+        weft::ws::pane-show-buffer! $pane $bid
+
+        return #{kind shown pane $pane buffer $bid
+            name [get [weft::ws::buffer $bid] name]}
+    }
+
+    ;; Split the acting pane: `split-h` side by side, `split-v`
+    ;; stacked.  Alone, the new pane shows the SAME buffer -- two
+    ;; views, one text (what ctrl+e / ctrl+shift+d do).  Given a
+    ;; buffer it shows that one, resolved the way `show` resolves
+    ;; (fuzzy): `weft::split-h qol`.  Focus moves to the new pane.
+    proc _split {axis rest} {
+        let ctx [weft::image::ctx]
+        let pane [weft::_ctx-pane $ctx]
+        var bid [weft::ws::view-buffer [weft::ws::pane-view $pane]]
+
+        if [> [len $rest] 0] {
+            set! bid [weft::ws::buffer-resolve \
+                [String::from [get $rest 0]] fuzzy $ctx]
+
+            if [weft::error::error? $bid] { return $bid }
+        }
+
+        let np [weft::ws::pane-split! $pane $axis $bid]
+
+        if [weft::error::error? $np] { return $np }
+
+        return #{kind split axis $axis pane $np from $pane buffer $bid
+            name [get [weft::ws::buffer $bid] name]}
+    }
+
+    proc split-h {*rest} { return [weft::_split h $rest] }
+    proc split-v {*rest} { return [weft::_split v $rest] }
+
+    ;; A fresh, empty, path-less buffer -- the tiling-window-manager
+    ;; move: start from nothing and arrange.  `weft::new` shows it in
+    ;; the acting pane; `weft::new h` / `weft::new v` split the pane
+    ;; first (side by side / stacked) and show it in the new pane.  A
+    ;; further word names it (`weft::new v notes`); the default name
+    ;; is *new*, and any name that exists gets a `-2`, `-3` suffix so
+    ;; `show` never meets an ambiguity nobody authored.  Path-less
+    ;; buffers take their name as the filetype key, so a config
+    ;; `filetype! "*new*" #{lang lcl}` applies to every one.
+    proc new {*rest} {
+        let ctx [weft::image::ctx]
+        var axis ""
+        var name ""
+
+        foreach a $rest {
+            let s [String::from $a]
+
+            if [and [and [empty? $axis] [empty? $name]] \
+                    [or [== $s h] [== $s v]]] {
+                set! axis $s
+            } else {
+                set! name $s
+            }
+        }
+
+        if [empty? $name] { set! name "*new*" }
+
+        set! name [weft::_unique-buffer-name $name]
+
+        let bid [weft::ws::buffer-create! $name "" ""]
+        let pane [weft::_ctx-pane $ctx]
+        var target $pane
+
+        if [empty? $axis] {
+            weft::ws::pane-show-buffer! $pane $bid
+        } else {
+            set! target [weft::ws::pane-split! $pane $axis $bid]
+
+            if [weft::error::error? $target] { return $target }
+        }
+
+        return #{kind new buffer $bid name $name pane $target axis $axis}
+    }
+
+    ;; *new* -> *new-2* -> *new-3*; notes -> notes-2.  The stars stay
+    ;; outermost so the special-buffer spelling survives.
+    proc _unique-buffer-name {name} {
+        if [empty? [weft::ws::buffer-for-name $name]] { return $name }
+
+        var stem $name
+        var star ""
+
+        let n_end [- [String::length $name] 1]
+
+        if [== "*" [String::range $name $n_end [+ $n_end 1]]] {
+            set! stem [String::range $name 0 $n_end]
+            set! star "*"
+        }
+
+        var n 2
+
+        while 1 {
+            let cand "$stem-$n$star"
+
+            if [empty? [weft::ws::buffer-for-name $cand]] { return $cand }
+
+            set! n [+ $n 1]
+        }
+    }
+
+    ;; Collapse the split tree to the acting pane.  Holds the pane id
+    ;; and closes every pane in its SIBLING subtree while it has a
+    ;; parent -- deterministic, never touches the held pane, and no
+    ;; buffer is lost (views die, buffers and their history do not).
+    proc only {} {
+        let ctx [weft::image::ctx]
+        let keep [weft::_ctx-pane $ctx]
+        var n 0
+
+        while [not [empty? [get [weft::ws::node $keep] parent]]] {
+            let s [weft::ws::node [get [weft::ws::node $keep] parent]]
+            var sib [get $s a]
+
+            if [== $sib $keep] { set! sib [get $s b] }
+
+            foreach p [weft::ws::panes-in $sib] {
+                weft::ws::pane-close! $p
+                set! n [+ $n 1]
+            }
+        }
+
+        weft::ws::focus! $keep
+
+        return #{kind only pane $keep closed $n}
+    }
+
+    ;; Kill a buffer -- a tiny transaction: resolve EXACT (a fuzzy hit
+    ;; silently turning destructive is the classic convenience-
+    ;; crossing-the-API-boundary bug), preflight with buffer-closable?
+    ;; so the close cannot refuse later, evacuate every pane showing
+    ;; it to the most recently active OTHER buffer (else *scratch*),
+    ;; then close.  Panes are never closed: the layout is the user's.
+    ;; `weft::close` alone takes the ctx buffer; `weft::close NAME
+    ;; force` discards unsaved changes.
+    proc close {*rest} {
+        let ctx [weft::image::ctx]
+        var target ""
+        var force 0
+
+        foreach a $rest {
+            if [== [String::from $a] force] {
+                set! force 1
+            } else {
+                set! target $a
+            }
+        }
+
+        var bid ""
+
+        if [empty? $target] {
+            set! bid [weft::ctx::field $ctx buffer]
+
+            if [not [weft::ws::buffer? $bid]] {
+                return [weft::error::make invalid-args "close: no buffer in ctx"]
+            }
+        } else {
+            set! bid [weft::ws::buffer-resolve $target exact $ctx]
+
+            if [weft::error::error? $bid] { return $bid }
+        }
+
+        let name [get [weft::ws::buffer $bid] name]
+        let ok [weft::ws::buffer-closable? $bid $force]
+
+        if [weft::error::error? $ok] { return $ok }
+
+        ;; The only buffer: nothing to evacuate to.  (*scratch* itself
+        ;; is closable when anything else exists.)
+        if [< [len [weft::ws::buffer-list]] 2] {
+            return [weft::error::make denied "cannot close the only buffer"]
+        }
+
+        var fallback [weft::ws::mru-buffer-excluding $bid]
+
+        if [empty? $fallback] { set! fallback [weft::ws::scratch-buffer!] }
+
+        var n 0
+
+        foreach p [weft::ws::panes] {
+            if [== [weft::ws::view-buffer [weft::ws::pane-view $p]] $bid] {
+                weft::ws::pane-show-buffer! $p $fallback
+                set! n [+ $n 1]
+            }
+        }
+
+        ;; Infallible after the preflight: views are gone, dirtiness
+        ;; was checked, and nothing ran in between.
+        let r [weft::ws::buffer-close! $bid $force]
+
+        if [weft::error::error? $r] { return $r }
+
+        return #{kind closed buffer $bid name $name panes $n}
+    }
+
+    ;; Swap the acting pane's view with the next pane's (the ctrl+n
+    ;; order); focus stays.  Swapping projections is deliberately
+    ;; dumb -- "move this pane's buffer" would invent ownership.
+    proc pane-swap {} {
+        let ctx [weft::image::ctx]
+        let a [weft::_ctx-pane $ctx]
+        let b [weft::ws::pane-next $a]
+
+        if [== $a $b] { return #{kind swapped pane $a with ""} }
+
+        weft::ws::pane-swap-views! $a $b
+
+        return #{kind swapped pane $a with $b}
+    }
+
+    ;; Flip the axis of the acting pane's parent split.
+    proc transpose {} {
+        let ctx [weft::image::ctx]
+        let r [weft::ws::pane-transpose! [weft::_ctx-pane $ctx]]
+
+        if [weft::error::error? $r] { return $r }
+
+        return #{kind transposed split [get $r split] axis [get $r axis]}
+    }
+
+    ;; ---- the orphan flow (P5-C) ----
+    ;; Orphans are persisted annotations whose context vanished from
+    ;; the document.  `weft::orphans` lists the focused buffer's;
+    ;; select a span and execute `weft::orphan-adopt N` to re-attach
+    ;; one there, or `weft::orphan-drop N` to discard it.
+
+    proc _excerpt {s n from_end} {
+        let l [String::length $s]
+        var out $s
+
+        if [> $l $n] {
+            if $from_end {
+                set! out [String::range $s [- $l $n] $l]
+            } else {
+                set! out [String::range $s 0 $n]
+            }
+        }
+
+        return [String::replace $out "\n" " "]
+    }
+
+    proc orphans {} {
+        let ctx [weft::image::ctx]
+        let bid [weft::ctx::field $ctx buffer]
+
+        if [not [weft::ws::buffer? $bid]] {
+            return "orphans: no buffer in ctx"
+        }
+
+        let lst [weft::persist::orphans $bid]
+
+        if [== 0 [len $lst]] { return "no orphans" }
+
+        var out ""
+        var i 0
+
+        foreach rec $lst {
+            let a [get $rec start_anchor]
+
+            set! out "$out#$i  [get $rec layer]  ..[weft::_excerpt [get $a before] 16 1]/[weft::_excerpt [get $a after] 16 0]..\n"
+            set! i [+ $i 1]
+        }
+
+        set! out "$out;; select a span, then \[weft::orphan-adopt N\] -- or \[weft::orphan-drop N\]\n"
+
+        return $out
+    }
+
+    proc orphan-adopt {idx} {
+        let ctx [weft::image::ctx]
+        let bid [weft::ctx::field $ctx buffer]
+
+        if [not [weft::ws::buffer? $bid]] {
+            return [weft::error::make invalid-args "orphan-adopt: no buffer in ctx"]
+        }
+
+        if [not [and [has? $ctx start] [has? $ctx end]]] {
+            return [weft::error::make invalid-args
+                "orphan-adopt: select the span to adopt onto first"]
+        }
+
+        let r [weft::persist::orphan-adopt! $bid $idx
+            [get $ctx start] [get $ctx end]]
+
+        if [weft::error::error? $r] { return $r }
+
+        return "adopted orphan #$idx at \[[get $ctx start], [get $ctx end])"
+    }
+
+    proc orphan-drop {idx} {
+        let ctx [weft::image::ctx]
+        let bid [weft::ctx::field $ctx buffer]
+
+        if [not [weft::ws::buffer? $bid]] {
+            return [weft::error::make invalid-args "orphan-drop: no buffer in ctx"]
+        }
+
+        let r [weft::persist::orphan-drop! $bid $idx]
+
+        if [weft::error::error? $r] { return $r }
+
+        return "dropped orphan #$idx"
+    }
+
+    ;; ---- sessions (P5-D) ----
+
+    proc session-save {} {
+        let r [weft::session::save!]
+
+        if [weft::error::error? $r] { return $r }
+
+        return "session saved"
+    }
+
+    ;; One line per buffer: "id  name  [dirty]  views" -- names are
+    ;; plumbable where they are paths.
+    ;; The buffer menu as Acme-style clickable text (command pipeline
+    ;; stage B): rows emitted through the sink into *output*, each
+    ;; carrying a qjump presentation -- right-click a row to show
+    ;; that buffer in the focused pane.  Text is the menu.
+    proc buffers {} {
+        let out [weft::shell::out-buffer! [weft::image::ctx]]
+        var n 0
+
+        foreach row [weft::ws::buffer-list] {
+            var mark ""
+
+            if [get $row dirty] {
+                set! mark " *"
+            }
+
+            let bid [get $row id]
+            ;; The id as the LAST column so the row still reads as a
+            ;; name -- select it for weft::repl::attach, the name for
+            ;; weft::show / weft::close.
+            weft::sink::emit! $out \
+                "[get $row name]$mark  ([get $row views] views)  $bid\n" \
+                #{layer {qjump} meta #{kind {buffer-row} buffer $bid}
+                    present #{ptype {qjump}
+                        value #{buffer $bid start 0 end 0}}}
+            set! n [+ $n 1]
+        }
+
+        return #{kind emitted summary "$n buffers -> *output*" count $n}
+    }
+
+    ;; ---- messages: the flash history ----
+    ;; Errors surface as four-second flashes in the status row; this
+    ;; is where they go afterwards.  Newest last, so the tail is the
+    ;; recent past.
+    proc messages {*rest} {
+        var n 20
+
+        if [== 1 [len $rest]] { set! n [get $rest 0] }
+
+        let all [weft::shell::notices]
+        var from [- [len $all] $n]
+
+        if [< $from 0] { set! from 0 }
+
+        let out [weft::shell::out-buffer! [weft::image::ctx]]
+        var count 0
+
+        foreach m [List::slice $all $from [len $all]] {
+            weft::sink::emit! $out "[get $m text]\n" \
+                #{layer {msg} meta #{kind {message} at [get $m at]}}
+            set! count [+ $count 1]
+        }
+
+        if [== 0 $count] {
+            weft::sink::emit! $out "(no messages yet)\n" #{layer {msg} meta #{kind {message}}}
+        }
+
+        return #{kind emitted summary "$count messages -> *output*" count $count}
+    }
+
+    ;; ---- the command menu: text is the menu ----
+    ;;
+    ;; One row per user-facing command, grouped, with a one-line doc.
+    ;; The rows are ordinary live text: middle-click a bare name to
+    ;; EXECUTE it, or put the cursor on a form that takes arguments
+    ;; and press ctrl+enter.  Nothing in the UI knows about this menu
+    ;; -- it works because the gestures already work on any text,
+    ;; which is the whole argument for printing menus instead of
+    ;; building them.
+    ;;
+    ;; The table is CURATED, not reflected.  Ns::keys would happily
+    ;; list several hundred internal procs and could not say what one
+    ;; of them is for; a menu's value is the sentence, not the name.
+    ;; test/cmd-gates.lcl checks that every head here still resolves,
+    ;; so the curation cannot rot into a list of lies.
+    var command_menu (
+        #{title {Buffers and workspace (ctrl+i inspects at the cursor)} rows (
+            ({weft::open notes.md} {open a file -- one that does not exist yet becomes a new one})
+            ({weft::buffers} {open buffers -- right-click a row to show it})
+            ({weft::show qol} {show a buffer here -- name, id, path, or a unique prefix})
+            ({weft::new v} {a fresh empty buffer -- alone: here; `h`/`v`: in a new split (side by side / stacked); a further word names it})
+            ({weft::split-h qol} {split this pane side by side showing a buffer -- alone: this buffer twice})
+            ({weft::split-v} {split this pane stacked, likewise})
+            ({weft::close notes.md} {kill a buffer by name (add `force` to discard edits); alone: this one})
+            ({weft::only} {collapse the splits to this pane -- no buffer is lost})
+            ({weft::transpose} {flip this pane's split between side-by-side and stacked})
+            ({weft::pane-swap} {swap this pane's buffer with the next pane's})
+            ({weft::commands} {this menu})
+            ({weft::keys} {every chord and mouse gesture, by group -- and what shadows what})
+            ({weft::messages} {recent status-row messages -- the errors you missed})
+            ({weft::version} {the running version}))}
+
+        #{title {Image and REPL (ctrl+r opens *lcl*)} rows (
+            ({weft::repl::attach} {execute IN a buffer: REPL evals then carry it as ctx})
+            ({weft::repl::target} {which buffer the REPL is attached to})
+            ({weft::repl::detach} {drop the attachment})
+            ({weft::image::user-defs} {everything you have defined in user::})
+            ({weft::describe weft::open} {what a name is: signature, where it was defined, its docstring -- *scratch* definitions too})
+            ({weft::apropos anchor} {every documented name whose name or docstring mentions a word})
+            ({weft::image::records} {the execution log -- every eval with its ctx}))}
+
+        #{title {Commands (ctrl+enter runs a line; middle-click a word)} rows (
+            ({weft::cmd::explain {git status}} {how a line resolves -- runs nothing})
+            ({weft::cmd::run-list} {recent runs: provider, cwd, exit status})
+            ({weft::cmd::which ls} {resolve a name on PATH without spawning})
+            ({cd ..} {move THIS buffer's execution cwd (Acme's rule)})
+            ({sh {ls *.c}} {force the shell on a line, globs and all}))}
+
+        ;; A query is a PLAN: a source, then stages, then one terminal
+        ;; that interprets it.  The pieces below are not standalone
+        ;; commands -- they compose with `->`, which is why the first
+        ;; row is a whole runnable line and the rest are labelled.
+        #{title {Queries -- plans are data; run the first row as-is} rows (
+            ({-> [weft::q::doc] {weft::q::matches {TODO}} {weft::q::preview 5}}
+                {source, stage, terminal -- ctrl+enter on this line})
+            ({weft::q::doc} {source: the buffer this runs in})
+            ({weft::q::selection} {source: the selection handed in (attached REPL, or ctrl+shift+enter with it selected elsewhere)})
+            ({weft::q::range {} 0 10} {source: an explicit buffer id and span})
+            ({weft::q::lines} {stage: one record per line})
+            ({weft::q::matches {re}} {stage: one record per regex match})
+            ({weft::q::select} {stage: keep the records a predicate likes})
+            ({weft::q::preview 5} {terminal: the first N records as text})
+            ({weft::q::count} {terminal: how many records})
+            ({weft::q::explain} {terminal: the plan as text, evaluating nothing})
+            ({weft::q::show} {terminal: read-only *query* rows that jump to source})
+            ({weft::q::materialize} {terminal: a fresh editable buffer of results})
+            ({weft::q::annotate} {terminal: live rules as producers, styled})
+            ({weft::q::replace {new}} {terminal: pend edits as a reviewable plan}))}
+
+        #{title {Filters and operands -- the selection through, or handed to, a program (docs/commands.md stage D)} rows (
+            ({weft::operand} {this evaluation's operand text: the selection a middle-click/ctrl+shift+enter handed the command})
+            ({weft::filter::pipe {sort}} {selection -> stdin; stdout replaces it (|sort)})
+            ({weft::filter::insert {date}} {stdout replaces the selection, or inserts at the cursor (<date)})
+            ({weft::filter::send {wc -l}} {selection -> stdin; stdout to *output* (>wc -l)})
+            ({weft::filter::pipe {sort} #{preview 1}} {same, but pend the edit for *diff* review}))}
+
+        #{title {Transforms -- preview, then decide} rows (
+            ({weft::transform::names} {registered transforms})
+            ({weft::transform::run upper} {run one on the selection -- previews first})
+            ({weft::transform::apply} {apply the pending plan})
+            ({weft::transform::reject} {discard it}))}
+
+        #{title {Annotations} rows (
+            ({weft::annot::edit-at} {edit the annotations at the cursor as text})
+            ({weft::annot::apply-edit} {commit that editing session})
+            ({weft::annot::cancel-edit} {abandon it}))}
+
+        #{title {Persistence and sessions} rows (
+            ({weft::session::save!} {save the workspace shape now})
+            ({weft::session::restore! [weft::image::ctx]} {restore the saved one})
+            ({weft::orphans} {persisted annotations whose text vanished})
+            ({weft::orphan-adopt 0} {re-attach orphan N to the selection})
+            ({weft::orphan-drop 0} {discard orphan N}))}
+
+        #{title {Configuration (see ~/.config/weft/init.lcl)} rows (
+            ({weft::config::bind! {ctrl+u} {weft::transform::run upper}}
+                {bind a chord to a script (a third word documents it in weft::keys); rebinding a native chord shadows it})
+            ({weft::template {replace-all {} {}}}
+                {paste a command to complete, cursor in the first {} -- bind! it and any command is a keyed prompt})
+            ({weft::config::filetype! {.md} #{wrap word}} {per-filetype settings})
+            ({weft::plumb::rule-names} {the plumbing rules in force})
+            ({weft::ts::style!} {recolor a tree-sitter capture})
+            ({weft::search::query!} {light every match of a needle}))})
+
+    proc _pad {s w} {
+        var out $s
+
+        while [< [String::length $out] $w] { set! out "$out " }
+
+        return $out
+    }
+
+    proc commands {} {
+        let out [weft::shell::out-buffer! [weft::image::ctx]]
+        var w 0
+        var n 0
+
+        ;; Align the doc column to the widest name -- but only up to a
+        ;; cap: one long example form should not push forty short rows
+        ;; off the right edge.  A row wider than the cap simply keeps
+        ;; its own width and takes the two-space gap.
+        foreach group $command_menu {
+            foreach row [get $group rows] {
+                let l [String::length [get $row 0]]
+
+                if [and [> $l $w] [<= $l 34]] { set! w $l }
+            }
+        }
+
+        weft::sink::emit! $out \
+            ";; weft commands -- text is the menu.  Middle-click a bare\n;; name to run it; for a form with arguments, put the cursor on\n;; the line and press ctrl+enter.  (Rows labelled stage/terminal\n;; are query pieces -- they compose with -> rather than run alone.)\n;; These are ordinary words: the ordinary gestures make them work.\n"
+
+        foreach group $command_menu {
+            weft::sink::emit! $out "\n[get $group title]\n"
+
+            foreach row [get $group rows] {
+                weft::sink::emit! $out \
+                    "  [weft::_pad [get $row 0] $w]  [get $row 1]\n"
+                set! n [+ $n 1]
+            }
+        }
+
+        return #{kind emitted summary "$n commands -> *output*" count $n}
+    }
+
+
+    ;; ---- describe / apropos: docstrings on live symbols ----
+    ;; lcl's Doc library (docs/commands.md "Describe"): `describe`
+    ;; asks Doc for a name; Doc matches an Lcl proc by Proc::origin
+    ;; (file + line, reading the file on first use) and anything else
+    ;; by qualified name.  Text evaluated from a buffer has that
+    ;; buffer as its origin (eval_at, weft::image::source-of), so
+    ;; before asking we REGISTER the live buffer's text under its
+    ;; name -- the host owns ephemeral source, Doc only indexes what
+    ;; it is handed.  Doc is spelled `::Doc::` (live root) so this
+    ;; module compiles on a host without it.
+    proc _doc-buffer-of {file} {
+        foreach b [weft::ws::buffer-list] {
+            if [or [== [get $b path] $file] [== [get $b name] $file]] {
+                return [get $b id]
+            }
+        }
+
+        return ""
+    }
+
+    var _doc_files #{}
+
+    ;; Make Doc's index cover `file`: a live buffer's current text
+    ;; (every time -- it changes), else the file on disk (once).
+    proc _doc-sync! {file} {
+        if [empty? $file] { return 0 }
+        if [== 0 [String::find $file "<"]] { return 0 }
+
+        let b [weft::_doc-buffer-of $file]
+
+        if [not [empty? $b]] {
+            ::Doc::register [Lk::doc_text [weft::ws::buffer-doc $b]] $file
+            return 1
+        }
+
+        if [has? $_doc_files $file] { return 1 }
+
+        var r ""
+        var e ""
+
+        if [== 0 [catch { ::Doc::register_file $file } r e]] {
+            set! _doc_files [put $_doc_files $file 1]
+            return 1
+        }
+
+        return 0
+    }
+
+    proc _doc-origin-file {name} {
+        var v ""
+        var e ""
+
+        if [not [== 0 [catch { set! v [getvar $name] } v e]]] { return "" }
+        if [not [== proc [type $v]]] { return "" }
+
+        return [get [Proc::origin $v] file ""]
+    }
+
+    ;; A bare name typed in the REPL means "in my namespace": resolve
+    ;; `name` as the evaluation's ctx namespace sees it (user::hi
+    ;; for `hi`), so describe and Doc agree on one qualified name.
+    proc _doc-resolve-name {name} {
+        if [>= [String::find $name "::"] 0] { return $name }
+
+        var v ""
+        var e ""
+
+        if [== 0 [catch { set! v [getvar $name] } v e]] { return $name }
+
+        let ns [weft::ctx::field [weft::image::ctx] ns]
+
+        if [empty? $ns] { return $name }
+
+        let q "${ns}::$name"
+
+        if [== 0 [catch { set! v [getvar $q] } v e]] { return $q }
+
+        return $name
+    }
+
+    ;;; Print what `name` is: kind and signature, where it was
+    ;;; defined (file:line, or the buffer it was evaluated from), and
+    ;;; its `;;;` docstring.
+    proc describe {name} {
+        if [not ${::weft_have_doc}] {
+            return [weft::error::make unsupported \
+                "describe needs lcl's Doc library (the lcl-lib require root)"]
+        }
+
+        let qn [weft::_doc-resolve-name $name]
+        weft::_doc-sync! [weft::_doc-origin-file $qn]
+
+        var text ""
+        var e ""
+
+        if [not [== 0 [catch { set! text [::Doc::describe $qn] } text e]]] {
+            return [weft::error::make invalid-args "$e"]
+        }
+
+        let out [weft::shell::out-buffer! [weft::image::ctx]]
+        weft::sink::emit! $out "$text\n"
+
+        return #{kind emitted summary "$name -> *output*" count 1}
+    }
+
+    ;; Walk a namespace's members, syncing every origin file into the
+    ;; index (a live buffer's text or the file on disk).  Namespaces
+    ;; cannot cycle in lcl; the depth cap is belt and braces.
+    proc _doc-index-ns! {ns depth} {
+        if [> $depth 6] { return 0 }
+
+        let base [Ns::name $ns]
+        var n 0
+
+        foreach k [Ns::keys $ns] {
+            var v ""
+            var e ""
+
+            if [not [== 0 [catch { set! v [getvar "${base}::$k"] } v e]]] {
+                continue
+            }
+
+            let t [type $v]
+
+            if [== $t proc] {
+                set! n [+ $n [weft::_doc-sync! [get [Proc::origin $v] file ""]]]
+            }
+
+            if [== $t namespace] {
+                set! n [+ $n [weft::_doc-index-ns! $v [+ $depth 1]]]
+            }
+        }
+
+        return $n
+    }
+
+    ;;; Every documented name whose qualified name or docstring
+    ;;; contains `sub` (case-insensitive), across weft::, user:: and
+    ;;; the live buffers they were defined from.
+    proc apropos {sub} {
+        if [not ${::weft_have_doc}] {
+            return [weft::error::make unsupported \
+                "apropos needs lcl's Doc library (the lcl-lib require root)"]
+        }
+
+        weft::_doc-index-ns! ${::weft} 0
+        weft::_doc-index-ns! ${::user} 0
+
+        let hits [List::sort_by [::Doc::search $sub] [lambda {e} { get $e qname }]]
+        let out [weft::shell::out-buffer! [weft::image::ctx]]
+        var w 0
+
+        foreach e $hits {
+            let l [String::length [get $e qname]]
+
+            if [and [> $l $w] [<= $l 40]] { set! w $l }
+        }
+
+        weft::sink::emit! $out ";; apropos $sub -- [len $hits] documented names.  weft::describe one for the full text.\n"
+
+        foreach e $hits {
+            let first [get [String::split "[get $e doc]\n" "\n"] 0]
+            weft::sink::emit! $out \
+                "  [weft::_pad [get $e qname] $w]  [weft::_pad [get $e kind] 9]  $first\n"
+        }
+
+        return #{kind emitted summary "[len $hits] names -> *output*" count [len $hits]}
+    }
+
+    ;; ---- weft::keys: the chord listing ----
+    ;; The keymap is REFLECTED, not curated: every row the shell
+    ;; registers is a row here, in the groups the intents declare,
+    ;; followed by the bind! scripts by source, the mouse gestures,
+    ;; and the lk editor widget's own keys when this lk reflects them
+    ;; (Lk::editor_keys) -- never a hand-copied list of them.
+    proc _keys-rows {group} {
+        var out ()
+
+        foreach r [weft::keymap::table] {
+            if [== [get $r group] $group] { set! out [List::push $out $r] }
+        }
+
+        return $out
+    }
+
+    proc _keys-emit-group! {out title rows w} {
+        if [empty? $rows] { return 0 }
+
+        ;; The form column is sized per group and omitted where the
+        ;; group has no forms (bars, gestures): docs stay on the line.
+        var fw 0
+
+        foreach r $rows {
+            let l [String::length [get $r form]]
+
+            if [and [> $l $fw] [<= $l 28]] { set! fw $l }
+        }
+
+        weft::sink::emit! $out "\n$title\n"
+        var n 0
+
+        foreach r $rows {
+            var note ""
+            var form ""
+
+            if [== shadowed [get $r status]] {
+                set! note "  (shadowed by a [get $r shadowed_by] binding)"
+            }
+
+            if [== pending [get $r status]] {
+                if [has? ${::Lk} clear_translators] {
+                    set! note "  (PENDING: registered on the next frame)"
+                } else {
+                    set! note "  (PENDING: bound after the shell registered its keys -- this lk has no Lk::clear_translators, so it takes effect on the next start)"
+                }
+            }
+
+            if [> $fw 0] { set! form "[weft::_pad [get $r form] $fw]  " }
+
+            weft::sink::emit! $out \
+                "  [weft::_pad [get $r chord] $w]  $form[get $r doc]$note\n"
+            set! n [+ $n 1]
+        }
+
+        return $n
+    }
+
+    proc _keys-lk-rows {kind} {
+        ;; The widget's bindings as lk reflects them (Lk::editor_keys,
+        ;; lk 0e749ef): key rows #{chord command doc extend_with_shift
+        ;; mods_exact}, pointer rows #{gesture action command doc}.
+        ;; The dispatch IS these tables, so the listing cannot drift
+        ;; from the widget.  Read defensively: a field lk drops later
+        ;; degrades to blank, never to an error in a menu.
+        var rows ()
+
+        foreach k [Lk::editor_keys] {
+            if [not [== $kind [get $k kind]]] { continue }
+
+            var chord ""
+            var doc ""
+            var form ""
+
+            if [has? $k chord] { set! chord [get $k chord] }
+            if [has? $k gesture] { set! chord [get $k gesture] }
+            if [has? $k doc] { set! doc [get $k doc] }
+            if [has? $k command] { set! form [get $k command] }
+
+            if [and [empty? $form] [has? $k action]] {
+                set! form [get $k action]
+            }
+
+            if [and [has? $k extend_with_shift] [get $k extend_with_shift]] {
+                set! doc "$doc; shift extends the selection"
+            }
+
+            if [and [has? $k mods_exact] [get $k mods_exact]] {
+                set! chord "$chord (alone)"
+            }
+
+            if [empty? $chord] { set! chord [String::from $k] }
+
+            set! rows [List::push $rows \
+                #{chord $chord form $form doc $doc status active}]
+        }
+
+        return $rows
+    }
+
+    proc keys {} {
+        let out [weft::shell::out-buffer! [weft::image::ctx]]
+        let table [weft::keymap::table]
+        var w 6
+        var n 0
+
+        foreach r $table {
+            let l [String::length [get $r chord]]
+
+            if [and [> $l $w] [<= $l 20]] { set! w $l }
+        }
+
+        foreach g [weft::keymap::gestures] {
+            let l [String::length [get $g gesture]]
+
+            if [and [> $l $w] [<= $l 20]] { set! w $l }
+        }
+
+        weft::sink::emit! $out \
+            ";; weft keys -- every chord the shell registers, by group.  The\n;; middle column is the same action as a word where one exists:\n;; middle-click it.  In init.lcl, `weft::config::bind! {chord}\n;; {script}` rebinds anything (later wins; a shadowed row says so);\n;; `weft::keymap::chord! {chord} Intent` remaps a shell intent.\n"
+
+        ;; Intent groups in declaration order; unbound rows are a
+        ;; profile error and say so.
+        foreach g [weft::keymap::groups] {
+            set! n [+ $n [weft::_keys-emit-group! $out $g \
+                [weft::_keys-rows $g] $w]]
+        }
+
+        foreach src (native user live) {
+            let title [weft::keymap::source-group $src]
+            var rows ()
+
+            foreach r $table {
+                if [and [== script [get $r kind]] [== [get $r source] $src]] {
+                    set! rows [List::push $rows $r]
+                }
+            }
+
+            set! n [+ $n [weft::_keys-emit-group! $out $title $rows $w]]
+        }
+
+        var bad ()
+
+        foreach r $table {
+            if [== unbound [get $r status]] {
+                set! bad [List::push $bad [Dict::merge $r \
+                    #{doc "PROFILE ERROR: no intent named [get $r intent] -- never registered"}]]
+            }
+        }
+
+        set! n [+ $n [weft::_keys-emit-group! $out \
+            "Chords naming no intent" $bad $w]]
+
+        var grows ()
+
+        foreach g [weft::keymap::gestures] {
+            set! grows [List::push $grows \
+                #{chord [get $g gesture] form "" doc [get $g doc] status active}]
+        }
+
+        set! n [+ $n [weft::_keys-emit-group! $out \
+            "Mouse (the shell's gestures; not rebindable)" $grows $w]]
+
+        if [has? ${::Lk} editor_keys] {
+            set! n [+ $n [weft::_keys-emit-group! $out \
+                "The lk editor widget's own keys (Lk::editor_keys; the command column is Lk::editor_command vocabulary)" \
+                [weft::_keys-lk-rows key] $w]]
+            set! n [+ $n [weft::_keys-emit-group! $out \
+                "The lk editor widget's pointer gestures" \
+                [weft::_keys-lk-rows pointer] $w]]
+        } else {
+            weft::sink::emit! $out \
+                "\nThe lk editor widget's own keys\n  (not reflected by this lk: no Lk::editor_keys -- select-all, copy/cut/paste,\n  undo/redo, ctrl+d select-next-match, ctrl+click add caret, ctrl+shift+up/down,\n  alt+drag box select and escape collapse live in the widget)\n"
+        }
+
+        return #{kind emitted summary "$n keys -> *output*" count $n}
+    }
+}

@@ -1,0 +1,259 @@
+;;; weft::recog -- generic contextual recognizers (command pipeline
+;;; stage C, docs/commands.md).  Consumes the sink's framed line
+;;; records INCREMENTALLY -- only newly emitted lines, never a rescan
+;;; of a growing buffer -- and resolves candidates against the
+;;; PRODUCING RUN's cwd (the root annotation context), so `ls`, grep,
+;;; compilers, and git output become interactive with zero
+;;; command-specific knowledge.
+;;;
+;;; What makes this different from a plumb rule: VERIFICATION.  A
+;;; token only becomes a file/dir presentation if the resolved path
+;;; actually exists (fs.file? / fs.dir? capabilities); the pattern can
+;;; therefore be loose -- the filesystem carries the false-positive
+;;; load.  URLs are recognized textually.
+;;;
+;;; Per line, in claim order: url -> file:line (file part verified)
+;;; -> bare tokens (verified; file beats dir).  Later recognizers skip
+;;; ranges already claimed.  Annotations land on the `loc` layer with
+;;; a typed `loc` presentation:
+;;;   #{kind file|dir|fileline|url path .. line .. url ..}
+;;; Gesture policy (open / goto / re-list / browse) lives in the
+;;; shell, not here.
+
+namespace weft::recog {
+
+    var _url ""
+    var _fl ""
+
+    if $weft_have_regex {
+        set! _url [Regex::compile {https?://[^ \t]+}]
+        set! _fl [Regex::compile {([A-Za-z0-9_.~/+-]+):([0-9]+)}]
+    }
+
+    ;; ---- capability probes ----
+
+    proc _file? {p} {
+        let t [weft::cap::invoke "fs.file?" #{path $p} #{}]
+
+        if [== [weft::task::state $t] succeeded] {
+            return [weft::task::result $t]
+        }
+
+        return 0
+    }
+
+    proc _dir? {p} {
+        let t [weft::cap::invoke "fs.dir?" #{path $p} #{}]
+
+        if [== [weft::task::state $t] succeeded] {
+            return [weft::task::result $t]
+        }
+
+        return 0
+    }
+
+    proc _resolve {tok cwd} {
+        if [empty? $tok] { return "" }
+        if [== [String::index $tok 0] "/"] { return $tok }
+        if [== [String::index $tok 0] "~"] { return "" }
+        if [empty? $cwd] { return "" }
+
+        return "$cwd/$tok"
+    }
+
+    proc _claimed? {claimed s e} {
+        foreach c $claimed {
+            if [and [< [get $c 0] $e] [> [get $c 1] $s]] { return 1 }
+        }
+
+        return 0
+    }
+
+    ;; Attach the loc annotation + presentation.  Skips ranges that
+    ;; end at the buffer tail: lk end anchors are RIGHT-biased, so a
+    ;; tail-closed span would grow with the next append (only
+    ;; close!-flushed partial lines can hit this).
+    proc _mark! {bid s e value} {
+        if [>= $e [Lk::doc_len [weft::ws::buffer-doc $bid]]] {
+            return ""
+        }
+
+        let store [weft::ws::buffer-store $bid]
+        let a [Lk::annot_add $store $s $e "loc" $value]
+        weft::ws::present! $store $a "loc" $value
+        return ""
+    }
+
+    ;; Shrink a match's end past trailing punctuation.
+    proc _trim-end {text s e} {
+        var e2 $e
+
+        while [and [> $e2 $s] [>= [String::find {,.;:)>"'} \
+                [String::index $text [- $e2 1]]] 0]] {
+            set! e2 [- $e2 1]
+        }
+
+        return $e2
+    }
+
+    ;; Recognize one framed line.  `start` is the line's absolute
+    ;; offset in the buffer; offsets within `text` are relative.
+    proc line! {bid cwd start text} {
+        if [not $weft_have_regex] { return "" }
+
+        let n [String::length $text]
+        var claimed ()
+        var pos 0
+        var going 1
+
+        ;; ---- URLs (textual; no filesystem) ----
+        while $going {
+            if [> $pos $n] {
+                set! going 0
+            } else {
+                let m [Regex::search $_url $text $pos]
+
+                if [== 0 [len $m]] {
+                    set! going 0
+                } else {
+                    let so [get [get $m 0] 0]
+                    let eo [get [get $m 0] 1]
+                    let e2 [weft::recog::_trim-end $text $so $eo]
+
+                    if [> $e2 $so] {
+                        weft::recog::_mark! $bid [+ $start $so] \
+                            [+ $start $e2] #{kind {url}
+                                url [String::range $text $so $e2]}
+                        set! claimed [List::push $claimed ($so $e2)]
+                    }
+
+                    if [> $eo $pos] {
+                        set! pos $eo
+                    } else {
+                        set! pos [+ $pos 1]
+                    }
+                }
+            }
+        }
+
+        ;; ---- file:line (file part verified against cwd) ----
+        set! pos 0
+        set! going 1
+
+        while $going {
+            if [> $pos $n] {
+                set! going 0
+            } else {
+                let m [Regex::search $_fl $text $pos]
+
+                if [== 0 [len $m]] {
+                    set! going 0
+                } else {
+                    let so [get [get $m 0] 0]
+                    let eo [get [get $m 0] 1]
+                    let f [get $m 1]
+                    let l [get $m 2]
+
+                    if [not [weft::recog::_claimed? $claimed $so $eo]] {
+                        let fpath [weft::recog::_resolve \
+                            [String::range $text [get $f 0] [get $f 1]] \
+                            $cwd]
+
+                        if [and [not [empty? $fpath]] \
+                                [weft::recog::_file? $fpath]] {
+                            weft::recog::_mark! $bid [+ $start $so] \
+                                [+ $start $eo] #{kind {fileline}
+                                    path $fpath
+                                    line [int [String::range $text \
+                                        [get $l 0] [get $l 1]]]}
+                            set! claimed [List::push $claimed ($so $eo)]
+                        }
+                    }
+
+                    if [> $eo $pos] {
+                        set! pos $eo
+                    } else {
+                        set! pos [+ $pos 1]
+                    }
+                }
+            }
+        }
+
+        ;; ---- bare tokens, filesystem-verified (file beats dir) ----
+        var i 0
+        var count 0
+
+        while [and [< $i $n] [< $count 16]] {
+            var c [String::index $text $i]
+
+            if [or [== $c " "] [== $c "\t"]] {
+                set! i [+ $i 1]
+            } else {
+                var ts $i
+
+                while [and [< $i $n] \
+                        [not [or [== [String::index $text $i] " "] \
+                                 [== [String::index $text $i] "\t"]]]] {
+                    set! i [+ $i 1]
+                }
+
+                var te [weft::recog::_trim-end $text $ts $i]
+
+                while [and [< $ts $te] [>= [String::find {("'<} \
+                        [String::index $text $ts]] 0]] {
+                    set! ts [+ $ts 1]
+                }
+
+                if [and [> $te $ts] \
+                        [not [weft::recog::_claimed? $claimed $ts $te]]] {
+                    let tok [String::range $text $ts $te]
+
+                    if [and [not [== $tok {.}]] [not [== $tok {..}]]] {
+                        let p [weft::recog::_resolve $tok $cwd]
+
+                        if [not [empty? $p]] {
+                            if [weft::recog::_file? $p] {
+                                weft::recog::_mark! $bid [+ $start $ts] \
+                                    [+ $start $te] #{kind {file} path $p}
+                                set! claimed [List::push $claimed \
+                                    ($ts $te)]
+                            } else {
+                                if [weft::recog::_dir? $p] {
+                                    weft::recog::_mark! $bid \
+                                        [+ $start $ts] [+ $start $te] \
+                                        #{kind {dir} path $p}
+                                    set! claimed [List::push $claimed \
+                                        ($ts $te)]
+                                }
+                            }
+                        }
+                    }
+                }
+
+                set! count [+ $count 1]
+            }
+        }
+
+        return ""
+    }
+
+    ;; Recognize a batch of sink line records against a run's context.
+    proc lines! {rid records} {
+        if [not $weft_have_regex] { return "" }
+
+        let run [weft::cmd::run $rid]
+
+        if [empty? $run] { return "" }
+
+        let bid [get $run buffer]
+        let cwd [get $run cwd]
+
+        foreach r $records {
+            if [<= [String::length [get $r text]] 500] {
+                weft::recog::line! $bid $cwd [get $r start] [get $r text]
+            }
+        }
+
+        return ""
+    }
+}
