@@ -18,9 +18,9 @@ namespace weft::shell {
         (Save pane {Buffers and panes}
             {save this buffer} {})
         (SplitH pane {Buffers and panes}
-            {split this pane side by side, showing the same buffer} {weft::split-h})
+            {split this pane side by side, showing the same buffer} {weft::split right})
         (SplitV pane {Buffers and panes}
-            {split this pane stacked, likewise} {weft::split-v})
+            {split this pane stacked, likewise} {weft::split down})
         (ClosePane pane {Buffers and panes}
             {close this pane -- its buffer stays open} {})
         (NextPane pane {Buffers and panes}
@@ -78,7 +78,7 @@ namespace weft::shell {
         ({middle-click}
             {EXECUTE the word under the pointer (the selection, when clicked inside it); outside a selection the word runs WITH the selection as its operand})
         ({right-click}
-            {LOOK: a plumbed range, qjump row or verified location acts; a bare word finds its next occurrence})
+            {LOOK: a plumbed range, qjump row, verified location or workspace pane row acts; a bare word finds its next occurrence})
         ({shift+right-click}
             {LOOK, opening the result in a new pane beside this one})
         ({drag a split border}

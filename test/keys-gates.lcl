@@ -118,7 +118,7 @@ gate "return rows live in bar scopes only" [not $_ret_pane]
 var _splith #{}
 foreach r [weft::keymap::lookup "ctrl+e"] { set! _splith $r }
 gate "an intent row resolves doc/group/form from the intent" \
-    [and [== "weft::split-h" [get $_splith form]] \
+    [and [== "weft::split right" [get $_splith form]] \
          [and [not [empty? [get $_splith doc]]] \
               [== "Buffers and panes" [get $_splith group]]]]
 
@@ -257,7 +257,7 @@ gate "listing has the intent groups" \
          [>= [String::find $_text "Execute"] 0]]
 gate "listing shows the chord, the command form and the doc" \
     [and [>= [String::find $_text "ctrl+e"] 0] \
-         [and [>= [String::find $_text "weft::split-h"] 0] \
+         [and [>= [String::find $_text "weft::split right"] 0] \
               [>= [String::find $_text "side by side"] 0]]]
 gate "listing says what shadows what" \
     [>= [String::find $_text "shadowed by a live binding"] 0]

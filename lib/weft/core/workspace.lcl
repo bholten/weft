@@ -36,9 +36,14 @@ namespace weft::ws {
     var nodes #{}
     var root ""
     var focused ""
+    var zoomed 0
 
     ;; ---- lifecycle ----
 
+    ;; `zoomed` is workspace SHAPE and resets with the tree;
+    ;; focus_history and meta_gen survive init! deliberately (one is a
+    ;; cross-workspace convenience lazily filtered on read, the other
+    ;; a cache generation that must only ever move forward).
     proc init! {editor_hooks} {
         set! hooks $editor_hooks
         set! buffers #{}
@@ -46,6 +51,7 @@ namespace weft::ws {
         set! nodes #{}
         set! root ""
         set! focused ""
+        set! zoomed 0
         return 1
     }
 
@@ -771,10 +777,11 @@ namespace weft::ws {
 
     ;; Split a pane along axis (h = side by side, v = stacked), showing
     ;; buffer_id in the new pane (pass the pane's own buffer for the
-    ;; two-views-one-buffer case).  The old pane keeps its view and id;
-    ;; a new split node takes its place in the tree.  Returns the new
-    ;; pane id; focus moves to it.
-    proc pane-split! {pane_id axis buffer_id} {
+    ;; two-views-one-buffer case).  `side` places the new pane: b =
+    ;; after (right of / below the old pane), a = before.  The old pane
+    ;; keeps its view and id; a new split node takes its place in the
+    ;; tree.  Returns the new pane id; focus moves to it.
+    proc pane-split-at! {pane_id axis side buffer_id} {
         let old [weft::ws::node $pane_id]
 
         if [not [== [get $old kind] pane]] {
@@ -788,8 +795,15 @@ namespace weft::ws {
 
         weft::ws::_node-put! $new_pane \
             #{id $new_pane kind pane view $vid parent $split}
-        weft::ws::_node-put! $split #{id $split kind split axis $axis
-            ratio 0.5 a $pane_id b $new_pane parent $parent}
+
+        if [== $side a] {
+            weft::ws::_node-put! $split #{id $split kind split axis $axis
+                ratio 0.5 a $new_pane b $pane_id parent $parent}
+        } else {
+            weft::ws::_node-put! $split #{id $split kind split axis $axis
+                ratio 0.5 a $pane_id b $new_pane parent $parent}
+        }
+
         weft::ws::_reparent! $pane_id $split
 
         if [empty? $parent] {
@@ -799,8 +813,13 @@ namespace weft::ws {
         }
 
         set! focused $new_pane
+        set! zoomed 0
 
         return $new_pane
+    }
+
+    proc pane-split! {pane_id axis buffer_id} {
+        return [weft::ws::pane-split-at! $pane_id $axis b $buffer_id]
     }
 
     ;; Close a pane: destroy its view (buffer survives), collapse its
@@ -846,6 +865,8 @@ namespace weft::ws {
             set! focused [get [weft::ws::panes-in $sibling] 0]
         }
 
+        set! zoomed 0
+
         return 1
     }
 
@@ -859,9 +880,47 @@ namespace weft::ws {
         return 1
     }
 
-    ;; Show a buffer in a pane: new view in, old view out (closed only
-    ;; after the swap so its editor state snapshots normally).
-    proc pane-show-buffer! {pane_id buffer_id} {
+    ;; ---- per-pane buffer history ----
+    ;;
+    ;; Each pane carries its own trail: optional `hist` (back stack)
+    ;; and `fwd` fields on the pane node, most recent first, buffer
+    ;; IDS (views die on show, so a view trail would dangle at once).
+    ;; Node-resident, so pane-close! garbage-collects it and sessions
+    ;; ignore it (ids are runtime-only).  Dead entries are skipped on
+    ;; read -- the focus_history idiom -- and pruned only in passing
+    ;; by back/forward.
+
+    var _hist_cap 50
+
+    proc _pane-hist {pane_id} {
+        let n [weft::ws::node $pane_id]
+
+        if [has? $n hist] { return [get $n hist] }
+
+        return ()
+    }
+
+    proc _pane-fwd {pane_id} {
+        let n [weft::ws::node $pane_id]
+
+        if [has? $n fwd] { return [get $n fwd] }
+
+        return ()
+    }
+
+    proc _hist-cap {lst} {
+        if [> [len $lst] $_hist_cap] {
+            return [List::slice $lst 0 $_hist_cap]
+        }
+
+        return $lst
+    }
+
+    ;; The view churn alone -- what pane-show-buffer! did before
+    ;; history: new view in, old view out (closed only after the swap
+    ;; so its editor state snapshots normally).  Back/forward call
+    ;; THIS -- moving along the trail never pushes onto it.
+    proc _pane-display! {pane_id buffer_id} {
         let old_view [weft::ws::pane-view $pane_id]
 
         if [== [weft::ws::view-buffer $old_view] $buffer_id] {
@@ -876,12 +935,120 @@ namespace weft::ws {
         return $vid
     }
 
+    ;; Show a buffer in a pane; the pane remembers.  The old buffer
+    ;; is pushed onto the pane's back stack and the forward stack
+    ;; clears (the browser rule: a fresh navigation forks the trail).
+    proc pane-show-buffer! {pane_id buffer_id} {
+        let old_view [weft::ws::pane-view $pane_id]
+        let old_buf [weft::ws::view-buffer $old_view]
+
+        if [== $old_buf $buffer_id] { return $old_view }
+
+        let hist [weft::ws::_hist-cap \
+            [List::concat [list $old_buf] [weft::ws::_pane-hist $pane_id]]]
+        var n [weft::ws::node $pane_id]
+
+        set! n [put $n hist $hist]
+        set! n [put $n fwd ()]
+        weft::ws::_node-put! $pane_id $n
+
+        return [weft::ws::_pane-display! $pane_id $buffer_id]
+    }
+
+    ;; Step back along this pane's trail: the first LIVE entry that
+    ;; is not the current buffer is shown, the current buffer moves
+    ;; to the forward stack, and the dead entries walked past are
+    ;; pruned.  Returns the buffer shown, "" at the end of the trail.
+    proc pane-back! {pane_id} {
+        let cur [weft::ws::view-buffer [weft::ws::pane-view $pane_id]]
+        let hist [weft::ws::_pane-hist $pane_id]
+        var target ""
+        var rest ()
+        var i 0
+
+        foreach b $hist {
+            set! i [+ $i 1]
+
+            if [empty? $target] {
+                if [and [weft::ws::buffer? $b] [not [== $b $cur]]] {
+                    set! target $b
+                    set! rest [List::slice $hist $i]
+                }
+            }
+        }
+
+        if [empty? $target] { return "" }
+
+        var n [weft::ws::node $pane_id]
+
+        set! n [put $n hist $rest]
+        set! n [put $n fwd [weft::ws::_hist-cap \
+            [List::concat [list $cur] [weft::ws::_pane-fwd $pane_id]]]]
+        weft::ws::_node-put! $pane_id $n
+        weft::ws::_pane-display! $pane_id $target
+
+        return $target
+    }
+
+    proc pane-forward! {pane_id} {
+        let cur [weft::ws::view-buffer [weft::ws::pane-view $pane_id]]
+        let fwd [weft::ws::_pane-fwd $pane_id]
+        var target ""
+        var rest ()
+        var i 0
+
+        foreach b $fwd {
+            set! i [+ $i 1]
+
+            if [empty? $target] {
+                if [and [weft::ws::buffer? $b] [not [== $b $cur]]] {
+                    set! target $b
+                    set! rest [List::slice $fwd $i]
+                }
+            }
+        }
+
+        if [empty? $target] { return "" }
+
+        var n [weft::ws::node $pane_id]
+
+        set! n [put $n fwd $rest]
+        set! n [put $n hist [weft::ws::_hist-cap \
+            [List::concat [list $cur] [weft::ws::_pane-hist $pane_id]]]]
+        weft::ws::_node-put! $pane_id $n
+        weft::ws::_pane-display! $pane_id $target
+
+        return $target
+    }
+
+    ;; The pane's own most recent live buffer other than `excluding`;
+    ;; "" when none.  Read-only skip, no pruning -- close evacuation
+    ;; reads this before falling to the global MRU.
+    proc pane-hist-fallback {pane_id excluding} {
+        foreach b [weft::ws::_pane-hist $pane_id] {
+            if [and [weft::ws::buffer? $b] [not [== $b $excluding]]] {
+                return $b
+            }
+        }
+
+        return ""
+    }
+
+    ;; Raw stacks for gates/inspection: #{back (..) fwd (..)},
+    ;; unfiltered -- callers skip dead ids, as with focus-history.
+    proc pane-history {pane_id} {
+        return #{back [weft::ws::_pane-hist $pane_id]
+                 fwd [weft::ws::_pane-fwd $pane_id]}
+    }
+
     proc pane-swap-views! {pane_a pane_b} {
         let va [weft::ws::pane-view $pane_a]
         let vb [weft::ws::pane-view $pane_b]
 
         weft::ws::pane-set-view! $pane_a $vb
         weft::ws::pane-set-view! $pane_b $va
+
+        set! zoomed 0
 
         return 1
     }
@@ -907,6 +1074,8 @@ namespace weft::ws {
         if [== [get $s axis] v] { set! axis h }
 
         weft::ws::_node-put! $sid [put $s axis $axis]
+
+        set! zoomed 0
 
         return #{split $sid axis $axis}
     }
@@ -967,8 +1136,209 @@ namespace weft::ws {
         return $root
     }
 
+    ;; ---- geometry (normalized; headless) ----
+    ;;
+    ;; Pane rectangles in the unit square, derived from the split tree
+    ;; and its ratios -- the same numbers the shell hands lk to draw
+    ;; (up to borders/padding), with no widget in the loop.  y grows
+    ;; downward.
+
+    proc _rects-into {node_id x y w h acc} {
+        let n [weft::ws::node $node_id]
+
+        if [== [get $n kind] pane] {
+            return [put $acc $node_id #{x $x y $y w $w h $h}]
+        }
+
+        let r [get $n ratio]
+
+        if [== [get $n axis] h] {
+            let aw [* $w $r]
+            let acc2 [weft::ws::_rects-into [get $n a] $x $y $aw $h $acc]
+
+            return [weft::ws::_rects-into [get $n b] [+ $x $aw] $y \
+                        [- $w $aw] $h $acc2]
+        }
+
+        let ah [* $h $r]
+        let acc2 [weft::ws::_rects-into [get $n a] $x $y $w $ah $acc]
+
+        return [weft::ws::_rects-into [get $n b] $x [+ $y $ah] $w \
+                    [- $h $ah] $acc2]
+    }
+
+    proc pane-rects {} {
+        if [empty? $root] { return #{} }
+
+        return [weft::ws::_rects-into $root 0.0 0.0 1.0 1.0 #{}]
+    }
+
+    var _eps 0.000001
+
+    proc _fmin {a b} {
+        if [< $a $b] { return $a }
+        return $b
+    }
+
+    proc _fmax {a b} {
+        if [> $a $b] { return $a }
+        return $b
+    }
+
+    ;; The nearest pane in a spatial direction from `pane_id`, over the
+    ;; normalized rects: candidates lie at or beyond the focal edge
+    ;; (shared borders count) and overlap the focal pane on the
+    ;; perpendicular axis (corner neighbours do not).  Nearest edge
+    ;; wins; ties fall to the larger perpendicular overlap, then to
+    ;; the most recently focused, then to tree order.  "" when no pane
+    ;; lies that way -- no wrapping.
+    proc pane-in-direction {pane_id dir} {
+        let n [weft::ws::node $pane_id]
+
+        if [not [== [get $n kind] pane]] {
+            return [weft::error::make invalid-args "$pane_id is not a pane"]
+        }
+
+        if [not [or [== $dir left] [or [== $dir right]
+                [or [== $dir up] [== $dir down]]]]] {
+            return [weft::error::make invalid-args \
+                "direction must be left, right, up or down (got $dir)"]
+        }
+
+        let rects [weft::ws::pane-rects]
+        let r [get $rects $pane_id]
+        let rl [get $r x]
+        let rt [get $r y]
+        let rr [+ $rl [get $r w]]
+        let rb [+ $rt [get $r h]]
+
+        ;; recency rank over the focus history, most recent = 0
+        ;; (declared later in the module -- reach it qualified)
+        var rank #{}
+        var i 0
+
+        foreach p [weft::ws::focus-history] {
+            if [not [has? $rank $p]] { set! rank [put $rank $p $i] }
+            set! i [+ $i 1]
+        }
+
+        var best ""
+        var bd 0.0
+        var bo 0.0
+        var br 1000000
+
+        foreach q [weft::ws::panes] {
+            if [== $q $pane_id] { continue }
+
+            let s [get $rects $q]
+            let sl [get $s x]
+            let st [get $s y]
+            let sr [+ $sl [get $s w]]
+            let sb [+ $st [get $s h]]
+
+            var ok 0
+            var dist 0.0
+            var ov 0.0
+
+            if [== $dir left] {
+                if [<= $sr [+ $rl $_eps]] {
+                    set! ok 1
+                    set! dist [- $rl $sr]
+                    set! ov [- [weft::ws::_fmin $rb $sb]
+                               [weft::ws::_fmax $rt $st]]
+                }
+            }
+            if [== $dir right] {
+                if [>= $sl [- $rr $_eps]] {
+                    set! ok 1
+                    set! dist [- $sl $rr]
+                    set! ov [- [weft::ws::_fmin $rb $sb]
+                               [weft::ws::_fmax $rt $st]]
+                }
+            }
+            if [== $dir up] {
+                if [<= $sb [+ $rt $_eps]] {
+                    set! ok 1
+                    set! dist [- $rt $sb]
+                    set! ov [- [weft::ws::_fmin $rr $sr]
+                               [weft::ws::_fmax $rl $sl]]
+                }
+            }
+            if [== $dir down] {
+                if [>= $st [- $rb $_eps]] {
+                    set! ok 1
+                    set! dist [- $st $rb]
+                    set! ov [- [weft::ws::_fmin $rr $sr]
+                               [weft::ws::_fmax $rl $sl]]
+                }
+            }
+
+            if [not $ok] { continue }
+            if [<= $ov $_eps] { continue }
+
+            var qr 1000000
+
+            if [has? $rank $q] { set! qr [get $rank $q] }
+
+            var win 0
+
+            if [empty? $best] { set! win 1 }
+            if [not $win] {
+                if [< $dist [- $bd $_eps]] { set! win 1 }
+            }
+            if [not $win] {
+                if [and [<= $dist [+ $bd $_eps]] [> $ov [+ $bo $_eps]]] {
+                    set! win 1
+                }
+            }
+            if [not $win] {
+                if [and [<= $dist [+ $bd $_eps]]
+                        [and [>= $ov [- $bo $_eps]] [< $qr $br]]] {
+                    set! win 1
+                }
+            }
+
+            if $win {
+                set! best $q
+                set! bd $dist
+                set! bo $ov
+                set! br $qr
+            }
+        }
+
+        return $best
+    }
+
     proc focused-pane {} {
         return $focused
+    }
+
+    ;; ---- zoom ----
+    ;;
+    ;; Workspace shape, render-level: while set, the shell projects
+    ;; only the focused pane; the tree, its ratios and every hidden
+    ;; view stay intact.  Anything that changes the tree or moves
+    ;; focus to a DIFFERENT pane drops the zoom; showing another
+    ;; buffer in the zoomed pane (show / send / back) does not --
+    ;; that is the zoomed workflow.
+
+    proc zoomed? {} {
+        return $zoomed
+    }
+
+    proc unzoom! {} {
+        set! zoomed 0
+        return 0
+    }
+
+    proc zoom-toggle! {} {
+        if $zoomed {
+            set! zoomed 0
+        } else {
+            set! zoomed 1
+        }
+
+        return $zoomed
     }
 
     ;; Focus history, most recent first.  It answers "which view of
@@ -979,6 +1349,12 @@ namespace weft::ws {
     var focus_history ()
 
     proc focus! {pane_id} {
+        ;; The guard is load-bearing: the shell mirrors every lk
+        ;; focus_changed through here, and while zoomed the only
+        ;; editor IS the focused pane's -- a same-pane re-focus must
+        ;; keep the zoom.
+        if [not [== $pane_id $focused]] { set! zoomed 0 }
+
         set! focused $pane_id
 
         var hist [list $pane_id]
@@ -1020,9 +1396,9 @@ namespace weft::ws {
 
     ;; The most recently active buffer other than `bid` -- the focus
     ;; history walked for the first live pane whose view shows another
-    ;; buffer; "" when none.  (Per-pane history would be kinder when
-    ;; one buffer fills several panes; the kernel keeps none, and
-    ;; docs/buffers.md adds no state for it.)
+    ;; buffer; "" when none.  (The WORKSPACE-wide fallback: close
+    ;; evacuation asks the pane's own trail first --
+    ;; pane-hist-fallback -- and comes here only when that is empty.)
     proc mru-buffer-excluding {bid} {
         let live [weft::ws::panes]
 
@@ -1057,7 +1433,11 @@ namespace weft::ws {
             set! i [+ $i 1]
         }
 
-        set! focused [get $ps [% [+ $idx 1] [len $ps]]]
+        let next [get $ps [% [+ $idx 1] [len $ps]]]
+
+        if [not [== $next $focused]] { set! zoomed 0 }
+
+        set! focused $next
 
         return $focused
     }

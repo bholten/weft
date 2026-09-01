@@ -1176,6 +1176,23 @@ proc wsh_qjump_hit {cmd new} {
     return ""
 }
 
+;; LOOK on a weft::workspace pane row: focus that pane.  The value
+;; carries a pane id from an earlier listing -- panes are disposable
+;; projections, so a dead one just says so.
+proc wsh_pane_jump {cmd} {
+    let pid [get [get [get $cmd hit] value] pane]
+
+    if [not [== pane [get [weft::ws::node $pid] kind]]] {
+        wsh_flash_set "pane is gone -- re-run weft::workspace"
+        return ""
+    }
+
+    weft::ws::focus! $pid
+    wsh_focus_editor
+
+    return ""
+}
+
 proc wsh_plumb_hit {cmd new} {
     let pane [wsh_hit_pane $cmd $new]
     let r [weft::plumb::dispatch! [get [get $cmd hit] value] \
@@ -1945,6 +1962,23 @@ proc wsh_render_node {node_id} {
     return ""
 }
 
+;; The pane tree, or -- zoomed -- only the focused pane.  The tree,
+;; its ratios and the hidden views stay in the kernel; editors live
+;; on views, so nothing is destroyed and unzoom is a free re-render.
+proc wsh_render_root {} {
+    var rt [weft::ws::tree-root]
+
+    if [weft::ws::zoomed?] {
+        let fp [weft::ws::focused-pane]
+
+        if [== pane [get [weft::ws::node $fp] kind]] { set! rt $fp }
+    }
+
+    wsh_render_node $rt
+
+    return 1
+}
+
 proc wsh_status_name {} {
     let f [weft::ws::focused-ctx-fields]
 
@@ -1955,7 +1989,11 @@ proc wsh_status_name {} {
 
     if [weft::ws::buffer-dirty? [get $f buffer]] { set! mark " *" }
 
-    return "[get $b name]$mark"
+    var zoom ""
+
+    if [weft::ws::zoomed?] { set! zoom {  [zoom]} }
+
+    return "[get $b name]$mark$zoom"
 }
 
 proc wsh_status_pos {} {
@@ -2024,6 +2062,7 @@ proc wsh_register_input! {} {
     translator pointer_down #{button secondary} plumb PlumbHit
     translator pointer_down #{button secondary} qjump QjumpHit
     translator pointer_down #{button secondary} loc LocHit
+    translator pointer_down #{button secondary} panejump PaneJumpHit
     translator pointer_down #{button secondary mods shift} plumb PlumbHitNew
     translator pointer_down #{button secondary mods shift} qjump QjumpHitNew
     translator pointer_down #{button secondary mods shift} loc LocHitNew
@@ -2228,6 +2267,7 @@ proc wsh_run {files} {
         on PlumbHitNew [lambda {cmd} { wsh_plumb_hit $cmd 1 }]
         on LocHit [lambda {cmd} { wsh_loc_hit $cmd 0 }]
         on LocHitNew [lambda {cmd} { wsh_loc_hit $cmd 1 }]
+        on PaneJumpHit [lambda {cmd} { wsh_pane_jump $cmd }]
 
         ;; Raw-event tier: focus mirroring plus the EXECUTE/LOOK
         ;; fallbacks for clicks that hit no presented range (those were
@@ -2306,7 +2346,7 @@ proc wsh_run {files} {
             wsh_follow_output
 
             column "root" #{align stretch gap 4 padding 6} {
-                wsh_render_node [weft::ws::tree-root]
+                wsh_render_root
 
                 if [not [empty? $wsh_bar]] {
                     row "minibar" #{gap 8} {

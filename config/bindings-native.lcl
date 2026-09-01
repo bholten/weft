@@ -65,13 +65,42 @@ weft::config::bind! "ctrl+shift+e" {weft::transpose} \
 ;; ---- fresh buffers: the tiling-window-manager move ----
 ;; ctrl+e / ctrl+shift+d split showing the SAME buffer (shell chords);
 ;; the alt spellings split showing a NEW empty one, and ctrl+shift+n
-;; opens one in place.  `weft::new v notes` from any text names it.
+;; opens one in place.  `weft::new down notes` from any text names it.
 weft::config::bind! "ctrl+shift+n" {weft::new} \
     {a fresh empty buffer in this pane}
-weft::config::bind! "ctrl+alt+e"   {weft::new h} \
+weft::config::bind! "ctrl+alt+e"   {weft::new right} \
     {a fresh empty buffer in a new pane beside this one}
-weft::config::bind! "ctrl+alt+d"   {weft::new v} \
+weft::config::bind! "ctrl+alt+d"   {weft::new down} \
     {a fresh empty buffer in a new pane below this one}
+
+;; ---- spatial navigation ----
+;; The workspace is a manual tiler: focus is the spatial cursor.
+;; Arrow chords reach the app because lk's editor masks Alt on every
+;; key row (Alt chords always bubble).  `weft::swap <dir>` exchanges
+;; two panes' contents and stays a command -- bind! it if it earns a
+;; chord.  Edges are quiet no-ops; there is no wrapping.
+weft::config::bind! "ctrl+alt+left"  {weft::focus left} \
+    {focus the pane to the left}
+weft::config::bind! "ctrl+alt+right" {weft::focus right} \
+    {focus the pane to the right}
+weft::config::bind! "ctrl+alt+up"    {weft::focus up} \
+    {focus the pane above}
+weft::config::bind! "ctrl+alt+down"  {weft::focus down} \
+    {focus the pane below}
+weft::config::bind! "ctrl+alt+shift+left"  {weft::send left} \
+    {show this buffer in the pane to the left (focus stays)}
+weft::config::bind! "ctrl+alt+shift+right" {weft::send right} \
+    {show this buffer in the pane to the right (focus stays)}
+weft::config::bind! "ctrl+alt+shift+up"    {weft::send up} \
+    {show this buffer in the pane above (focus stays)}
+weft::config::bind! "ctrl+alt+shift+down"  {weft::send down} \
+    {show this buffer in the pane below (focus stays)}
+weft::config::bind! "ctrl+alt+z" {weft::zoom} \
+    {show only this pane, tree intact -- toggle (weft::only destroys)}
+weft::config::bind! "alt+left"  {weft::back} \
+    {this pane's previous buffer (its own trail)}
+weft::config::bind! "alt+right" {weft::forward} \
+    {forward along this pane's buffer trail}
 
 ;; ---- transforms ----
 ;; Scripts evaluate in the image with the focused buffer and selection
