@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.14)
 
 project(weft
   VERSION 0.1.0
-  DESCRIPTION "Weft: a programmable textual workspace on lk/Lcl"
+  DESCRIPTION "Weft: a programmable textual workspace on Lcl/Lk"
   LANGUAGES C
 )
 

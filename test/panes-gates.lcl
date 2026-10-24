@@ -1,0 +1,304 @@
+;;; Spatial pane vocabulary gates: normalized rects, directional
+;;; resolution, focus/swap/send, zoom, per-pane buffer history and
+;;; weft::workspace.  Headless, CWD-independent:
+;;;   weft --headless test/panes-gates.lcl
+
+proc gate {name ok} {
+    if [not $ok] { error "GATE FAILED: $name" }
+    puts "ok: $name"
+}
+
+require "weft/host/test.lcl"
+
+weft::ws::init! [weft::testhost::editor-hooks]
+
+proc ev {code ctx} {
+    let r [weft::image::eval-in! user $code $ctx]
+
+    if [not [get $r ok]] { return [get $r error] }
+
+    return [get $r value]
+}
+
+proc near {a b} {
+    var d [- $a $b]
+
+    if [< $d 0] { set! d [- 0 $d] }
+
+    return [< $d 0.000001]
+}
+
+weft::testhost::fs-put! "/w/a.md" "aaa\n"
+weft::testhost::fs-put! "/w/b.md" "bbb\n"
+weft::testhost::fs-put! "/w/c.md" "ccc\n"
+weft::testhost::fs-put! "/w/d.md" "ddd\n"
+
+let _c0 [weft::ctx::make #{}]
+let _ba [weft::ws::buffer-open! "/w/a.md" $_c0]
+let _bb [weft::ws::buffer-open! "/w/b.md" $_c0]
+let _bc [weft::ws::buffer-open! "/w/c.md" $_c0]
+let _bd [weft::ws::buffer-open! "/w/d.md" $_c0]
+
+;; ===================== rects =====================
+let _p1 [weft::ws::tree-init! [weft::ws::view-create! $_ba]]
+let _r0 [get [weft::ws::pane-rects] $_p1]
+gate "rects: a single pane fills the unit square" \
+    [and [near [get $_r0 x] 0.0] \
+         [and [near [get $_r0 y] 0.0] \
+              [and [near [get $_r0 w] 1.0] [near [get $_r0 h] 1.0]]]]
+
+;; The 2x2 grid: _p1 top-left, _p2 top-right, _p3 bottom-left,
+;; _p4 bottom-right.
+let _p2 [weft::ws::pane-split! $_p1 h $_bb]
+let _p3 [weft::ws::pane-split! $_p1 v $_bc]
+let _p4 [weft::ws::pane-split! $_p2 v $_bd]
+
+let _r1 [get [weft::ws::pane-rects] $_p1]
+gate "rects: a split halves the space" \
+    [and [near [get $_r1 w] 0.5] [near [get $_r1 h] 0.5]]
+let _r4 [get [weft::ws::pane-rects] $_p4]
+gate "rects: nested splits compose" \
+    [and [near [get $_r4 x] 0.5] \
+         [and [near [get $_r4 y] 0.5] \
+              [and [near [get $_r4 w] 0.5] [near [get $_r4 h] 0.5]]]]
+
+weft::ws::split-ratio-set! [get [weft::ws::node $_p1] parent] 0.3
+let _r3 [get [weft::ws::pane-rects] $_p3]
+gate "rects: ratios flow into the rects" \
+    [and [near [get $_r3 y] 0.3] [near [get $_r3 h] 0.7]]
+weft::ws::split-ratio-set! [get [weft::ws::node $_p1] parent] 0.5
+
+;; ===================== directions =====================
+gate "direction: right from top-left is the top-right pane" \
+    [== $_p2 [weft::ws::pane-in-direction $_p1 right]]
+gate "direction: down from top-left is the bottom-left pane" \
+    [== $_p3 [weft::ws::pane-in-direction $_p1 down]]
+gate "direction: edges do not wrap" \
+    [and [== "" [weft::ws::pane-in-direction $_p1 left]] \
+         [== "" [weft::ws::pane-in-direction $_p1 up]]]
+gate "direction: diagonal neighbours are never candidates" \
+    [and [== $_p3 [weft::ws::pane-in-direction $_p4 left]] \
+         [== $_p2 [weft::ws::pane-in-direction $_p4 up]]]
+gate "direction: a bad word is invalid-args" \
+    [== invalid-args \
+        [weft::error::code [weft::ws::pane-in-direction $_p1 sideways]]]
+
+;; Tie-breaks: A over C in the left column, B the full right column.
+weft::ws::init! [weft::testhost::editor-hooks]
+let _ta [weft::ws::buffer-open! "/w/a.md" $_c0]
+let _tb [weft::ws::buffer-open! "/w/b.md" $_c0]
+let _tc [weft::ws::buffer-open! "/w/c.md" $_c0]
+let _tp1 [weft::ws::tree-init! [weft::ws::view-create! $_ta]]
+let _tp2 [weft::ws::pane-split! $_tp1 h $_tb]
+let _tp3 [weft::ws::pane-split! $_tp1 v $_tc]
+
+weft::ws::split-ratio-set! [get [weft::ws::node $_tp1] parent] 0.7
+gate "direction: larger perpendicular overlap wins a distance tie" \
+    [== $_tp1 [weft::ws::pane-in-direction $_tp2 left]]
+weft::ws::split-ratio-set! [get [weft::ws::node $_tp1] parent] 0.5
+weft::ws::focus! $_tp1
+weft::ws::focus! $_tp3
+gate "direction: recency breaks an exact tie (C focused last)" \
+    [== $_tp3 [weft::ws::pane-in-direction $_tp2 left]]
+weft::ws::focus! $_tp1
+gate "direction: ...and follows the newest focus (A now)" \
+    [== $_tp1 [weft::ws::pane-in-direction $_tp2 left]]
+
+;; ===================== focus =====================
+let _f1 [ev {weft::focus right} [weft::ctx::make [weft::ws::focused-ctx-fields]]]
+gate "focus right: moves kernel focus" \
+    [and [== 1 [get $_f1 moved]] \
+         [and [== $_tp2 [get $_f1 pane]] \
+              [== $_tp2 [weft::ws::focused-pane]]]]
+let _f2 [ev {weft::focus right} [weft::ctx::make [weft::ws::focused-ctx-fields]]]
+gate "focus at the edge: quiet no-op, focus unchanged" \
+    [and [== 0 [get $_f2 moved]] [== $_tp2 [weft::ws::focused-pane]]]
+let _f3 [ev {weft::focus up} [weft::ctx::make #{pane $_tp3}]]
+gate "focus: acts on the ctx pane, not the focused one" \
+    [and [== 1 [get $_f3 moved]] [== $_tp1 [weft::ws::focused-pane]]]
+gate "focus next: cycles" \
+    [== 1 [get [ev {weft::focus next} \
+        [weft::ctx::make [weft::ws::focused-ctx-fields]]] moved]]
+gate "focus: a bad word refuses" \
+    [== invalid-args [weft::error::code \
+        [ev {weft::focus sideways} [weft::ctx::make #{}]]]]
+
+;; ===================== swap =====================
+weft::ws::focus! $_tp1
+let _va [weft::ws::pane-view $_tp1]
+let _vb [weft::ws::pane-view $_tp2]
+let _sw [ev {weft::swap right} [weft::ctx::make [weft::ws::focused-ctx-fields]]]
+gate "swap right: views exchange, focus stays with the acting pane" \
+    [and [== $_vb [weft::ws::pane-view $_tp1]] \
+         [and [== $_va [weft::ws::pane-view $_tp2]] \
+              [== $_tp1 [weft::ws::focused-pane]]]]
+gate "swap: result names both panes and the direction" \
+    [and [== $_tp1 [get $_sw pane]] \
+         [and [== $_tp2 [get $_sw with]] [== right [get $_sw dir]]]]
+ev {weft::swap right} [weft::ctx::make [weft::ws::focused-ctx-fields]]
+gate "swap at the edge: with empty, nothing moves" \
+    [== "" [get [ev {weft::swap right} \
+        [weft::ctx::make #{pane $_tp2}]] with]]
+gate "pane-swap: survives as the swap-next alias" \
+    [== next [get [ev {weft::pane-swap} \
+        [weft::ctx::make [weft::ws::focused-ctx-fields]]] dir]]
+ev {weft::pane-swap} [weft::ctx::make [weft::ws::focused-ctx-fields]]
+
+;; ===================== send =====================
+weft::ws::focus! $_tp1
+let _npanes [len [weft::ws::panes]]
+let _sd [ev {weft::send right} [weft::ctx::make [weft::ws::focused-ctx-fields]]]
+gate "send right: the target shows this buffer" \
+    [== [get $_sd buffer] \
+        [weft::ws::view-buffer [weft::ws::pane-view $_tp2]]]
+gate "send: the source keeps showing it (two views, one buffer)" \
+    [== [get $_sd buffer] \
+        [weft::ws::view-buffer [weft::ws::pane-view $_tp1]]]
+gate "send: focus and layout never move" \
+    [and [== $_tp1 [weft::ws::focused-pane]] \
+         [== $_npanes [len [weft::ws::panes]]]]
+gate "send: result carries from/to/dir" \
+    [and [== $_tp1 [get $_sd from]] \
+         [and [== $_tp2 [get $_sd to]] [== 1 [get $_sd moved]]]]
+gate "send: the source's own trail is untouched" \
+    [== 0 [len [get [weft::ws::pane-history $_tp1] back]]]
+gate "send: the target pane can go back to what it showed" \
+    [== $_tb [get [get [weft::ws::pane-history $_tp2] back] 0]]
+gate "send at the edge: quiet no-op" \
+    [== 0 [get [ev {weft::send left} \
+        [weft::ctx::make #{pane $_tp3}]] moved]]
+gate "send next: cycles to the next pane" \
+    [== 1 [get [ev {weft::send next} \
+        [weft::ctx::make #{pane $_tp3}]] moved]]
+
+;; Direction-built trees still serialize the kernel axis vocabulary.
+let _snap [weft::session::snapshot]
+gate "session: the snapshot still carries axis h/v" \
+    [== h [get [get $_snap tree] axis]]
+
+;; ===================== zoom =====================
+weft::ws::focus! $_tp1
+let _z1 [ev {weft::zoom} [weft::ctx::make [weft::ws::focused-ctx-fields]]]
+gate "zoom: toggles on, names the pane" \
+    [and [== 1 [get $_z1 on]] \
+         [and [== $_tp1 [get $_z1 pane]] [weft::ws::zoomed?]]]
+gate "zoom: showing another buffer in the zoomed pane keeps it" \
+    [and [not [empty? [weft::ws::pane-show-buffer! $_tp1 $_tc]]] \
+         [weft::ws::zoomed?]]
+ev {weft::send right} [weft::ctx::make [weft::ws::focused-ctx-fields]]
+gate "zoom: send while zoomed keeps it" [weft::ws::zoomed?]
+weft::ws::focus! $_tp1
+gate "zoom: focus! to the SAME pane keeps it (the shell's focus mirror)" \
+    [weft::ws::zoomed?]
+ev {weft::focus right} [weft::ctx::make [weft::ws::focused-ctx-fields]]
+gate "zoom: a focus move to another pane drops it" \
+    [not [weft::ws::zoomed?]]
+gate "zoom: toggles back off from its result" \
+    [and [== 1 [get [ev {weft::zoom} \
+            [weft::ctx::make [weft::ws::focused-ctx-fields]]] on]] \
+         [== 0 [get [ev {weft::zoom} \
+            [weft::ctx::make [weft::ws::focused-ctx-fields]]] on]]]
+
+ev {weft::zoom} [weft::ctx::make [weft::ws::focused-ctx-fields]]
+let _zs [ev {weft::split right} [weft::ctx::make [weft::ws::focused-ctx-fields]]]
+gate "zoom: a split drops it" [not [weft::ws::zoomed?]]
+ev {weft::zoom} [weft::ctx::make [weft::ws::focused-ctx-fields]]
+let _zc [ev {weft::pane-close} [weft::ctx::make [weft::ws::focused-ctx-fields]]]
+gate "zoom: pane-close drops it" \
+    [and [== pane-closed [get $_zc kind]] [not [weft::ws::zoomed?]]]
+ev {weft::zoom} [weft::ctx::make [weft::ws::focused-ctx-fields]]
+ev {weft::transpose} [weft::ctx::make [weft::ws::focused-ctx-fields]]
+gate "zoom: transpose drops it" [not [weft::ws::zoomed?]]
+ev {weft::transpose} [weft::ctx::make [weft::ws::focused-ctx-fields]]
+ev {weft::zoom} [weft::ctx::make [weft::ws::focused-ctx-fields]]
+ev {weft::pane-swap} [weft::ctx::make [weft::ws::focused-ctx-fields]]
+gate "zoom: swapping contents drops it" [not [weft::ws::zoomed?]]
+ev {weft::pane-swap} [weft::ctx::make [weft::ws::focused-ctx-fields]]
+
+ev {weft::zoom} [weft::ctx::make [weft::ws::focused-ctx-fields]]
+weft::ws::init! [weft::testhost::editor-hooks]
+gate "zoom: init! resets the flag" [not [weft::ws::zoomed?]]
+
+;; ===================== per-pane history =====================
+let _ha [weft::ws::buffer-open! "/w/a.md" $_c0]
+let _hb [weft::ws::buffer-open! "/w/b.md" $_c0]
+let _hc [weft::ws::buffer-open! "/w/c.md" $_c0]
+let _hd [weft::ws::buffer-open! "/w/d.md" $_c0]
+let _hp [weft::ws::tree-init! [weft::ws::view-create! $_ha]]
+
+gate "history: a fresh pane has no trail" \
+    [and [== 0 [len [get [weft::ws::pane-history $_hp] back]]] \
+         [== 0 [get [ev {weft::back} [weft::ctx::make #{pane $_hp}]] moved]]]
+
+weft::ws::pane-show-buffer! $_hp $_hb
+weft::ws::pane-show-buffer! $_hp $_hc
+gate "history: show pushes -- the back stack reads (b a)" \
+    [and [== $_hb [get [get [weft::ws::pane-history $_hp] back] 0]] \
+         [== $_ha [get [get [weft::ws::pane-history $_hp] back] 1]]]
+
+let _bk1 [ev {weft::back} [weft::ctx::make #{pane $_hp}]]
+gate "back: returns to b; forward holds c" \
+    [and [== $_hb [get $_bk1 buffer]] \
+         [and [== $_hb [weft::ws::view-buffer [weft::ws::pane-view $_hp]]] \
+              [== $_hc [get [get [weft::ws::pane-history $_hp] fwd] 0]]]]
+ev {weft::back} [weft::ctx::make #{pane $_hp}]
+gate "back twice: at a" \
+    [== $_ha [weft::ws::view-buffer [weft::ws::pane-view $_hp]]]
+gate "back at the end of the trail: quiet no-op" \
+    [== 0 [get [ev {weft::back} [weft::ctx::make #{pane $_hp}]] moved]]
+gate "forward: returns to b" \
+    [== $_hb [get [ev {weft::forward} \
+        [weft::ctx::make #{pane $_hp}]] buffer]]
+weft::ws::pane-show-buffer! $_hp $_hd
+gate "history: a fresh show clears forward (the browser rule)" \
+    [and [== 0 [len [get [weft::ws::pane-history $_hp] fwd]]] \
+         [== 0 [get [ev {weft::forward} \
+            [weft::ctx::make #{pane $_hp}]] moved]]]
+
+ev {weft::close /w/b.md} [weft::ctx::make #{pane $_hp buffer $_hd}]
+gate "back: dead entries are skipped (b was closed)" \
+    [== $_ha [get [ev {weft::back} [weft::ctx::make #{pane $_hp}]] buffer]]
+
+var _i 0
+while [< $_i 60] {
+    weft::ws::pane-show-buffer! $_hp $_hc
+    weft::ws::pane-show-buffer! $_hp $_hd
+    set! _i [+ $_i 1]
+}
+gate "history: the trail caps at 50" \
+    [<= [len [get [weft::ws::pane-history $_hp] back]] 50]
+
+;; ===================== weft::workspace =====================
+let _wp2 [weft::ws::pane-split! $_hp h $_hc]
+weft::ws::focus! $_hp
+weft::testhost::presented-reset!
+let _wk [ev {weft::workspace} [weft::ctx::make [weft::ws::focused-ctx-fields]]]
+let _wout [weft::shell::out-buffer! [weft::ctx::make #{}]]
+let _wtext [Lk::doc_text [weft::ws::buffer-doc $_wout]]
+gate "workspace: emits, counting panes" \
+    [and [== emitted [get $_wk kind]] [== 2 [get $_wk count]]]
+gate "workspace: rows carry the split, the names, the focus marker" \
+    [and [>= [String::find $_wtext "split h"] 0] \
+         [and [>= [String::find $_wtext "/w/c.md"] 0] \
+              [>= [String::find $_wtext "focused"] 0]]]
+gate "workspace: pane rows are indented under their split" \
+    [>= [String::find $_wtext "  /w/d.md"] 0]
+
+var _pj 0
+var _pj_live 1
+foreach pr [weft::testhost::presented] {
+    if [== panejump [get $pr ptype]] {
+        set! _pj [+ $_pj 1]
+
+        let pid [get [get $pr value] pane]
+
+        if [not [== pane [get [weft::ws::node $pid] kind]]] {
+            set! _pj_live 0
+        }
+    }
+}
+gate "workspace: each pane row presents a panejump with a live pane id" \
+    [and [== 2 $_pj] [== 1 $_pj_live]]
+
+puts ""
+puts "PANES GATES PASSED"

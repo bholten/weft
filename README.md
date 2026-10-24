@@ -47,7 +47,11 @@ cmake -B build && cmake --build build -j     # sibling ../lk and ../lcl are auto
 | Key | Does |
 |---|---|
 | ctrl+s | save |
-| ctrl+e / ctrl+d | split horizontally / vertically |
+| ctrl+e / ctrl+shift+d | split right / down (`weft::split <dir>` — left/up put the new pane first) |
+| ctrl+alt+arrows | focus the pane in that direction (the workspace is a manual tiler) |
+| ctrl+alt+shift+arrows | SEND this buffer to the pane that way — focus and layout stay put |
+| ctrl+alt+z | zoom: only this pane, tree intact — toggle; any layout change drops it |
+| alt+left / alt+right | back / forward along this pane's own buffer trail |
 | ctrl+w · ctrl+n · ctrl+b | close pane (buffers survive) · next pane · cycle buffer |
 | ctrl+shift+b · ctrl+1 | show a buffer by name (`qol` finds `docs/qol.md`) · collapse to this pane |
 | ctrl+shift+w · ctrl+shift+e | kill the buffer (`weft::close NAME force` discards) · flip the split's axis |

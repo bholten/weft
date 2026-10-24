@@ -94,6 +94,32 @@ namespace weft {
         return ""
     }
 
+    ;; Save a buffer: the ctx buffer, or one named EXACTLY (fuzzy
+    ;; saving is the convenience-crossing-the-API-boundary bug).  The
+    ;; command form of ctrl+s and of the tag's `Put`.
+    proc save {*rest} {
+        let ctx [weft::image::ctx]
+        var bid ""
+
+        if [empty? $rest] {
+            set! bid [weft::ctx::field $ctx buffer]
+
+            if [not [weft::ws::buffer? $bid]] {
+                return [weft::error::make invalid-args "save: no buffer in ctx"]
+            }
+        } else {
+            set! bid [weft::ws::buffer-resolve [get $rest 0] exact $ctx]
+
+            if [weft::error::error? $bid] { return $bid }
+        }
+
+        let r [weft::ws::buffer-save! $bid $ctx]
+
+        if [weft::error::error? $r] { return $r }
+
+        return #{kind saved buffer $bid path [get [weft::ws::buffer $bid] path]}
+    }
+
     proc open {*rest} {
         let ctx [weft::image::ctx]
         var path ""
@@ -179,55 +205,109 @@ namespace weft {
             name [get [weft::ws::buffer $bid] name]}
     }
 
-    ;; Split the acting pane: `split-h` side by side, `split-v`
-    ;; stacked.  Alone, the new pane shows the SAME buffer -- two
-    ;; views, one text (what ctrl+e / ctrl+shift+d do).  Given a
-    ;; buffer it shows that one, resolved the way `show` resolves
-    ;; (fuzzy): `weft::split-h qol`.  Focus moves to the new pane.
-    proc _split {axis rest} {
+    ;; Direction words are the surface vocabulary; the kernel keeps
+    ;; axis h/v (h = side by side, v = stacked) and a/b child order.
+    ;; "vertical split" means opposite things to different people --
+    ;; a spatial direction means one.
+    proc _dir? {s} {
+        return [or [== $s left] [or [== $s right]
+                   [or [== $s up] [== $s down]]]]
+    }
+
+    proc _dir-split {dir} {
+        if [== $dir right] { return #{axis h side b} }
+        if [== $dir left] { return #{axis h side a} }
+        if [== $dir down] { return #{axis v side b} }
+        if [== $dir up] { return #{axis v side a} }
+
+        return #{}
+    }
+
+    ;; Resolve a movement word from `pane`: `next` wraps in the ctrl+n
+    ;; order; a direction goes to the nearest spatial neighbour and
+    ;; may be "" (an edge -- no wrapping).
+    proc _dir-target {pane word} {
+        if [== $word next] { return [weft::ws::pane-next $pane] }
+
+        if [weft::_dir? $word] {
+            return [weft::ws::pane-in-direction $pane $word]
+        }
+
+        return [weft::error::make invalid-args \
+            "expected left, right, up, down or next (got $word)"]
+    }
+
+    ;; Split the acting pane toward a direction: `weft::split right`
+    ;; side by side with the new pane after, `left` puts it FIRST;
+    ;; `down`/`up` stack.  Alone, the new pane shows the SAME buffer
+    ;; -- two views, one text (what ctrl+e / ctrl+shift+d do).  Given
+    ;; a buffer it shows that one, resolved the way `show` resolves
+    ;; (fuzzy): `weft::split right qol`.  Focus moves to the new pane.
+    proc split {*rest} {
         let ctx [weft::image::ctx]
+
+        if [== 0 [len $rest]] {
+            return [weft::error::make invalid-args \
+                "split: expected a direction -- left, right, up or down"]
+        }
+
+        let dir [String::from [get $rest 0]]
+
+        if [not [weft::_dir? $dir]] {
+            return [weft::error::make invalid-args \
+                "split: expected left, right, up or down (got $dir)"]
+        }
+
         let pane [weft::_ctx-pane $ctx]
         var bid [weft::ws::view-buffer [weft::ws::pane-view $pane]]
 
-        if [> [len $rest] 0] {
+        if [> [len $rest] 1] {
             set! bid [weft::ws::buffer-resolve \
-                [String::from [get $rest 0]] fuzzy $ctx]
+                [String::from [get $rest 1]] fuzzy $ctx]
 
             if [weft::error::error? $bid] { return $bid }
         }
 
-        let np [weft::ws::pane-split! $pane $axis $bid]
+        let ds [weft::_dir-split $dir]
+        let np [weft::ws::pane-split-at! $pane [get $ds axis] \
+                    [get $ds side] $bid]
 
         if [weft::error::error? $np] { return $np }
 
-        return #{kind split axis $axis pane $np from $pane buffer $bid
+        return #{kind split dir $dir axis [get $ds axis] pane $np
+            from $pane buffer $bid
             name [get [weft::ws::buffer $bid] name]}
     }
 
-    proc split-h {*rest} { return [weft::_split h $rest] }
-    proc split-v {*rest} { return [weft::_split v $rest] }
-
     ;; A fresh, empty, path-less buffer -- the tiling-window-manager
     ;; move: start from nothing and arrange.  `weft::new` shows it in
-    ;; the acting pane; `weft::new h` / `weft::new v` split the pane
-    ;; first (side by side / stacked) and show it in the new pane.  A
-    ;; further word names it (`weft::new v notes`); the default name
-    ;; is *new*, and any name that exists gets a `-2`, `-3` suffix so
-    ;; `show` never meets an ambiguity nobody authored.  Path-less
-    ;; buffers take their name as the filetype key, so a config
-    ;; `filetype! "*new*" #{lang lcl}` applies to every one.
+    ;; the acting pane; `weft::new right` / `weft::new down` (or left/
+    ;; up, which put the new pane first) split the pane and show it in
+    ;; the new pane.  A further word names it (`weft::new down notes`);
+    ;; the default name is *new*, and any name that exists gets a
+    ;; `-2`, `-3` suffix so `show` never meets an ambiguity nobody
+    ;; authored.  Path-less buffers take their name as the filetype
+    ;; key, so a config `filetype! "*new*" #{lang lcl}` applies to
+    ;; every one.
     proc new {*rest} {
         let ctx [weft::image::ctx]
-        var axis ""
+        var dir ""
         var name ""
 
         foreach a $rest {
             let s [String::from $a]
 
-            if [and [and [empty? $axis] [empty? $name]] \
-                    [or [== $s h] [== $s v]]] {
-                set! axis $s
+            if [and [and [empty? $dir] [empty? $name]] [weft::_dir? $s]] {
+                set! dir $s
             } else {
+                ;; the pre-direction spelling: refuse with the map,
+                ;; never a buffer accidentally named "h"
+                if [and [and [empty? $dir] [empty? $name]] \
+                        [or [== $s h] [== $s v]]] {
+                    return [weft::error::make invalid-args \
+                        "new: directions now -- right|down (left|up put the new pane first)"]
+                }
+
                 set! name $s
             }
         }
@@ -239,16 +319,22 @@ namespace weft {
         let bid [weft::ws::buffer-create! $name "" ""]
         let pane [weft::_ctx-pane $ctx]
         var target $pane
+        var axis ""
 
-        if [empty? $axis] {
+        if [empty? $dir] {
             weft::ws::pane-show-buffer! $pane $bid
         } else {
-            set! target [weft::ws::pane-split! $pane $axis $bid]
+            let ds [weft::_dir-split $dir]
+
+            set! axis [get $ds axis]
+            set! target [weft::ws::pane-split-at! $pane $axis \
+                             [get $ds side] $bid]
 
             if [weft::error::error? $target] { return $target }
         }
 
-        return #{kind new buffer $bid name $name pane $target axis $axis}
+        return #{kind new buffer $bid name $name pane $target
+            dir $dir axis $axis}
     }
 
     ;; *new* -> *new-2* -> *new-3*; notes -> notes-2.  The stars stay
@@ -349,15 +435,23 @@ namespace weft {
             return [weft::error::make denied "cannot close the only buffer"]
         }
 
-        var fallback [weft::ws::mru-buffer-excluding $bid]
-
-        if [empty? $fallback] { set! fallback [weft::ws::scratch-buffer!] }
-
         var n 0
 
+        ;; Per-pane evacuation ladder: the pane's OWN trail first (each
+        ;; pane keeps its train of thought), then the workspace MRU,
+        ;; then *scratch*.  The dying buffer lands in each evacuated
+        ;; pane's back stack and then dies -- a dangling entry the
+        ;; lazy read-filter skips.
         foreach p [weft::ws::panes] {
             if [== [weft::ws::view-buffer [weft::ws::pane-view $p]] $bid] {
-                weft::ws::pane-show-buffer! $p $fallback
+                var fb [weft::ws::pane-hist-fallback $p $bid]
+
+                if [empty? $fb] {
+                    set! fb [weft::ws::mru-buffer-excluding $bid]
+                }
+                if [empty? $fb] { set! fb [weft::ws::scratch-buffer!] }
+
+                weft::ws::pane-show-buffer! $p $fb
                 set! n [+ $n 1]
             }
         }
@@ -371,19 +465,154 @@ namespace weft {
         return #{kind closed buffer $bid name $name panes $n}
     }
 
-    ;; Swap the acting pane's view with the next pane's (the ctrl+n
-    ;; order); focus stays.  Swapping projections is deliberately
-    ;; dumb -- "move this pane's buffer" would invent ownership.
-    proc pane-swap {} {
+    ;; Move focus spatially: `weft::focus left|right|up|down` goes to
+    ;; the nearest neighbour (an edge is a quiet no-op -- no wrap);
+    ;; `weft::focus next` cycles like ctrl+n.
+    proc focus {*rest} {
         let ctx [weft::image::ctx]
+
+        if [== 0 [len $rest]] {
+            return [weft::error::make invalid-args \
+                "focus: expected left, right, up, down or next"]
+        }
+
+        let word [String::from [get $rest 0]]
+        let pane [weft::_ctx-pane $ctx]
+        let t [weft::_dir-target $pane $word]
+
+        if [weft::error::error? $t] { return $t }
+
+        if [or [empty? $t] [== $t $pane]] {
+            return #{kind focused pane $pane from $pane dir $word moved 0}
+        }
+
+        weft::ws::focus! $t
+
+        return #{kind focused pane $t from $pane dir $word moved 1}
+    }
+
+    ;; Exchange which buffers two panes display -- the acting pane
+    ;; and its spatial neighbour (`weft::swap right`) or the next in
+    ;; the ctrl+n order (`weft::swap next`).  Contents move, the tree
+    ;; does not, and focus stays with the acting pane.  Swapping
+    ;; projections is deliberately dumb -- "move this pane's buffer"
+    ;; would invent ownership.
+    proc swap {*rest} {
+        let ctx [weft::image::ctx]
+
+        if [== 0 [len $rest]] {
+            return [weft::error::make invalid-args \
+                "swap: expected left, right, up, down or next"]
+        }
+
+        let word [String::from [get $rest 0]]
         let a [weft::_ctx-pane $ctx]
-        let b [weft::ws::pane-next $a]
+        let t [weft::_dir-target $a $word]
 
-        if [== $a $b] { return #{kind swapped pane $a with ""} }
+        if [weft::error::error? $t] { return $t }
 
-        weft::ws::pane-swap-views! $a $b
+        if [or [empty? $t] [== $t $a]] {
+            return #{kind swapped pane $a with "" dir $word}
+        }
 
-        return #{kind swapped pane $a with $b}
+        weft::ws::pane-swap-views! $a $t
+        weft::ws::focus! $a
+
+        return #{kind swapped pane $a with $t dir $word}
+    }
+
+    proc pane-swap {} { return [weft::swap next] }
+
+    ;; Send the acting pane's buffer to another pane's display --
+    ;; `weft::send right` / `weft::send next`.  Display only: the
+    ;; target shows this buffer, the source keeps showing it, focus
+    ;; and the tree never move.  (Unrelated to `>cmd`, the filter
+    ;; spelling that sends the selection to a process.)
+    proc send {*rest} {
+        let ctx [weft::image::ctx]
+
+        if [== 0 [len $rest]] {
+            return [weft::error::make invalid-args \
+                "send: expected left, right, up, down or next"]
+        }
+
+        let word [String::from [get $rest 0]]
+        let s [weft::_ctx-pane $ctx]
+        let b [weft::ws::view-buffer [weft::ws::pane-view $s]]
+        let t [weft::_dir-target $s $word]
+
+        if [weft::error::error? $t] { return $t }
+
+        let name [get [weft::ws::buffer $b] name]
+
+        if [or [empty? $t] [== $t $s]] {
+            return #{kind sent buffer $b name $name from $s to ""
+                dir $word moved 0}
+        }
+
+        weft::ws::pane-show-buffer! $t $b
+
+        return #{kind sent buffer $b name $name from $s to $t
+            dir $word moved 1}
+    }
+
+    ;; Step this pane back / forward along its own buffer trail --
+    ;; each pane is a train of thought: `show` pushes, back and
+    ;; forward move without pushing.  A quiet no-op at either end.
+    proc back {} {
+        let ctx [weft::image::ctx]
+        let p [weft::_ctx-pane $ctx]
+        let t [weft::ws::pane-back! $p]
+
+        if [empty? $t] {
+            return #{kind back pane $p buffer "" name "" moved 0}
+        }
+
+        return #{kind back pane $p buffer $t
+            name [get [weft::ws::buffer $t] name] moved 1}
+    }
+
+    proc forward {} {
+        let ctx [weft::image::ctx]
+        let p [weft::_ctx-pane $ctx]
+        let t [weft::ws::pane-forward! $p]
+
+        if [empty? $t] {
+            return #{kind forward pane $p buffer "" name "" moved 0}
+        }
+
+        return #{kind forward pane $p buffer $t
+            name [get [weft::ws::buffer $t] name] moved 1}
+    }
+
+    ;; Show only this pane -- the escape hatch that replaces closing
+    ;; three panes to stare at one buffer.  A toggle: the tree, its
+    ;; ratios and every hidden view stay intact; any split, close,
+    ;; swap, transpose or focus move to ANOTHER pane drops it, while
+    ;; showing other buffers in the zoomed pane (show/send) keeps it.
+    ;; `weft::only` is the destructive sibling.
+    proc zoom {} {
+        let ctx [weft::image::ctx]
+        let p [weft::_ctx-pane $ctx]
+
+        ;; act where invoked: a clicked `weft::zoom` zooms the
+        ;; clicked pane (focusing a different pane drops any old zoom
+        ;; on the way, which is the right reading of the gesture)
+        if [not [== $p [weft::ws::focused-pane]]] { weft::ws::focus! $p }
+
+        return #{kind zoomed on [weft::ws::zoom-toggle!] pane $p}
+    }
+
+    ;; Close the acting pane -- the command form of ctrl+w.  Its view
+    ;; dies, the buffer survives; the last pane refuses.
+    proc pane-close {} {
+        let ctx [weft::image::ctx]
+        let p [weft::_ctx-pane $ctx]
+        let r [weft::ws::pane-close! $p]
+
+        if [weft::error::error? $r] { return $r }
+
+        return #{kind pane-closed pane $p}
     }
 
     ;; Flip the axis of the acting pane's parent split.
@@ -522,6 +751,65 @@ namespace weft {
         return #{kind emitted summary "$n buffers -> *output*" count $n}
     }
 
+    ;; One workspace row per tree node, indented by depth; returns the
+    ;; pane count under `node_id`.  Pane rows carry a panejump
+    ;; presentation (right-click focuses that pane); split rows print
+    ;; axis and ratio, plain.
+    proc _ws-row! {out node_id depth} {
+        let n [weft::ws::node $node_id]
+        var pad ""
+        var i 0
+
+        while [< $i $depth] {
+            set! pad "$pad  "
+            set! i [+ $i 1]
+        }
+
+        if [== [get $n kind] pane] {
+            let bid [weft::ws::view-buffer [weft::ws::pane-view $node_id]]
+            var mark ""
+            var tag ""
+
+            if [weft::ws::buffer-dirty? $bid] { set! mark " *" }
+
+            if [== $node_id [weft::ws::focused-pane]] {
+                set! tag {  [focused]}
+
+                if [weft::ws::zoomed?] { set! tag {  [focused, zoomed]} }
+            }
+
+            weft::sink::emit! $out \
+                "$pad[get [weft::ws::buffer $bid] name]$mark$tag  $node_id\n" \
+                #{layer {panejump} meta #{kind {pane-row} pane $node_id}
+                    present #{ptype {panejump} value #{pane $node_id}}}
+
+            return 1
+        }
+
+        weft::sink::emit! $out \
+            "${pad}split [get $n axis] [get $n ratio]\n"
+
+        let na [weft::_ws-row! $out [get $n a] [+ $depth 1]]
+
+        return [+ $na [weft::_ws-row! $out [get $n b] [+ $depth 1]]]
+    }
+
+    ;; The split tree as text -- the workspace inspected the way
+    ;; everything in weft is inspected.  A projection, never the
+    ;; model: the tree stays canonical, this is a menu over it.
+    proc workspace {} {
+        let out [weft::shell::out-buffer! [weft::image::ctx]]
+        let rt [weft::ws::tree-root]
+
+        if [empty? $rt] {
+            return #{kind emitted summary "no panes" count 0}
+        }
+
+        let n [weft::_ws-row! $out $rt 0]
+
+        return #{kind emitted summary "$n panes -> *output*" count $n}
+    }
+
     ;; ---- messages: the flash history ----
     ;; Errors surface as four-second flashes in the status row; this
     ;; is where they go afterwards.  Newest last, so the tail is the
@@ -571,14 +859,23 @@ namespace weft {
         #{title {Buffers and workspace (ctrl+i inspects at the cursor)} rows (
             ({weft::open notes.md} {open a file -- one that does not exist yet becomes a new one})
             ({weft::buffers} {open buffers -- right-click a row to show it})
+            ({weft::workspace} {the split tree as rows -- right-click a pane row to focus it})
             ({weft::show qol} {show a buffer here -- name, id, path, or a unique prefix})
-            ({weft::new v} {a fresh empty buffer -- alone: here; `h`/`v`: in a new split (side by side / stacked); a further word names it})
-            ({weft::split-h qol} {split this pane side by side showing a buffer -- alone: this buffer twice})
-            ({weft::split-v} {split this pane stacked, likewise})
+            ({weft::new down} {a fresh empty buffer -- alone: here; a direction: in a new split that way; a further word names it})
+            ({weft::split right qol} {split this pane toward a direction, showing a buffer -- alone: this buffer twice; left/up put the new pane first})
+            ({weft::split down} {split this pane stacked, likewise})
+            ({weft::focus right} {focus the nearest pane in a direction (left/right/up/down; `next` cycles) -- edges are quiet})
+            ({weft::send right} {show THIS buffer in the pane that way -- focus and layout stay put; `next` cycles})
+            ({weft::back} {this pane's previous buffer -- every pane keeps its own trail (weft::forward returns)})
+            ({weft::swap right} {exchange what two panes display -- this one and the one that way; focus stays here})
+            ({weft::save} {save this buffer (ctrl+s; the tag's Put) -- `weft::save NAME` saves another})
             ({weft::close notes.md} {kill a buffer by name (add `force` to discard edits); alone: this one})
             ({weft::only} {collapse the splits to this pane -- no buffer is lost})
+            ({weft::zoom} {show only this pane, tree intact -- toggle; any layout change or focus move drops it})
+            ({weft::pane-close} {close this pane -- its buffer stays open (ctrl+w)})
+            ({Newcol} {tag verbs: Newcol Delcol New Del Put -- the line over each pane; `weft::describe Del`})
             ({weft::transpose} {flip this pane's split between side-by-side and stacked})
-            ({weft::pane-swap} {swap this pane's buffer with the next pane's})
+            ({weft::pane-swap} {swap this pane's buffer with the next pane's (weft::swap next)})
             ({weft::commands} {this menu})
             ({weft::keys} {every chord and mouse gesture, by group -- and what shadows what})
             ({weft::messages} {recent status-row messages -- the errors you missed})

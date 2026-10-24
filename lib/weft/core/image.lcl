@@ -179,16 +179,79 @@ namespace weft::image {
         return 1
     }
 
-    proc user-defs {} {
-        return [List::sort [Ns::keys $user]]
+    ;; ---- seeds: what the user package starts with ----
+    ;;
+    ;; A seed is a namespace whose members are copied into user:: by
+    ;; NAME (Ns::set), so interactive text can spell them bare -- the
+    ;; tag verbs (tag.lcl) are the case.  Seeds are the package's
+    ;; floor, not the user's work: they come back after reset-user!,
+    ;; and user-defs lists one only once the user has redefined it
+    ;; (a different Proc::origin).  Names only are stored; the
+    ;; namespace value is fetched when needed (never held in a cell).
+
+    var _user_seeds ()
+
+    proc _seed-user! {ns_name} {
+        let ns [getvar $ns_name]
+
+        foreach k [Ns::keys $ns] {
+            Ns::set $user $k [getvar "${ns_name}::$k"]
+        }
+
+        return [len [Ns::keys $ns]]
     }
 
-    ;; Reset the user package in place (Ns::clear).  Definitions go;
-    ;; the execution log survives -- history outlives state, so a
-    ;; reset is itself a recorded execution.
+    proc user-seed! {ns_name} {
+        if [not [has? $_user_seeds $ns_name]] {
+            set! _user_seeds [List::push $_user_seeds $ns_name]
+        }
+
+        return [weft::image::_seed-user! $ns_name]
+    }
+
+    ;; Is user::name still the seed's own definition?
+    proc _seeded? {name} {
+        var v ""
+        var e ""
+
+        foreach ns_name $_user_seeds {
+            if [== 0 [catch { set! v [getvar "${ns_name}::$name"] } v e]] {
+                let u [getvar "user::$name"]
+
+                if [and [proc? $u] [proc? $v]] {
+                    if [== [String::from [Proc::origin $u]] \
+                            [String::from [Proc::origin $v]]] {
+                        return 1
+                    }
+                }
+            }
+        }
+
+        return 0
+    }
+
+    ;; Everything the user has defined in user:: (seeds excluded until
+    ;; redefined).
+    proc user-defs {} {
+        var out ()
+
+        foreach k [List::sort [Ns::keys $user]] {
+            if [not [weft::image::_seeded? $k]] {
+                set! out [List::push $out $k]
+            }
+        }
+
+        return $out
+    }
+
+    ;; Reset the user package in place (Ns::clear).  Definitions go,
+    ;; seeds come back; the execution log survives -- history outlives
+    ;; state, so a reset is itself a recorded execution.
     proc reset-user! {} {
-        let n [len [Ns::keys $user]]
+        let n [len [weft::image::user-defs]]
         Ns::clear $user
+
+        foreach ns_name $_user_seeds { weft::image::_seed-user! $ns_name }
         weft::image::_record! #{id [weft::ctx::next-execution] ns user
             source "<reset-user>" ok 1 value "cleared $n definitions"
             buffer "" time [weft::image::_now]}

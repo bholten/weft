@@ -453,6 +453,21 @@ proc wsh_run_units {units quiet} {
 proc wsh_execute {} {
     let f [weft::ws::focused-ctx-fields]
 
+    ;; The caret is in a TAG: tags have no lines, so the tag's
+    ;; selection, else the word at its caret, is the program.
+    let fid [Lk::focus_get $wsh_ui]
+
+    if [::wsh_tag_node? $fid] {
+        let tp [::wsh_pane_of_node $fid]
+
+        if [not [empty? $tp]] {
+            ::wsh_tag_execute $tp \
+                [Lk::editor_cursor [weft::ws::pane-tag-editor $tp]] 0
+
+            return ""
+        }
+    }
+
     if [wsh_repl_buffer? [get $f buffer]] {
         return [wsh_repl_eval [get $f pane]]
     }
@@ -976,14 +991,29 @@ proc wsh_filter_glyph? {text i n} {
     return [or [== $c "|"] [or [== $c "<"] [== $c ">"]]]
 }
 
+;; The pane a widget node belongs to: `ed_<pane>` is its body editor,
+;; `tag_<pane>` its tag line.  Both carry the pane presentation, so
+;; chords and commands stamp the same pane whichever one has focus.
 proc wsh_pane_of_node {node_name} {
-    if [not [== 0 [String::find $node_name "ed_"]]] { return "" }
+    var p ""
 
-    let p [String::replace $node_name "ed_" ""]
+    if [== 0 [String::find $node_name "ed_"]] {
+        set! p [String::replace $node_name "ed_" ""]
+    }
+
+    if [== 0 [String::find $node_name "tag_"]] {
+        set! p [String::replace $node_name "tag_" ""]
+    }
+
+    if [empty? $p] { return "" }
 
     if [== pane [get [weft::ws::node $p] kind]] { return $p }
 
     return ""
+}
+
+proc wsh_tag_node? {node_name} {
+    return [== 0 [String::find $node_name "tag_"]]
 }
 
 ;; EXECUTE at a click: the selection when the click lands inside it,
@@ -1048,8 +1078,18 @@ proc wsh_execute_at {pane pos} {
     set! cf [Dict::merge $cf \
         #{source [weft::image::source-of [get $cf buffer] $pos]}]
 
+    return [::wsh_run_word $text $cf $sels]
+}
+
+;; A word as the program, the selections as its operands: none = one
+;; run; N = N runs, document order, one operand each.
+proc wsh_run_word {text cf sels *opts} {
     if [== 0 [len $sels]] {
-        ::wsh_run_text $text [weft::ctx::make $cf]
+        if [> [len $opts] 0] {
+            ::wsh_run_text $text [weft::ctx::make $cf] [get $opts 0]
+        } else {
+            ::wsh_run_text $text [weft::ctx::make $cf]
+        }
 
         return 1
     }
@@ -1067,13 +1107,81 @@ proc wsh_execute_at {pane pos} {
     return 1
 }
 
+;; EXECUTE in a TAG (docs/buffers.md "Tags"): the tag's selection when
+;; `pos` lands inside it, else the word at `pos` -- run with the
+;; pane's BODY as the lens.  ctx buffer/view are the body's and the
+;; body's selections are the operands, so `Del` kills the buffer
+;; under the tag and `|sort` typed into a tag sorts the body's
+;; selection.  The separator is the one word that is not a program.
+;; From a click (`focus` 1) keyboard focus lands in the body: the
+;; verbs act on the window, and so should the chord you press next.
+proc wsh_tag_execute {pane pos focus} {
+    weft::ws::focus! $pane
+
+    if $focus { Lk::focus_set $wsh_ui "ed_$pane" }
+
+    let ted [weft::ws::pane-tag-editor $pane]
+    let tdoc [weft::ws::pane-tag-doc $pane]
+    var text ""
+
+    ;; editor_selections reports a collapsed caret as an empty entry
+    ;; (the kernel's view-selections keeps only the pairs, as here).
+    foreach s [Lk::editor_selections $ted] {
+        if [== 2 [len $s]] {
+            if [and [>= $pos [get $s 0]] [< $pos [get $s 1]]] {
+                set! text [String::trim [String::range [Lk::doc_text $tdoc] \
+                    [get $s 0] [get $s 1]]]
+            }
+        }
+    }
+
+    if [empty? $text] {
+        let w [wsh_word_at $tdoc $pos]
+
+        if [empty? [get $w text]] { return 0 }
+        if [== [get $w start] [weft::ws::pane-tag-sep $pane]] { return 0 }
+
+        set! text [String::trim [get $w text]]
+    }
+
+    if [empty? $text] { return 0 }
+
+    let vid [weft::ws::pane-view $pane]
+    let bid [weft::ws::view-buffer $vid]
+    let cf #{pane $pane view $vid buffer $bid
+             source #{name "[get [weft::ws::buffer $bid] name] (tag)" line 1}}
+
+    return [::wsh_run_word $text $cf [weft::ws::view-selections $vid] tag]
+}
+
+;; LOOK from a tag: Acme's Look -- the word under the pointer is
+;; searched for in the BODY, from the body's cursor.
+proc wsh_tag_look {pane pos} {
+    let needle [get [wsh_word_at [weft::ws::pane-tag-doc $pane] $pos] text]
+
+    if [empty? $needle] { return 0 }
+
+    weft::ws::focus! $pane
+    Lk::focus_set $wsh_ui "ed_$pane"
+
+    return [::wsh_look_needle $pane $needle]
+}
+
 ;; Shared EXECUTE tail: route through run-text!, surface the outcome.
-proc wsh_run_text {text ctx} {
+proc wsh_run_text {text ctx *opts} {
     let t [weft::shell::run-text! $text $ctx]
     var quiet 0
 
     ;; EXECUTE HERE: the output is already where the user is looking.
     if [not [empty? [weft::ctx::field $ctx out]]] { set! quiet 1 }
+
+    ;; From a TAG (`tag` option): a verb's VALUE is quiet -- Newcol,
+    ;; Del are window operations and the flash says what happened --
+    ;; while a run it starts (`ls` typed into a tag) still streams
+    ;; into *output*, and an emitted menu still surfaces (after_eval).
+    if [and [> [len $opts] 0] [== tag [get $opts 0]]] {
+        if [== [weft::task::state $t] succeeded] { set! quiet 1 }
+    }
 
     ;; A pending task may ask not to surface *output* on start (filters
     ;; report through their own events; *output* pops only if there is
@@ -1116,11 +1224,20 @@ proc wsh_look_at {pane pos} {
     Lk::focus_set $wsh_ui "ed_$pane"
 
     let vid [weft::ws::pane-view $pane]
-    let ed [weft::ws::view-editor $vid]
     let doc [weft::ws::buffer-doc [weft::ws::view-buffer $vid]]
     let needle [get [wsh_word_at $doc $pos] text]
 
     if [empty? $needle] { return 0 }
+
+    return [wsh_look_needle $pane $needle]
+}
+
+;; Find `needle` in the pane's body after its cursor (wrapping), and
+;; select the hit.
+proc wsh_look_needle {pane needle} {
+    let vid [weft::ws::pane-view $pane]
+    let ed [weft::ws::view-editor $vid]
+    let doc [weft::ws::buffer-doc [weft::ws::view-buffer $vid]]
 
     var hit [Lk::doc_find $doc $needle [+ [Lk::editor_cursor $ed] 1]]
 
@@ -1172,6 +1289,23 @@ proc wsh_qjump_hit {cmd new} {
         weft::ws::focus! $pane
         wsh_focus_editor
     }
+
+    return ""
+}
+
+;; LOOK on a weft::workspace pane row: focus that pane.  The value
+;; carries a pane id from an earlier listing -- panes are disposable
+;; projections, so a dead one just says so.
+proc wsh_pane_jump {cmd} {
+    let pid [get [get [get $cmd hit] value] pane]
+
+    if [not [== pane [get [weft::ws::node $pid] kind]]] {
+        wsh_flash_set "pane is gone -- re-run weft::workspace"
+        return ""
+    }
+
+    weft::ws::focus! $pid
+    wsh_focus_editor
 
     return ""
 }
@@ -1915,6 +2049,20 @@ proc wsh_project_spans {vid bid} {
 ;; Splits are CONTROLLED: the workspace ratio is authoritative, drags
 ;; emit SplitMoved (per-mille in source_value, split node id in the
 ;; presentation args) and the prop is re-supplied here each frame.
+;; One text line plus the tagline rule's padding (4 above, 4 below)
+;; and a hair for the caret row.
+var wsh_tag_h 0
+
+proc wsh_tag_height {} {
+    if [== 0 $wsh_tag_h] {
+        let m [Lk::text_size $wsh_ui "Mg"]
+
+        set! wsh_tag_h [+ [get $m 1] 10]
+    }
+
+    return $wsh_tag_h
+}
+
 proc wsh_render_node {node_id} {
     let n [weft::ws::node $node_id]
 
@@ -1922,9 +2070,20 @@ proc wsh_render_node {node_id} {
         ;; The pane presentation is what keybindings match against
         ;; (translators only fire at nodes carrying presentations) and
         ;; it stamps every command with the pane it fired in.
-        editor "ed_$node_id" \
-            #{editor [weft::ws::view-editor [get $n view]] grow 1
-              focusable 1 present (pane ($node_id))}
+        ;; The tag over the body (docs/buffers.md "Tags"): the kernel
+        ;; re-syncs its prefix here, so a renamed/dirtied buffer shows
+        ;; next frame.  Both widgets carry the SAME pane presentation.
+        weft::ws::pane-tag-sync! $node_id
+
+        column "pn_$node_id" #{grow 1 align stretch gap 2} {
+            editor "tag_$node_id" \
+                #{editor [weft::ws::pane-tag-editor $node_id]
+                  h [wsh_tag_height] focusable 1 tag tagline
+                  present (pane ($node_id))}
+            editor "ed_$node_id" \
+                #{editor [weft::ws::view-editor [get $n view]] grow 1
+                  focusable 1 present (pane ($node_id))}
+        }
     } else {
         let pm [int [* [weft::ws::split-ratio $node_id] 1000]]
         if [== [get $n axis] h] {
@@ -1945,17 +2104,29 @@ proc wsh_render_node {node_id} {
     return ""
 }
 
-proc wsh_status_name {} {
-    let f [weft::ws::focused-ctx-fields]
+;; The pane tree, or -- zoomed -- only the focused pane.  The tree,
+;; its ratios and the hidden views stay in the kernel; editors live
+;; on views, so nothing is destroyed and unzoom is a free re-render.
+proc wsh_render_root {} {
+    var rt [weft::ws::tree-root]
 
-    if [not [has? $f buffer]] { return "" }
+    if [weft::ws::zoomed?] {
+        let fp [weft::ws::focused-pane]
 
-    let b [weft::ws::buffer [get $f buffer]]
-    var mark ""
+        if [== pane [get [weft::ws::node $fp] kind]] { set! rt $fp }
+    }
 
-    if [weft::ws::buffer-dirty? [get $f buffer]] { set! mark " *" }
+    wsh_render_node $rt
 
-    return "[get $b name]$mark"
+    return 1
+}
+
+;; The buffer's name and dirty mark live in each pane's tag; the
+;; status row keeps what is workspace-wide: zoom, position, flash.
+proc wsh_status_zoom {} {
+    if [weft::ws::zoomed?] { return {[zoom]} }
+
+    return ""
 }
 
 proc wsh_status_pos {} {
@@ -2024,6 +2195,7 @@ proc wsh_register_input! {} {
     translator pointer_down #{button secondary} plumb PlumbHit
     translator pointer_down #{button secondary} qjump QjumpHit
     translator pointer_down #{button secondary} loc LocHit
+    translator pointer_down #{button secondary} panejump PaneJumpHit
     translator pointer_down #{button secondary mods shift} plumb PlumbHitNew
     translator pointer_down #{button secondary mods shift} qjump QjumpHitNew
     translator pointer_down #{button secondary mods shift} loc LocHitNew
@@ -2135,6 +2307,7 @@ proc wsh_run {files} {
             rule window #{bg (24 26 32)}
             rule * #{fg (205 210 220)}
             rule editor #{bg (28 31 40) padding 8}
+            rule editor #{tag tagline} #{bg (40 44 58) padding 4}
             rule split_h #{border_color (60 65 80)}
             rule split_v #{border_color (60 65 80)}
             rule label #{tag dim} #{fg (125 132 148)}
@@ -2228,6 +2401,7 @@ proc wsh_run {files} {
         on PlumbHitNew [lambda {cmd} { wsh_plumb_hit $cmd 1 }]
         on LocHit [lambda {cmd} { wsh_loc_hit $cmd 0 }]
         on LocHitNew [lambda {cmd} { wsh_loc_hit $cmd 1 }]
+        on PaneJumpHit [lambda {cmd} { wsh_pane_jump $cmd }]
 
         ;; Raw-event tier: focus mirroring plus the EXECUTE/LOOK
         ;; fallbacks for clicks that hit no presented range (those were
@@ -2248,6 +2422,23 @@ proc wsh_run {files} {
             let pane [wsh_pane_of_node [get $ev target_id]]
 
             if [empty? $pane] { return 0 }
+
+            if [wsh_tag_node? [get $ev target_id]] {
+                let ted [weft::ws::pane-tag-editor $pane]
+                let tpos [Lk::editor_pos_at $ted [get $ev x] [get $ev y]]
+
+                if [< $tpos 0] { return 0 }
+
+                if [== [get $ev button] 2] {
+                    return [wsh_tag_execute $pane $tpos 1]
+                }
+
+                if [== [get $ev button] 3] {
+                    return [wsh_tag_look $pane $tpos]
+                }
+
+                return 0
+            }
 
             let ed [weft::ws::view-editor [weft::ws::pane-view $pane]]
             let pos [Lk::editor_pos_at $ed [get $ev x] [get $ev y]]
@@ -2306,7 +2497,7 @@ proc wsh_run {files} {
             wsh_follow_output
 
             column "root" #{align stretch gap 4 padding 6} {
-                wsh_render_node [weft::ws::tree-root]
+                wsh_render_root
 
                 if [not [empty? $wsh_bar]] {
                     row "minibar" #{gap 8} {
@@ -2360,7 +2551,7 @@ proc wsh_run {files} {
                 }
 
                 row "status" #{gap 12} {
-                    label "st_name" #{text [wsh_status_name]}
+                    label "st_zoom" #{tag dim text [wsh_status_zoom]}
                     label "st_pos" #{tag dim text [wsh_status_pos]}
                     label "st_flash" #{tag dim text [wsh_status_flash]}
                 }
