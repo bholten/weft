@@ -20,9 +20,11 @@ require "weft/core/error.lcl"
 var weft_have_doc 0
 var _doc_r ""
 var _doc_e ""
+
 if [== 0 [catch { require "doc/src/Doc.lcl" } _doc_r _doc_e]] {
     set! weft_have_doc 1
 }
+
 require "weft/core/task.lcl"
 require "weft/core/tasks.lcl"
 require "weft/core/cap.lcl"
@@ -43,6 +45,7 @@ require "weft/core/recog.lcl"
 require "weft/core/exec.lcl"
 require "weft/core/filter.lcl"
 require "weft/core/api.lcl"
+require "weft/core/tag.lcl"
 require "weft/core/repl.lcl"
 require "weft/core/annot-edit.lcl"
 require "weft/core/inspect.lcl"
@@ -56,6 +59,7 @@ require "weft/core/query.lcl"
 ;; here so a headless image resolves the keybinding profile exactly
 ;; as the windowed one does (weft::keys, test/keys-gates.lcl).
 require "weft/ui/intents.lcl"
+
 weft::shell::intents!
 
 ;; Terse alias: q::lines etc.  Import shares cells, so var state
@@ -93,17 +97,21 @@ load "$weft_lib_dir/weft/host/$weft_host_kind.lcl"
 ;; ---- System defaults, then user config (full vocabulary is loaded,
 ;; so config may use any weft:: API) ----
 weft::keymap::source! native
+
 load "$weft_config_dir/default.lcl"
 
 ;; A broken or incompatible user config must never prevent startup:
 ;; warn and continue.  (Legacy C-weft init.lcl files use a retired API;
 ;; they land here until a migration story exists.)
 let _user_cfg_t [weft::cap::invoke "fs.exists?" #{path $weft_user_config} #{}]
+
 if [== [weft::task::state $_user_cfg_t] succeeded] {
     if [weft::task::result $_user_cfg_t] {
         var _cfg_r ""
         var _cfg_e ""
+
         weft::keymap::source! user
+
         if [not [== 0 [catch { load $weft_user_config } _cfg_r _cfg_e]]] {
             puts "weft: warning: user config $weft_user_config failed: $_cfg_e"
         }

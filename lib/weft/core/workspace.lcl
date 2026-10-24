@@ -736,6 +736,8 @@ namespace weft::ws {
         set! root $id
         set! focused $id
 
+        weft::ws::_pane-tag-init! $id
+
         return $id
     }
 
@@ -795,6 +797,7 @@ namespace weft::ws {
 
         weft::ws::_node-put! $new_pane \
             #{id $new_pane kind pane view $vid parent $split}
+        weft::ws::_pane-tag-init! $new_pane
 
         if [== $side a] {
             weft::ws::_node-put! $split #{id $split kind split axis $axis
@@ -849,6 +852,7 @@ namespace weft::ws {
         let grand [get $s parent]
 
         weft::ws::view-close! [get $n view]
+        weft::ws::_pane-tag-free! $pane_id
 
         set! nodes [del $nodes $pane_id]
         set! nodes [del $nodes $split_id]
@@ -1019,6 +1023,219 @@ namespace weft::ws {
         weft::ws::_pane-display! $pane_id $target
 
         return $target
+    }
+
+    ;; ---- per-pane tags (docs/buffers.md "Tags") ----
+    ;;
+    ;; Acme's tag line: one editable line of text over each pane whose
+    ;; words EXECUTE.  A tag is a projection like the view under it --
+    ;; a bare doc + editor on the pane node, never a buffer, so nothing
+    ;; has to hide it from weft::buffers, the resolver, MRU or
+    ;; persistence.  The kernel owns the PREFIX
+    ;;
+    ;;   <name> <tag_verbs> [<tag_dirty_verbs>] |
+    ;;
+    ;; and the user owns everything after the separator.  sync!
+    ;; rewrites the prefix IN PLACE when the pane's buffer or its
+    ;; dirtiness changes (one doc transaction, so the editor's cursor
+    ;; and the user's text ride along) and otherwise never touches the
+    ;; doc.  Put appears while the buffer is dirty, Acme's signal.
+    ;; Node-resident: pane-close! frees the editor; sessions carry the
+    ;; user half (session.lcl).
+
+    proc pane-tag {pane_id} {
+        let n [weft::ws::node $pane_id]
+
+        if [has? $n tag] { return [get $n tag] }
+
+        return #{}
+    }
+
+    proc pane-tag-editor {pane_id} {
+        let t [weft::ws::pane-tag $pane_id]
+
+        if [has? $t editor] { return [get $t editor] }
+
+        return ""
+    }
+
+    proc pane-tag-doc {pane_id} {
+        let t [weft::ws::pane-tag $pane_id]
+
+        if [has? $t doc] { return [get $t doc] }
+
+        return ""
+    }
+
+    ;; The kernel-owned half, ending in the separator (no trailing
+    ;; space).  Verbs are TEXT from config: tag_verbs is the standing
+    ;; list, tag_dirty_verbs joins it while the buffer is dirty.
+    proc pane-tag-prefix {pane_id} {
+        let bid [weft::ws::view-buffer [weft::ws::pane-view $pane_id]]
+        let verbs [String::from \
+            [weft::config::value-or tag_verbs "Newcol Delcol New Del"]]
+        let dirty_verbs [String::from \
+            [weft::config::value-or tag_dirty_verbs "Put"]]
+        var s [get [weft::ws::buffer $bid] name]
+
+        if [not [empty? $verbs]] { set! s "$s $verbs" }
+
+        ;; Dirty AND saveable: a path-less buffer (*output*, *scratch*)
+        ;; is dirty for life and Put could only fail there.
+        if [and [not [empty? $dirty_verbs]] \
+                [and [not [empty? [get [weft::ws::buffer $bid] path]]] \
+                     [weft::ws::buffer-dirty? $bid]]] {
+            set! s "$s $dirty_verbs"
+        }
+
+        return "$s |"
+    }
+
+    proc _pane-tag-init! {pane_id} {
+        let doc [Lk::doc_new ""]
+        let hist [Lk::history_new $doc]
+        let store [Lk::annot_store_new]
+
+        Lk::history_mark_saved $hist
+        Lk::annot_attach $store $doc
+
+        let ed [apply [get $hooks make] $doc $hist $store "*tag*"]
+
+        weft::ws::_node-put! $pane_id [put [weft::ws::node $pane_id] tag \
+            #{doc $doc hist $hist store $store editor $ed prefix ""}]
+        weft::ws::pane-tag-sync! $pane_id
+
+        return $pane_id
+    }
+
+    proc _pane-tag-free! {pane_id} {
+        let t [weft::ws::pane-tag $pane_id]
+
+        if [has? $t editor] { apply [get $hooks free] [get $t editor] }
+
+        return 1
+    }
+
+    ;; Bring the prefix up to date.  The common case finds the cached
+    ;; prefix still at the front and swaps exactly it; a prefix the
+    ;; user edited is re-synced from the first " |" (their edit is
+    ;; theirs until the name or dirtiness moves); a tag with no
+    ;; separator left gets the prefix put back in front of all of it.
+    ;; Returns 1 when the doc changed.
+    proc pane-tag-sync! {pane_id} {
+        var t [weft::ws::pane-tag $pane_id]
+
+        if [not [has? $t doc]] { return 0 }
+
+        let want [weft::ws::pane-tag-prefix $pane_id]
+        let old [get $t prefix]
+
+        if [== $want $old] { return 0 }
+
+        let doc [get $t doc]
+        let text [Lk::doc_text $doc]
+        var end 0
+        var ins "$want "
+
+        if [and [not [empty? $old]] [== 0 [String::find $text $old]]] {
+            set! end [String::length $old]
+            set! ins $want
+        } else {
+            let i [String::find $text " |"]
+
+            if [>= $i 0] {
+                set! end [+ $i 2]
+                set! ins $want
+            }
+        }
+
+        Lk::doc_transact $doc {
+            if [> $end 0] { Lk::doc_delete $doc 0 $end }
+            Lk::doc_insert $doc 0 $ins
+        }
+
+        set! t [put $t prefix $want]
+        weft::ws::_node-put! $pane_id [put [weft::ws::node $pane_id] tag $t]
+
+        return 1
+    }
+
+    ;; Where the user's half begins in the current text: just past the
+    ;; prefix and its one space (clamped to the text), or past the
+    ;; first " |" when the prefix was edited; 0 when there is none.
+    proc _pane-tag-user-start {pane_id} {
+        let t [weft::ws::pane-tag $pane_id]
+        let text [Lk::doc_text [get $t doc]]
+        let n [String::length $text]
+        let p [get $t prefix]
+        var start -1
+
+        if [and [not [empty? $p]] [== 0 [String::find $text $p]]] {
+            set! start [+ [String::length $p] 1]
+        } else {
+            let i [String::find $text " |"]
+
+            if [>= $i 0] { set! start [+ $i 3] }
+        }
+
+        if [< $start 0] { return 0 }
+        if [> $start $n] { return $n }
+
+        return $start
+    }
+
+    ;; The user's half of the tag (what sessions keep).
+    proc pane-tag-text {pane_id} {
+        let t [weft::ws::pane-tag $pane_id]
+
+        if [not [has? $t doc]] { return "" }
+
+        let text [Lk::doc_text [get $t doc]]
+
+        return [String::range $text \
+            [weft::ws::_pane-tag-user-start $pane_id] [String::length $text]]
+    }
+
+    ;; Replace the user's half (session restore).  The prefix is
+    ;; synced first so the boundary is the canonical one.
+    proc pane-tag-set-text! {pane_id user_text} {
+        let t [weft::ws::pane-tag $pane_id]
+
+        if [not [has? $t doc]] { return 0 }
+
+        weft::ws::pane-tag-sync! $pane_id
+
+        let doc [get $t doc]
+        let n [Lk::doc_len $doc]
+        let p [String::length [get [weft::ws::pane-tag $pane_id] prefix]]
+
+        Lk::doc_transact $doc {
+            if [> $n $p] { Lk::doc_delete $doc $p $n }
+            Lk::doc_insert $doc $p " $user_text"
+        }
+
+        return 1
+    }
+
+    ;; The separator's position in the current text (-1 when the user
+    ;; removed it): the one word in a tag that is not a program.
+    proc pane-tag-sep {pane_id} {
+        let t [weft::ws::pane-tag $pane_id]
+
+        if [not [has? $t doc]] { return -1 }
+
+        let text [Lk::doc_text [get $t doc]]
+        let p [get $t prefix]
+
+        if [and [not [empty? $p]] [== 0 [String::find $text $p]]] {
+            return [- [String::length $p] 1]
+        }
+
+        let i [String::find $text " |"]
+
+        if [>= $i 0] { return [+ $i 1] }
+
+        return -1
     }
 
     ;; The pane's own most recent live buffer other than `excluding`;

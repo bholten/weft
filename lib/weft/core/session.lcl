@@ -4,11 +4,12 @@
 ;;; A session is the split tree as data: splits carry axis + ratio
 ;;; (workspace-owned, section 6), panes carry what they showed --
 ;;; a path for file buffers, a bare name for scratch ones -- plus the
-;;; view's editor snapshot and the focus flag:
+;;; view's editor snapshot, the focus flag, and the user's half of
+;;; the pane's tag line (the kernel-owned half is derived):
 ;;;
 ;;;   #{tree #{kind "split" axis h ratio 0.62
 ;;;            a #{kind "pane" path "/x.c" view #{cursor 120}
-;;;               focused 1}
+;;;               focused 1 tag "Look |sort"}
 ;;;            b #{kind "pane" name "*scratch*" view #{cursor 0}}}}
 ;;;
 ;;; Buffer CONTENT never persists here: file panes reopen their path
@@ -42,7 +43,8 @@ namespace weft::session {
         }
 
         return #{kind "pane" path [get $b path] name [get $b name]
-            view [weft::ws::view-snapshot $vid] focused $focused}
+            view [weft::ws::view-snapshot $vid] focused $focused
+            tag [weft::ws::pane-tag-text $node_id]}
     }
 
     proc snapshot {} {
@@ -100,6 +102,14 @@ namespace weft::session {
         weft::ws::pane-show-buffer! $pane_id $bid
         weft::ws::view-restore! [weft::ws::pane-view $pane_id] \
             [get $node view]
+
+        ;; The user's half of the tag (sessions written before tags
+        ;; have none).
+        if [has? $node tag] {
+            if [not [empty? [get $node tag]]] {
+                weft::ws::pane-tag-set-text! $pane_id [get $node tag]
+            }
+        }
 
         if [get $node focused] { return $pane_id }
 

@@ -30,6 +30,14 @@ weft::config::filetype! "*lcl*" #{lang lcl}
 weft::config::filetype! "*scratch*" #{lang lcl}
 weft::config::filetype! "*annot-edit*" #{lang lcl}
 
+;; ---- tags: the line over each pane (docs/buffers.md "Tags") ----
+;; `<name> <tag_verbs> [<tag_dirty_verbs>] | <yours>`.  The verbs are
+;; text: rename, trim, or add your own procs' names here.  A tag
+;; never wraps -- it scrolls.
+weft::config::put! tag_verbs "Newcol Delcol New Del"
+weft::config::put! tag_dirty_verbs "Put"
+weft::config::filetype! "*tag*" #{wrap none}
+
 ;; ---- default keybindings: a host profile ----
 ;; Commands are portable; chords are per host.  See the file.
 load "$weft_config_dir/bindings-native.lcl"

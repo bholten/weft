@@ -94,6 +94,32 @@ namespace weft {
         return ""
     }
 
+    ;; Save a buffer: the ctx buffer, or one named EXACTLY (fuzzy
+    ;; saving is the convenience-crossing-the-API-boundary bug).  The
+    ;; command form of ctrl+s and of the tag's `Put`.
+    proc save {*rest} {
+        let ctx [weft::image::ctx]
+        var bid ""
+
+        if [empty? $rest] {
+            set! bid [weft::ctx::field $ctx buffer]
+
+            if [not [weft::ws::buffer? $bid]] {
+                return [weft::error::make invalid-args "save: no buffer in ctx"]
+            }
+        } else {
+            set! bid [weft::ws::buffer-resolve [get $rest 0] exact $ctx]
+
+            if [weft::error::error? $bid] { return $bid }
+        }
+
+        let r [weft::ws::buffer-save! $bid $ctx]
+
+        if [weft::error::error? $r] { return $r }
+
+        return #{kind saved buffer $bid path [get [weft::ws::buffer $bid] path]}
+    }
+
     proc open {*rest} {
         let ctx [weft::image::ctx]
         var path ""
@@ -842,10 +868,12 @@ namespace weft {
             ({weft::send right} {show THIS buffer in the pane that way -- focus and layout stay put; `next` cycles})
             ({weft::back} {this pane's previous buffer -- every pane keeps its own trail (weft::forward returns)})
             ({weft::swap right} {exchange what two panes display -- this one and the one that way; focus stays here})
+            ({weft::save} {save this buffer (ctrl+s; the tag's Put) -- `weft::save NAME` saves another})
             ({weft::close notes.md} {kill a buffer by name (add `force` to discard edits); alone: this one})
             ({weft::only} {collapse the splits to this pane -- no buffer is lost})
             ({weft::zoom} {show only this pane, tree intact -- toggle; any layout change or focus move drops it})
             ({weft::pane-close} {close this pane -- its buffer stays open (ctrl+w)})
+            ({Newcol} {tag verbs: Newcol Delcol New Del Put -- the line over each pane; `weft::describe Del`})
             ({weft::transpose} {flip this pane's split between side-by-side and stacked})
             ({weft::pane-swap} {swap this pane's buffer with the next pane's (weft::swap next)})
             ({weft::commands} {this menu})
