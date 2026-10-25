@@ -94,6 +94,76 @@ namespace weft {
         return ""
     }
 
+    ;; ---- insert: text at the cursor, applied now ----
+
+    ;; Put TEXT into the ctx buffer and apply it at once -- one undo
+    ;; step, no *diff* review.  Where: the selection SET (each range
+    ;; replaced), else the selection (start/end, replaced), else at
+    ;; EVERY caret of the ctx view (the active view of the buffer when
+    ;; the ctx names none: an attached REPL), else the buffer's tail.
+    ;; The cursor lands after the inserted text (one range; lk carries
+    ;; the carets of a set past their own inserts).  This is the
+    ;; "insert at cursor" primitive the transform algebra deliberately
+    ;; is not: a transform's result is a PLAN over [start, end), the
+    ;; whole buffer when nothing is selected, and it waits for review.
+    ;; A timestamp, a signature, a snippet want neither:
+    ;;   weft::config::bind! "ctrl+shift+t" {weft::insert [stamp]}
+    proc insert {text} {
+        let ctx [weft::image::ctx]
+        let bid [weft::ctx::field $ctx buffer]
+
+        if [not [weft::ws::buffer? $bid]] {
+            error "weft::insert: no buffer in ctx (run from a buffer, an attached REPL, or a bound chord)"
+        }
+
+        let doc [weft::ws::buffer-doc $bid]
+        var vid [weft::ctx::field $ctx view]
+
+        if [empty? $vid] {
+            set! vid [weft::ws::active-view-of-buffer $bid]
+        }
+
+        let body [String::from $text]
+        var edits ()
+
+        if [and [has? $ctx selections] [list? [get $ctx selections]]] {
+            foreach s [get $ctx selections] {
+                if [== 2 [len $s]] {
+                    set! edits [List::push $edits \
+                        #{start [get $s 0] end [get $s 1] text $body}]
+                }
+            }
+        }
+
+        if [and [== 0 [len $edits]] [has? $ctx start] [has? $ctx end]] {
+            set! edits [list #{start [get $ctx start] end [get $ctx end]
+                text $body}]
+        }
+
+        if [and [== 0 [len $edits]] [not [empty? $vid]]] {
+            foreach c [weft::ws::view-carets $vid] {
+                set! edits [List::push $edits #{start $c end $c text $body}]
+            }
+        }
+
+        if [== 0 [len $edits]] {
+            let tail [Lk::doc_len $doc]
+            set! edits [list #{start $tail end $tail text $body}]
+        }
+
+        let r [weft::transform::commit! #{transform insert buffer $bid
+            base_rev [Lk::doc_revision $doc] edits $edits}]
+
+        if [weft::error::error? $r] { return $r }
+
+        if [and [== 1 [len $edits]] [not [empty? $vid]]] {
+            weft::ws::view-set-cursor! $vid \
+                [+ [get [get $edits 0] start] [String::length $body]]
+        }
+
+        return ""
+    }
+
     ;; Save a buffer: the ctx buffer, or one named EXACTLY (fuzzy
     ;; saving is the convenience-crossing-the-API-boundary bug).  The
     ;; command form of ctrl+s and of the tag's `Put`.
@@ -948,6 +1018,8 @@ namespace weft {
                 {bind a chord to a script (a third word documents it in weft::keys); rebinding a native chord shadows it})
             ({weft::template {replace-all {} {}}}
                 {paste a command to complete, cursor in the first {} -- bind! it and any command is a keyed prompt})
+            ({weft::insert {text}}
+                {insert text at the cursor (or over the selection), applied now -- bind! {weft::insert [my-stamp]} for snippets})
             ({weft::config::filetype! {.md} #{wrap word}} {per-filetype settings})
             ({weft::plumb::rule-names} {the plumbing rules in force})
             ({weft::ts::style!} {recolor a tree-sitter capture})

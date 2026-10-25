@@ -978,4 +978,63 @@ gate "no view: the template goes to the tail" \
 let _t0 [_tmpl {y} #{}]
 gate "template without a buffer is an error" [not [get $_t0 ok]]
 
+;; ---- weft::insert: text at the cursor, applied now ----
+
+let _ib [weft::ws::buffer-create! "ins" "" "alpha\nbeta\n"]
+let _iv [weft::ws::view-create! $_ib]
+let _ied [weft::ws::view-editor $_iv]
+let _idoc [weft::ws::buffer-doc $_ib]
+
+proc _ins {text ctx} {
+    return [weft::image::eval-in! user "weft::insert {$text}" $ctx]
+}
+
+;; a bare caret: the text goes in AT it, cursor after
+weft::testhost::editor-multi-select! $_ied [list [list 2 2]]
+let _i1 [_ins {TS} #{buffer $_ib view $_iv}]
+gate "insert evaluates" [get $_i1 ok]
+gate "insert lands at the caret, nothing else touched" \
+    [== "alTSpha\nbeta\n" [Lk::doc_text $_idoc]]
+gate "insert leaves the cursor after the text" \
+    [== 4 [weft::testhost::editor-cursor $_ied]]
+gate "insert is one undo step" \
+    [and [Lk::history_undo [get [weft::ws::buffer $_ib] hist] $_idoc] \
+         [== "alpha\nbeta\n" [Lk::doc_text $_idoc]]]
+
+;; a selection: replaced
+_ins {X} #{buffer $_ib view $_iv start 0 end 5}
+gate "insert replaces the selection" \
+    [== "X\nbeta\n" [Lk::doc_text $_idoc]]
+gate "cursor after the replacement" [== 1 [weft::testhost::editor-cursor $_ied]]
+
+;; N bare carets: N insert points, one transaction
+weft::testhost::editor-multi-select! $_ied [list [list 0 0] [list 2 2]]
+_ins {-} #{buffer $_ib view $_iv}
+gate "N carets = N insert points" \
+    [== "-X\n-beta\n" [Lk::doc_text $_idoc]]
+gate "a caret-set insert is one undo step" \
+    [and [Lk::history_undo [get [weft::ws::buffer $_ib] hist] $_idoc] \
+         [== "X\nbeta\n" [Lk::doc_text $_idoc]]]
+
+;; the selection SET in ctx: every range replaced
+_ins {ab} #{buffer $_ib view $_iv start 0 end 1 selections ((0 1) (2 6))}
+gate "the selection set replaces every range" \
+    [== "ab\nab\n" [Lk::doc_text $_idoc]]
+
+;; no view at all (an unattached eval): the tail
+let _ib2 [weft::ws::buffer-create! "ins2" "" "x"]
+_ins {y} #{buffer $_ib2}
+gate "no view: insert goes to the tail" \
+    [== "xy" [Lk::doc_text [weft::ws::buffer-doc $_ib2]]]
+
+;; a view the ctx does not name: the buffer's active view supplies
+;; the caret (the attached-REPL shape: ctx buffer only)
+weft::testhost::editor-multi-select! $_ied [list [list 1 1]]
+_ins {!} #{buffer $_ib}
+gate "ctx without a view falls back to the buffer's active view" \
+    [== "a!b\nab\n" [Lk::doc_text $_idoc]]
+
+let _i0 [_ins {y} #{}]
+gate "insert without a buffer is an error" [not [get $_i0 ok]]
+
 puts "cmd gates: all passed"
