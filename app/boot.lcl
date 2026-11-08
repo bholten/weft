@@ -54,6 +54,9 @@ require "weft/core/plumb.lcl"
 require "weft/core/search.lcl"
 require "weft/core/ts.lcl"
 require "weft/core/query.lcl"
+require "weft/core/derivation.lcl"
+require "weft/core/diff.lcl"
+require "weft/core/keep.lcl"
 
 ;; The shell's intents (what a chord can fire) are pure data, loaded
 ;; here so a headless image resolves the keybinding profile exactly
@@ -117,6 +120,8 @@ if [== [weft::task::state $_user_cfg_t] succeeded] {
         }
     }
 }
+
+weft::live::load! [weft::live::path]
 
 ;; Anything bound from here on (REPL, *scratch*, a gate script) is
 ;; live: it shadows the config files and the listing says so.

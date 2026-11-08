@@ -1,0 +1,556 @@
+;; Derivation gates: the record, the capture/stage/ publish contract,
+;; staleness over input generations, detach, sessions, and the api
+;; verbs.  weft --headless test/derive-gates.lcl
+
+proc gate {name ok} {
+    if [not $ok] { error "GATE FAILED: $name" }
+    puts "ok: $name"
+}
+
+require "weft/host/test.lcl"
+
+weft::ws::init! [weft::testhost::editor-hooks]
+weft::ws::tree-init! [weft::ws::view-create! [weft::ws::buffer-create! "*scratch*" "" ""]]
+weft::derivation::reset!
+
+let _in [weft::ws::buffer-create! "chapter.txt" "" "alpha beta\ngamma delta\nepsilon\n"]
+let _in2 [weft::ws::buffer-create! "notes.md" "" "one note\n"]
+
+proc _dtext {bid} { return [Lk::doc_text [weft::ws::buffer-doc $bid]] }
+
+;; A program that emits one provenance row per input line through the
+;; sink, each a qjump back to its line.
+let _prog1 {
+    let out [get [weft::image::ctx] out]
+    let src [get [get [weft::image::ctx] inputs] 0]
+    var i 0
+    foreach rec [get [weft::q::_records [weft::q::lines [weft::q::doc $src]] 100] records] {
+        weft::sink::emit! $out "line $i: [weft::q::_rec-text $rec]\n" \
+            #{layer {qjump} meta #{kind {drow}}
+              present #{ptype {qjump} value #{buffer $src start [get $rec start] end [get $rec end]}}}
+        set! i [+ $i 1]
+    }
+    String::from "done"
+}
+
+;; ---- define + run ----
+
+gate "define! refuses a bad name" \
+    [weft::error::error? [weft::derivation::define! "two words" $_prog1 [list $_in]]]
+gate "define! refuses a non-list input" \
+    [weft::error::error? [weft::derivation::define! lines $_prog1 {b1 b2}]]
+gate "define! refuses an unknown buffer" \
+    [weft::error::error? [weft::derivation::define! lines $_prog1 (nope)]]
+gate "define! returns the name" \
+    [== lines [weft::derivation::define! lines $_prog1 [list $_in]]]
+gate "a fresh record is never run" \
+    [== "not run" [weft::derivation::stale-reason lines]]
+
+weft::testhost::presented-reset!
+
+let _r1 [weft::derivation::run! lines #{buffer $_in2 start 0 end 3 view v9}]
+gate "run! returns kind show with the output buffer" \
+    [and [dict? $_r1] [and [== show [get $_r1 kind]] [weft::ws::buffer? [get $_r1 buffer]]]]
+
+let _out [get $_r1 buffer]
+let _t1 [_dtext $_out]
+gate "the output is named *lines*" \
+    [== "*lines*" [get [weft::ws::buffer $_out] name]]
+gate "the output is read-only by policy" \
+    [== 0 [weft::ws::buffer-editable? $_out]]
+gate "header names the derivation" \
+    [== 0 [String::find $_t1 ";; derivation lines"]]
+gate "header names the input with its generations" \
+    [>= [String::find $_t1 "inputs: chapter.txt (rev "] 0]
+gate "header status is ok" \
+    [>= [String::find $_t1 ";; status: ok"] 0]
+gate "rows landed after the header" \
+    [and [>= [String::find $_t1 "line 0: alpha beta"] 0] \
+         [>= [String::find $_t1 "line 2: epsilon"] 0]]
+gate "the returned string is emitted as the last row" \
+    [>= [String::find $_t1 "\ndone\n"] 0]
+
+;; Annotations copied flat: three qjump rows in the OUTPUT store.
+let _ostore [weft::ws::buffer-store $_out]
+let _rows [Lk::annot_by_layer $_ostore "qjump"]
+gate "three qjump annotations published" [== 3 [len $_rows]]
+let _sp0 [Lk::annot_span $_ostore [get $_rows 0]]
+gate "a published row spans its own text" \
+    [== "line 0: alpha beta" [String::range $_t1 [get $_sp0 0] [get $_sp0 1]]]
+
+;; Presentations copied: the test host recorded one per row on the
+;; staging store AND one per row on the output store.
+var _pres_out 0
+foreach p [weft::testhost::presented] {
+    if [and [== qjump [get $p ptype]] [== $_in [get [get $p value] buffer]]] {
+        set! _pres_out [+ $_pres_out 1]
+    }
+}
+gate "qjump presentations point at the input (staged + published)" \
+    [== 6 $_pres_out]
+gate "no staging buffer survives" \
+    [empty? [weft::ws::buffer-for-name "*derive-staging-1*"]]
+
+gate "a published derivation is current" \
+    [== "" [weft::derivation::stale-reason lines]]
+gate "the record remembers its run" \
+    [and [== ok [get [get [weft::derivation::record lines] status] state]] \
+         [not [empty? [get [weft::derivation::record lines] run_id]]]]
+gate "for-output finds the owner" \
+    [== lines [weft::derivation::for-output $_out]]
+
+;; The program ran in user:: (a nested evaluation): the definitions
+;; it makes land there, not in user::user.
+weft::derivation::define! defs {proc _dgate_proc {} { return 5 }
+String::from "defined"} ()
+let _rd [weft::derivation::run! defs #{}]
+gate "a program with no inputs runs" [== show [get $_rd kind]]
+gate "program definitions land in user::" \
+    [and [Ns::has? $user _dgate_proc] [not [Ns::has? $user user]]]
+gate "no inputs prints as such" \
+    [>= [String::find [_dtext [get $_rd buffer]] "(no inputs)"] 0]
+
+;; ---- atomic publish: a failing run keeps the last good result ----
+
+weft::derivation::define! lines {
+    weft::sink::emit! [get [weft::image::ctx] out] "half a row\n"
+    error "boom"
+} [list $_in]
+gate "redefinition keeps the output and marks it stale" \
+    [and [== $_out [get [weft::derivation::record lines] output]] \
+         [== "program redefined" [weft::derivation::stale-reason lines]]]
+
+let _r2 [weft::derivation::run! lines #{}]
+gate "a failing run returns the structured error" \
+    [and [weft::error::error? $_r2] [>= [String::find [weft::error::message $_r2] "boom"] 0]]
+let _t2 [_dtext $_out]
+gate "the last good rows survive the failure" \
+    [and [>= [String::find $_t2 "line 2: epsilon"] 0] \
+         [< [String::find $_t2 "half a row"] 0]]
+gate "the status line reports the failure in place" \
+    [and [>= [String::find $_t2 ";; status: error: boom"] 0] \
+         [>= [String::find $_t2 "last good result kept"] 0]]
+gate "the record status is error" \
+    [== error [get [get [weft::derivation::record lines] status] state]]
+gate "the published annotations survive too" \
+    [== 3 [len [Lk::annot_by_layer $_ostore "qjump"]]]
+gate "the failed run's staging buffer is gone" \
+    [empty? [weft::ws::buffer-for-name "*derive-staging-3*"]]
+
+;; Back to a working program; the run heals the status.
+weft::derivation::define! lines $_prog1 [list $_in]
+let _r3 [weft::derivation::run! lines #{}]
+gate "a later success replaces the result" \
+    [and [== show [get $_r3 kind]] \
+         [>= [String::find [_dtext $_out] ";; status: ok"] 0]]
+gate "rows are replaced, not accumulated" \
+    [== 3 [len [Lk::annot_by_layer $_ostore "qjump"]]]
+
+;; ---- staleness: input generations ----
+
+Lk::doc_insert [weft::ws::buffer-doc $_in] 0 "zeta "
+gate "editing an input's text makes it stale" \
+    [== "chapter.txt text changed" [weft::derivation::stale-reason lines]]
+weft::derivation::run! lines #{}
+gate "a run clears staleness" [== "" [weft::derivation::stale-reason lines]]
+
+Lk::annot_add [weft::ws::buffer-store $_in] 0 4 "notes" #{note hi}
+gate "changing only an input's annotations makes it stale" \
+    [== "chapter.txt annotations changed" [weft::derivation::stale-reason lines]]
+weft::derivation::run! lines #{}
+gate "stale? is the predicate" [== 0 [weft::derivation::stale? lines]]
+
+;; ---- derived of derived ----
+
+weft::derivation::define! second {
+    weft::emit "second sees [weft::q::count [weft::q::lines [weft::q::doc]]] lines"
+} [list $_out]
+let _r4 [weft::derivation::run! second #{}]
+gate "a derivation over a derived buffer reads its current text" \
+    [>= [String::find [_dtext [get $_r4 buffer]] "second sees 8 lines"] 0]
+weft::derivation::run! lines #{}
+gate "re-running the input derivation makes the dependent stale" \
+    [== "*lines* text changed" [weft::derivation::stale-reason second]]
+
+;; ---- detach ----
+
+gate "detach! refuses an ordinary buffer" \
+    [weft::error::error? [weft::derivation::detach! $_in]]
+let _dn [weft::derivation::detach! $_out]
+gate "detach! names the derivation" [== lines $_dn]
+gate "a detached buffer is editable and renamed" \
+    [and [== 1 [weft::ws::buffer-editable? $_out]] \
+         [== "lines-detached" [get [weft::ws::buffer $_out] name]]]
+gate "the header stays as provenance" \
+    [== 0 [String::find [_dtext $_out] ";; derivation lines"]]
+gate "the record forgets its output" \
+    [and [== "" [get [weft::derivation::record lines] output]] \
+         [== "not run" [weft::derivation::stale-reason lines]]]
+let _r5 [weft::derivation::run! lines #{}]
+gate "the next run creates a fresh *lines*" \
+    [and [not [== $_out [get $_r5 buffer]]] \
+         [== "*lines*" [get [weft::ws::buffer [get $_r5 buffer]] name]]]
+
+;; An editable namesake is never overwritten.
+weft::derivation::define! taken {weft::emit "x"} ()
+let _taken [weft::ws::buffer-create! "*taken*" "" "mine\n"]
+let _r6 [weft::derivation::run! taken #{}]
+gate "an editable buffer wearing the output name refuses the run" \
+    [and [weft::error::error? $_r6] [== "mine\n" [_dtext $_taken]]]
+
+;; ---- a closed input ----
+
+let _gone [weft::ws::buffer-create! "gone.txt" "" "x\n"]
+weft::derivation::define! orphan {weft::emit "ran"} [list $_gone]
+let _r7 [weft::derivation::run! orphan #{}]
+gate "a run over a live input succeeds" [== show [get $_r7 kind]]
+weft::ws::buffer-close! $_gone 1
+let _r8 [weft::derivation::run! orphan #{}]
+gate "a closed input is a structured error" \
+    [and [weft::error::error? $_r8] [>= [String::find [weft::error::message $_r8] "closed"] 0]]
+gate "the last result is kept with the failure on its status line" \
+    [and [>= [String::find [_dtext [get $_r7 buffer]] "ran"] 0] \
+         [>= [String::find [_dtext [get $_r7 buffer]] ";; status: error:"] 0]]
+gate "stale-reason reports the closed input" \
+    [>= [String::find [weft::derivation::stale-reason orphan] "closed"] 0]
+
+;; ---- sessions: definitions, not results ----
+
+let _snap [weft::derivation::snapshot]
+gate "snapshot carries name, program and inputs by name" \
+    [and [list? $_snap] [> [len $_snap] 0]]
+var _snap_lines #{}
+foreach d $_snap { if [== lines [get $d name]] { set! _snap_lines $d } }
+gate "inputs are recorded by path-or-name" \
+    [== "chapter.txt" [get [get $_snap_lines inputs] 0]]
+gate "the program is the source text" \
+    [== $_prog1 [get $_snap_lines program]]
+
+weft::derivation::reset!
+gate "reset! forgets" [== 0 [len [weft::derivation::names]]]
+
+;; The session recreated *lines* as an empty scratch buffer; restore
+;; adopts it.  `orphan`'s input gone.txt is closed: reported, not an
+;; error.
+let _shell [weft::ws::buffer-create! "*lines*" "" ""]
+let _n [weft::derivation::restore! $_snap #{}]
+gate "restore! brings every record back" [== [len $_snap] $_n]
+gate "a namesake buffer is adopted read-only with a not-run header" \
+    [and [== $_shell [get [weft::derivation::record lines] output]] \
+         [and [== 0 [weft::ws::buffer-editable? $_shell]] \
+              [>= [String::find [_dtext $_shell] "not run this session"] 0]]]
+let _r9 [weft::derivation::run! lines #{}]
+gate "a restored derivation runs into the adopted buffer" \
+    [and [== $_shell [get $_r9 buffer]] \
+         [>= [String::find [_dtext $_shell] "line 0: zeta alpha beta"] 0]]
+gate "a missing input is unresolved, and the run says so" \
+    [and [== "gone.txt" [get [get [weft::derivation::record orphan] unresolved] 0]] \
+         [>= [String::find [weft::error::message [weft::derivation::run! orphan #{}]] "not open"] 0]]
+
+;; Through weft::session itself: snapshot round-trips the key.
+gate "the session snapshot carries derivations" \
+    [has? [weft::session::snapshot] derivations]
+
+;; ---- the api verbs, through the image (the real path) ----
+
+let _ctx_in #{buffer $_in start 0 end 0}
+let _a1 [weft::image::eval-in! user {weft::derive api {weft::emit "api row"} notes.md} $_ctx_in]
+gate "weft::derive defines and runs, inputs by name" \
+    [and [get $_a1 ok] [== show [get [get $_a1 value] kind]]]
+gate "the named input was resolved exactly" \
+    [== $_in2 [get [get [weft::derivation::record api] inputs] 0]]
+let _a2 [weft::image::eval-in! user {weft::derive api} #{}]
+gate "weft::derive name re-runs" [== show [get [get $_a2 value] kind]]
+let _a3 [weft::image::eval-in! user {weft::derive nosuch} #{}]
+gate "weft::derive on an unknown name is a structured error" \
+    [weft::error::error? [get $_a3 value]]
+let _a4 [weft::image::eval-in! user {weft::derive here {weft::emit "[q::count [q::lines [q::doc]]] lines"}} $_ctx_in]
+gate "no inputs named: the executing buffer is the input" \
+    [and [== $_in [get [get [weft::derivation::record here] inputs] 0]] \
+         [>= [String::find [_dtext [get [get $_a4 value] buffer]] "3 lines"] 0]]
+gate "the outer evaluation's ctx survives the nested run" \
+    [== $_in [get [get [weft::image::records] [- [len [weft::image::records]] 1]] buffer]]
+
+let _a5 [weft::image::eval-in! user {weft::derivations} #{}]
+gate "weft::derivations lists every record" \
+    [== [len [weft::derivation::names]] [get [get $_a5 value] count]]
+let _otext [_dtext [weft::shell::output-buffer!]]
+gate "rows carry status, inputs and the output name" \
+    [and [>= [String::find $_otext "api  ok  <- notes.md  *api*"] 0] \
+         [>= [String::find $_otext "orphan  error: derivation 'orphan': input 'gone.txt' is not open  <- gone.txt (not open)"] 0]]
+
+let _a6 [weft::image::eval-in! user {weft::detach} #{buffer [get [get $_a2 value] buffer]}]
+gate "weft::detach in the derived buffer severs it" \
+    [and [== detached [get [get $_a6 value] kind]] \
+         [== "api-detached" [get [get $_a6 value] name]]]
+let _a7 [weft::image::eval-in! user {weft::detach} $_ctx_in]
+gate "weft::detach on an ordinary buffer is a structured error" \
+    [weft::error::error? [get $_a7 value]]
+
+if $weft_have_regex {
+    let _sb [weft::ws::buffer-create! "src.txt" "" "see TODO-1 and TODO-22\n"]
+    let _sq [weft::q::matches [weft::q::doc $_sb] {TODO-[0-9]+}]
+    let _shown [weft::q::show $_sq 10]
+    gate "show defines the derivation named query" \
+        [and [weft::derivation::defined? query] \
+             [== [get $_shown buffer] [get [weft::derivation::record query] output]]]
+    gate "show's result keeps shown and total" \
+        [and [== 2 [get $_shown shown]] [== 2 [get $_shown total]]]
+    gate "show's program is the plan, its input the source" \
+        [and [== query [get [get [weft::derivation::record query] program] kind]] \
+             [== $_sb [get [get [weft::derivation::record query] inputs] 0]]]
+    gate "*query* wears the derivation header and the query line" \
+        [and [== 0 [String::find [_dtext [get $_shown buffer]] ";; derivation query"]] \
+             [>= [String::find [_dtext [get $_shown buffer]] "matches TODO"] 0]]
+    Lk::doc_insert [weft::ws::buffer-doc $_sb] 0 "x"
+    gate "a projection goes stale when its source moves" \
+        [== "src.txt text changed" [weft::derivation::stale-reason query]]
+    gate "a plan program is not persisted" \
+        [== 0 [len [List::filter [weft::derivation::snapshot] \
+            [lambda {d} { return [== query [get $d name]] }]]]]
+    let _qd [weft::derivation::detach! [get $_shown buffer]]
+    gate "a projection detaches like any derivation" \
+        [and [== query $_qd] \
+             [== "query-detached" [get [weft::ws::buffer [get $_shown buffer]] name]]]
+    let _shown2 [weft::q::show $_sq 10]
+    gate "the next show makes a fresh *query*" \
+        [and [not [== [get $_shown buffer] [get $_shown2 buffer]]] \
+             [== "*query*" [get [weft::ws::buffer [get $_shown2 buffer]] name]]]
+} else {
+    puts "deferred: show-as-derivation gates (host built without regex)"
+}
+
+;; ---- the tag: Detach always, Derive while stale (like Put) ----
+
+let _tin [weft::ws::buffer-create! "tagged.txt" "" "a\nb\n"]
+weft::derivation::define! tagged {weft::emit "rows"} [list $_tin]
+let _tr [weft::derivation::run! tagged #{}]
+let _tout [get $_tr buffer]
+let _tp [weft::ws::tree-root]
+weft::ws::pane-show-buffer! $_tp $_tout
+gate "a derived buffer's tag carries Detach, not Derive, while current" \
+    [and [>= [String::find [weft::ws::pane-tag-prefix $_tp] " Detach"] 0] \
+         [< [String::find [weft::ws::pane-tag-prefix $_tp] " Derive"] 0]]
+Lk::doc_insert [weft::ws::buffer-doc $_tin] 0 "z"
+gate "Derive appears in the tag once the result is stale" \
+    [== "*tagged* Newcol Delcol New Del Detach Derive |" \
+        [weft::ws::pane-tag-prefix $_tp]]
+let _t0 [weft::image::eval-in! user {weft::derive} #{buffer $_tout}]
+gate "weft::derive with no name refreshes the output it runs in" \
+    [and [== show [get [get $_t0 value] kind]] \
+         [< [String::find [weft::ws::pane-tag-prefix $_tp] " Derive"] 0]]
+let _t1 [weft::image::eval-in! user {weft::derive} #{buffer $_tin}]
+gate "weft::derive with no name refuses an ordinary buffer" \
+    [weft::error::error? [get $_t1 value]]
+gate "Derive and Detach are seeded tag verbs" \
+    [and [Ns::has? $user Derive] [Ns::has? $user Detach]]
+let _t2 [weft::image::eval-in! user {Detach} #{buffer $_tout}]
+gate "Detach in the tag severs the body (renamed, verbs gone)" \
+    [and [== detached [get [get $_t2 value] kind]] \
+         [== "tagged-detached Newcol Delcol New Del |" [weft::ws::pane-tag-prefix $_tp]]]
+
+weft::config::put! data_dir "/data"
+weft::persist::reset!
+weft::testhost::fs-put! "/n/chapter.txt" "Marcella prayed.\nThen she lied.\nThe end.\n"
+let _nb [weft::ws::buffer-open! "/n/chapter.txt" #{}]
+let _nstore [weft::ws::buffer-store $_nb]
+
+let _n0 [weft::annot::note! #{buffer $_nb} "x"]
+gate "a note needs a range" [weft::error::error? $_n0]
+let _n1 [weft::annot::note! #{buffer $_nb start 17 end 31} "first act against her theology"]
+gate "a note on the selection returns its record" \
+    [and [list? $_n1] [and [== 1 [len $_n1]] [== $_nb [get [get $_n1 0] buffer]]]]
+let _nid [get [get $_n1 0] id]
+gate "the note lives on the authored notes layer with its text and time" \
+    [and [== notes [Lk::annot_layer $_nstore $_nid]] \
+         [and [== "first act against her theology" [Lk::annot_meta $_nstore $_nid note]] \
+              [not [empty? [Lk::annot_meta $_nstore $_nid when]]]]]
+gate "a note carries the configured style keys" \
+    [== "70 60 30" [Lk::annot_meta $_nstore $_nid "style:bg"]]
+gate "the notes layer is authored, not producer-owned" \
+    [not [has? [weft::producer::owned-layers] notes]]
+
+;; A selection SET notes every selection; EXECUTE WITH's operand may
+;; sit in another buffer.
+let _n2 [weft::annot::note! #{buffer $_nb selections ((0 8) (32 39))} "two at once"]
+gate "a selection set makes one note per selection" [== 2 [len $_n2]]
+let _other [weft::ws::buffer-create! "elsewhere" "" "no notes here\n"]
+let _n3 [weft::annot::note! #{buffer $_other operand #{kind text buffer $_nb start 0 end 8 text "Marcella"}} "via operand"]
+gate "an operand in another buffer is noted there" \
+    [== $_nb [get [get $_n3 0] buffer]]
+
+;; No selection: the line under the caret.
+let _nv [weft::ws::view-create! $_nb]
+weft::testhost::editor-cursor-set! [weft::ws::view-editor $_nv] 20
+let _n4 [weft::annot::note! #{buffer $_nb view $_nv} "the whole line"]
+gate "a bare caret notes its line" \
+    [and [== 17 [get [get $_n4 0] start]] [== 31 [get [get $_n4 0] end]]]
+gate "notes-in lists them in document order" \
+    [and [== 5 [len [weft::annot::notes-in $_nb]]] \
+         [== 0 [get [get [weft::annot::notes-in $_nb] 0] start]]]
+
+;; The index is a derivation over the noted buffers.
+let _ni [weft::image::eval-in! user {weft::notes} #{}]
+gate "weft::notes derives *notes*" \
+    [and [== show [get [get $_ni value] kind]] \
+         [== "*notes*" [get [weft::ws::buffer [get [get $_ni value] buffer]] name]]]
+let _nibuf [get [get $_ni value] buffer]
+let _nitext [_dtext $_nibuf]
+gate "the index names the buffer and each note with its line" \
+    [and [>= [String::find $_nitext "chapter.txt  (5 notes)"] 0] \
+         [>= [String::find $_nitext "L2  first act against her theology  -- \"Then she lied.\""] 0]]
+;; (An earlier gate left one note on the path-less chapter.txt
+;; fixture, so the index spans two buffers.)
+var _nall 0
+foreach _nbid [weft::annot::noted-buffers] {
+    set! _nall [+ $_nall [len [weft::annot::notes-in $_nbid]]]
+}
+gate "index rows jump to their notes (one qjump per note, every buffer)" \
+    [and [== 6 $_nall] \
+         [== $_nall [len [Lk::annot_by_layer [weft::ws::buffer-store $_nibuf] "qjump"]]]]
+gate "the index declares the noted buffers as inputs" \
+    [== [weft::annot::noted-buffers] [get [weft::derivation::record notes] inputs]]
+let _ni_again [weft::image::eval-in! user {weft::notes} #{}]
+gate "re-defining the same derivation is not a change" \
+    [and [== show [get [get $_ni_again value] kind]] \
+         [== "" [weft::derivation::stale-reason notes]]]
+weft::annot::note! #{buffer $_nb start 32 end 35} "late"
+gate "a new note makes the index stale (annotations, not text)" \
+    [== "/n/chapter.txt annotations changed" [weft::derivation::stale-reason notes]]
+let _ni2 [weft::image::eval-in! user {weft::notes} #{}]
+gate "re-running the index picks the note up" \
+    [>= [String::find [_dtext $_nibuf] "(6 notes)"] 0]
+gate "weft::note is the api form" \
+    [== noted [get [get [weft::image::eval-in! user {weft::note "api"} #{buffer $_nb start 0 end 3}] value] kind]]
+
+;; Persistence: authored, so it rides the file (P5), re-anchors, and
+;; parks as an orphan when its text is gone.
+weft::ws::view-close! $_nv
+gate "save persists every note" [== 7 [weft::persist::annots-save! $_nb]]
+weft::ws::buffer-close! $_nb 0
+let _nb2 [weft::ws::buffer-open! "/n/chapter.txt" #{}]
+gate "notes come back with the file" \
+    [== 7 [len [weft::annot::notes-in $_nb2]]]
+proc _note-start {bid text} {
+    foreach nt [weft::annot::notes-in $bid] {
+        if [== $text [get $nt note]] { return [get $nt start] }
+    }
+    return -1
+}
+gate "a note's text survives the round trip" \
+    [== 17 [_note-start $_nb2 "first act against her theology"]]
+weft::ws::buffer-close! $_nb2 0
+weft::testhost::fs-put! "/n/chapter.txt" "PROLOGUE\nMarcella prayed.\nThen she lied.\nThe end.\n"
+let _nb3 [weft::ws::buffer-open! "/n/chapter.txt" #{}]
+gate "notes re-anchor after an external edit before them" \
+    [== 26 [_note-start $_nb3 "first act against her theology"]]
+weft::ws::buffer-save! $_nb3 #{}
+weft::ws::buffer-close! $_nb3 0
+weft::testhost::fs-put! "/n/chapter.txt" "entirely different text now\n"
+let _nb4 [weft::ws::buffer-open! "/n/chapter.txt" #{}]
+gate "notes whose text is gone park as orphans" \
+    [and [== 0 [len [weft::annot::notes-in $_nb4]]] \
+         [== notes [get [get [weft::persist::orphans $_nb4] 0] layer]]]
+
+let _da [weft::ws::buffer-create! "left.txt" "" "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\n"]
+let _db [weft::ws::buffer-create! "right.txt" "" "one\ntwo\nTHREE\nfour\nfive\nsix\nseven\neight\nnine\n"]
+gate "the line diff engine yields a minimal edit script" \
+    [== "keep del add keep add" [String::join [List::map \
+        [weft::linediff::ops (a b c) (a x c d)] [lambda {o} { return [get $o op] }]] " "]]
+gate "identical inputs are all keeps" \
+    [== 3 [len [List::filter [weft::linediff::ops (a b c) (a b c)] \
+        [lambda {o} { return [== keep [get $o op]] }]]]]
+let _dr [weft::image::eval-in! user {weft::diff left.txt right.txt} #{}]
+gate "weft::diff derives diff:<a>:<b> over both buffers" \
+    [and [== show [get [get $_dr value] kind]] \
+         [and [== "diff:left.txt:right.txt" [get [get $_dr value] derivation]] \
+              [== [list $_da $_db] [get [weft::derivation::record "diff:left.txt:right.txt"] inputs]]]]
+let _dout [_dtext [get [get $_dr value] buffer]]
+gate "the diff is unified: sides, hunk header, context and changes" \
+    [and [>= [String::find $_dout "--- left.txt\n+++ right.txt\n@@ -1,8 +1,9 @@\n one\n two\n-three\n+THREE\n four"] 0] \
+         [>= [String::find $_dout " eight\n+nine\n"] 0]]
+let _dstore [weft::ws::buffer-store [get [get $_dr value] buffer]]
+var _dminus 0
+var _dplus 0
+foreach _id [Lk::annot_by_layer $_dstore "qjump"] {
+    let _sp [Lk::annot_span $_dstore $_id]
+    let _row [String::range $_dout [get $_sp 0] [get $_sp 1]]
+    if [== "-three" $_row] { set! _dminus $_id }
+    if [== "+nine" $_row] { set! _dplus $_id }
+}
+gate "every diff row is a jump" \
+    [and [> $_dminus 0] [> $_dplus 0]]
+var _dj_a 0
+var _dj_b 0
+foreach p [weft::testhost::presented] {
+    if [== qjump [get $p ptype]] {
+        let v [get $p value]
+        if [and [== $_da [get $v buffer]] [== 8 [get $v start]]] { set! _dj_a 1 }
+        if [and [== $_db [get $v buffer]] [== 40 [get $v start]]] { set! _dj_b 1 }
+    }
+}
+gate "minus rows jump into a, plus rows into b, at their line ranges" \
+    [and $_dj_a $_dj_b]
+Lk::doc_insert [weft::ws::buffer-doc $_db] 0 "zero\n"
+gate "editing either side makes the diff stale" \
+    [== "right.txt text changed" [weft::derivation::stale-reason "diff:left.txt:right.txt"]]
+let _ds [weft::image::eval-in! user {weft::diff left.txt left.txt} #{}]
+gate "a buffer against itself has no differences" \
+    [>= [String::find [_dtext [get [get $_ds value] buffer]] "(no differences)"] 0]
+let _dd [weft::image::eval-in! user {weft::diff left.txt "*notes*"} #{}]
+gate "a derived buffer is a diff side like any other" \
+    [== show [get [get $_dd value] kind]]
+let _dbad [weft::image::eval-in! user {weft::diff left.txt nosuch.txt} #{}]
+gate "an unknown side is a structured error" \
+    [weft::error::error? [get $_dbad value]]
+
+weft::config::put! live_path "/cfg/live.lcl"
+gate "nothing kept yet is a structured error" \
+    [weft::error::error? [get [weft::image::eval-in! user {weft::keep classify} #{}] value]]
+weft::image::eval-in! user {let prefix "WARN"
+proc classify {line} { return [String::find $line $prefix] }} #{}
+let _k1 [weft::image::eval-in! user {weft::keep classify} #{}]
+gate "keep writes the defining form into live.lcl" \
+    [and [== kept [get [get $_k1 value] kind]] \
+         [== "/cfg/live.lcl" [get [get $_k1 value] path]]]
+let _ltext [weft::testhost::fs-get "/cfg/live.lcl"]
+;; NB braced: the form itself holds $line and [String::find].
+gate "the block carries the exact form under markers" \
+    [and [== 0 [String::find $_ltext ";; keep: classify "]] \
+         [and [>= [String::find $_ltext {proc classify {line} { return [String::find $line $prefix] }}] 0] \
+              [and [>= [String::find $_ltext ";; end keep: classify\n"] 0] \
+                   [< [String::find $_ltext "let prefix"] 0]]]]
+weft::image::eval-in! user {proc classify {line} { return 42 }} #{}
+weft::image::eval-in! user {weft::keep classify} #{}
+let _ltext2 [weft::testhost::fs-get "/cfg/live.lcl"]
+gate "re-keeping replaces the block" \
+    [and [== 1 [len [weft::live::blocks $_ltext2]]] \
+         [>= [String::find $_ltext2 "return 42"] 0]]
+weft::image::eval-in! user {var greeting "hi"} #{}
+weft::image::eval-in! user {weft::keep greeting} #{}
+gate "a var keeps too, in its own block" \
+    [== 2 [len [weft::live::blocks [weft::testhost::fs-get "/cfg/live.lcl"]]]]
+;; A hand-added block that cannot replay: its evaluation calls a
+;; proc that does not exist (a proc BODY with a free variable would
+;; define fine and only fail when called).
+let _broken [weft::live::render (#{name broken date x source {var broken [no_such_proc_anywhere 1]}})]
+weft::testhost::fs-put! "/cfg/live.lcl" "[weft::testhost::fs-get "/cfg/live.lcl"]$_broken"
+let _kl [weft::live::load! "/cfg/live.lcl"]
+gate "load! replays each block on its own and counts" \
+    [and [== 2 [get $_kl loaded]] [== 1 [get $_kl failed]]]
+gate "a failing block is a notice, not a stop" \
+    [>= [String::find [get [get [weft::shell::notices] [- [len [weft::shell::notices]] 1]] text] "keep: block 'broken'"] 0]
+gate "a missing file loads nothing" \
+    [== 0 [get [weft::live::load! "/cfg/none.lcl"] loaded]]
+let _kr [weft::image::eval-in! user {weft::kept} #{}]
+gate "weft::kept lists the blocks as a derivation" \
+    [and [== show [get [get $_kr value] kind]] \
+         [>= [String::find [_dtext [get [get $_kr value] buffer]] "classify  "] 0]]
+let _ku [weft::image::eval-in! user {weft::unkeep greeting} #{}]
+gate "unkeep drops a block" \
+    [and [== unkept [get [get $_ku value] kind]] \
+         [== 2 [len [weft::live::blocks [weft::testhost::fs-get "/cfg/live.lcl"]]]]]
+gate "unkeep of nothing is a structured error" \
+    [weft::error::error? [get [weft::image::eval-in! user {weft::unkeep greeting} #{}] value]]
+
+puts "derive gates: all passed"

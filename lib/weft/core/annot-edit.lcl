@@ -128,6 +128,182 @@ namespace weft::annot {
         return [> [len [Dict::keys $session]] 0]
     }
 
+    var note_layer "notes"
+
+    ;; Attach a note to [start, end) of `bid`; returns the id.
+    proc note-add! {bid start end text} {
+        let store [weft::ws::buffer-store $bid]
+        var _lr ""
+        var _le ""
+
+        catch { Lk::annot_layer_register $store $note_layer } _lr _le
+
+        var meta #{note [String::from $text]
+            when [weft::derivation::time-string]}
+        let st [weft::config::value-or note_style #{"style:bg" "70 60 30"}]
+
+        if [dict? $st] { set! meta [Dict::merge $st $meta] }
+
+        return [Lk::annot_add $store $start $end $note_layer $meta]
+    }
+
+    proc note-ranges {ctx} {
+        var out ()
+        let bid [weft::ctx::field $ctx buffer]
+
+        if [and [has? $ctx selections] [list? [get $ctx selections]]] {
+            foreach sel [get $ctx selections] {
+                if [and [== 2 [len $sel]] [< [get $sel 0] [get $sel 1]]] {
+                    set! out [List::push $out #{buffer $bid
+                        start [get $sel 0] end [get $sel 1]}]
+                }
+            }
+        }
+
+        if [== 0 [len $out]] {
+            let o [weft::cmd::operand-of $ctx]
+
+            if [and [has? $o buffer] [and [has? $o start] [has? $o end]]] {
+                if [< [get $o start] [get $o end]] {
+                    set! out [list #{buffer [get $o buffer]
+                        start [get $o start] end [get $o end]}]
+                }
+            }
+        }
+
+        if [and [== 0 [len $out]] [weft::ws::buffer? $bid]] {
+            var vid [weft::ctx::field $ctx view]
+
+            if [empty? $vid] {
+                set! vid [weft::ws::active-view-of-buffer $bid]
+            }
+
+            if [not [empty? $vid]] {
+                let doc [weft::ws::buffer-doc $bid]
+
+                foreach c [weft::ws::view-carets $vid] {
+                    let line [Lk::doc_pos_to_line $doc $c]
+                    let ls [Lk::doc_line_start $doc $line]
+                    let le [Lk::doc_line_end $doc $line]
+
+                    if [< $ls $le] {
+                        set! out [List::push $out #{buffer $bid
+                            start $ls end $le}]
+                    }
+                }
+            }
+        }
+
+        return $out
+    }
+
+    proc note! {ctx text} {
+        if [empty? [String::trim [String::from $text]]] {
+            return [weft::error::make invalid-args "note: empty note text"]
+        }
+
+        let ranges [weft::annot::note-ranges $ctx]
+
+        if [== 0 [len $ranges]] {
+            return [weft::error::make invalid-args \
+                "note: select the text to note (or put the caret on its line)"]
+        }
+
+        var out ()
+
+        foreach r $ranges {
+            let id [weft::annot::note-add! [get $r buffer] [get $r start] \
+                [get $r end] $text]
+
+            set! out [List::push $out [put $r id $id]]
+        }
+
+        return $out
+    }
+
+    proc notes-in {bid} {
+        let store [weft::ws::buffer-store $bid]
+        var _lr ""
+        var _le ""
+
+        catch { Lk::annot_layer_register $store $note_layer } _lr _le
+
+        var out ()
+
+        foreach id [Lk::annot_by_layer $store $note_layer] {
+            let sp [Lk::annot_span $store $id]
+            let meta [Lk::annot_meta_all $store $id]
+            var note ""
+            var when ""
+
+            if [has? $meta note] { set! note [get $meta note] }
+            if [has? $meta when] { set! when [get $meta when] }
+
+            set! out [List::push $out #{id $id start [get $sp 0]
+                end [get $sp 1] note $note when $when buffer $bid}]
+        }
+
+        return [List::sort_by $out [lambda {n} { return [get $n start] }]]
+    }
+
+    proc noted-buffers {} {
+        var out ()
+
+        foreach row [weft::ws::buffer-list] {
+            if [> [len [weft::annot::notes-in [get $row id]]] 0] {
+                set! out [List::push $out [get $row id]]
+            }
+        }
+
+        return $out
+    }
+
+    proc notes-rows! {out bids} {
+        var n 0
+
+        foreach bid $bids {
+            if [not [weft::ws::buffer? $bid]] { continue }
+
+            let notes [weft::annot::notes-in $bid]
+
+            if [== 0 [len $notes]] { continue }
+
+            let b [weft::ws::buffer $bid]
+            let doc [weft::ws::buffer-doc $bid]
+            let text [Lk::doc_text $doc]
+
+            weft::sink::emit! $out "[get $b name]  ([len $notes] notes)\n"
+
+            foreach nt $notes {
+                let line [+ 1 [Lk::doc_pos_to_line $doc [get $nt start]]]
+                var ex [String::replace \
+                    [String::range $text [get $nt start] [get $nt end]] \
+                    "\n" " "]
+
+                if [> [String::length $ex] 40] {
+                    set! ex "[String::range $ex 0 37].."
+                }
+
+                weft::sink::emit! $out \
+                    "  L$line  [String::replace [get $nt note] "\n" " "]  -- \"$ex\"\n" \
+                    #{layer {qjump} meta #{kind {note-row} buffer $bid
+                        note_id [get $nt id]}
+                        present #{ptype {qjump}
+                            value #{buffer $bid start [get $nt start]
+                                end [get $nt end]}}}
+                set! n [+ $n 1]
+            }
+
+            weft::sink::emit! $out "\n"
+        }
+
+        if [== 0 $n] {
+            weft::sink::emit! $out "(no notes -- weft::note {text} on a selection makes one)\n"
+        }
+
+        return ""
+    }
+
     proc session-buffer {} {
         if [not [weft::annot::pending?]] { return "" }
 

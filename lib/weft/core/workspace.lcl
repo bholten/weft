@@ -450,6 +450,17 @@ namespace weft::ws {
         return [apply [get $hooks present] $store $annot_id $ptype $value]
     }
 
+    ;; Read a presentation back (#{ptype .. value ..}, "" when none):
+    ;; the inverse of present!, so derived rows can be copied between
+    ;; stores at publish time (docs/derive.md).  A host without the
+    ;; hook reads "" -- rows then land without their jumps, never
+    ;; without their text.
+    proc presentation-of {store annot_id} {
+        if [not [has? $hooks presentation]] { return "" }
+
+        return [apply [get $hooks presentation] $store $annot_id]
+    }
+
     ;; Move a view's editor cursor through the restore hook (used by
     ;; plumb actions; core never touches editors directly).
     proc view-goto! {view_id pos} {
@@ -611,6 +622,19 @@ namespace weft::ws {
         set! meta_gen [+ $meta_gen 1]
 
         return $ft
+    }
+
+    ;; Rename a path-less buffer (names are presentation; the id is
+    ;; the identity).  The filetype key follows the name for path-less
+    ;; buffers, so it is recomputed.  Used by derivation detach.
+    proc buffer-rename! {id name} {
+        let b [weft::ws::buffer $id]
+
+        set! buffers [put $buffers $id [Dict::merge $b #{name $name
+            filetype [weft::ws::_filetype $name [get $b path]]}]]
+        set! meta_gen [+ $meta_gen 1]
+
+        return $name
     }
 
     ;; Registry summary for menus/tests: list of
@@ -1086,6 +1110,26 @@ namespace weft::ws {
                 [and [not [empty? [get [weft::ws::buffer $bid] path]]] \
                      [weft::ws::buffer-dirty? $bid]]] {
             set! s "$s $dirty_verbs"
+        }
+
+        ;; A derivation's output: Detach always, and Derive -- the
+        ;; refresh verb -- appears while the result is STALE, exactly
+        ;; as Put appears while a file is dirty.  A token comparison
+        ;; per frame, never a recompute.
+        let dname [weft::derivation::for-output $bid]
+
+        if [not [empty? $dname]] {
+            let derived_verbs [String::from \
+                [weft::config::value-or tag_derived_verbs "Detach"]]
+            let stale_verbs [String::from \
+                [weft::config::value-or tag_stale_verbs "Derive"]]
+
+            if [not [empty? $derived_verbs]] { set! s "$s $derived_verbs" }
+
+            if [and [not [empty? $stale_verbs]] \
+                    [weft::derivation::stale? $dname]] {
+                set! s "$s $stale_verbs"
+            }
         }
 
         return "$s |"

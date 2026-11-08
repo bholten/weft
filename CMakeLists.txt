@@ -46,13 +46,10 @@ if(NOT WEFT_LCL_SOURCE_DIR AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../lcl/CMakeL
   message(STATUS "weft: using sibling lcl checkout at ${WEFT_LCL_SOURCE_DIR}")
 endif()
 
-# lk's own options, forced before it configures (it configures lcl the
-# same way).  lk maps LK_LCL_IO/REGEX onto LCL_BUILD_IO/REGEX itself;
-# the remaining lcl packages are ours to enable.
 set(LK_BUILD_LCL ON CACHE BOOL "" FORCE)
 set(LK_LCL_IO ${WEFT_LCL_IO} CACHE BOOL "" FORCE)
 set(LK_LCL_REGEX ${WEFT_LCL_REGEX} CACHE BOOL "" FORCE)
-set(LCL_BUILD_POSIX ${WEFT_LCL_POSIX} CACHE BOOL "" FORCE)
+set(LK_LCL_POSIX ${WEFT_LCL_POSIX} CACHE BOOL "" FORCE)
 set(LCL_BUILD_PROCESS ${WEFT_LCL_PROCESS} CACHE BOOL "" FORCE)
 set(LCL_BUILD_JSON ${WEFT_LCL_JSON} CACHE BOOL "" FORCE)
 set(LCL_BUILD_TIME ${WEFT_LCL_TIME} CACHE BOOL "" FORCE)
@@ -141,7 +138,8 @@ if(WEFT_LCL_TS)
     ${tree-sitter_SOURCE_DIR}/lib/src)
 
   add_library(weft-ts-lcl STATIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/submodules/tree-sitter-lcl/src/parser.c)
+    ${CMAKE_CURRENT_SOURCE_DIR}/submodules/tree-sitter-lcl/src/parser.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/submodules/tree-sitter-lcl/src/scanner.c)
   target_include_directories(weft-ts-lcl PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/submodules/tree-sitter-lcl/src)
 

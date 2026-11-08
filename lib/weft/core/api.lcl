@@ -9,6 +9,235 @@ namespace weft {
         return $weft_version
     }
 
+    ;; weft::derive name {program} [input ...]   define (or redefine) and run
+    ;; weft::derive name                         re-run: the refresh verb
+    ;; weft::derive                              re-run the one whose output
+    proc derive {*args} {
+        let ctx [weft::image::ctx]
+
+        if [== 0 [len $args]] {
+            let b [weft::ctx::field $ctx buffer]
+            let owner [weft::derivation::for-output $b]
+
+            if [empty? $owner] {
+                return [weft::error::make invalid-args \
+                    "derive: this buffer is not a derivation's output -- weft::derive name {program} \[input ...\]"]
+            }
+
+            return [weft::derivation::run! $owner $ctx]
+        }
+
+        let name [get $args 0]
+        let rest [List::slice $args 1 [len $args]]
+
+        if [== 0 [len $rest]] {
+            if [not [weft::derivation::defined? $name]] {
+                return [weft::error::make invalid-args \
+                    "derive: no derivation '$name' -- define one: weft::derive $name {program} \[input ...\]"]
+            }
+
+            return [weft::derivation::run! $name $ctx]
+        }
+
+        let program [get $rest 0]
+        var inputs ()
+
+        if [== 1 [len $rest]] {
+            let b [weft::ctx::field $ctx buffer]
+
+            if [weft::ws::buffer? $b] { set! inputs [list $b] }
+        } else {
+            foreach a [List::slice $rest 1 [len $rest]] {
+                let bid [weft::ws::buffer-resolve $a exact $ctx]
+
+                if [weft::error::error? $bid] { return $bid }
+
+                set! inputs [List::push $inputs $bid]
+            }
+        }
+
+        let d [weft::derivation::define! $name $program $inputs]
+
+        if [weft::error::error? $d] { return $d }
+
+        return [weft::derivation::run! $name $ctx]
+    }
+
+    proc detach {*rest} {
+        let ctx [weft::image::ctx]
+        var bid ""
+
+        if [== 1 [len $rest]] {
+            set! bid [weft::ws::buffer-resolve [get $rest 0] exact $ctx]
+
+            if [weft::error::error? $bid] { return $bid }
+        } else {
+            set! bid [weft::ctx::field $ctx buffer]
+        }
+
+        if [not [weft::ws::buffer? $bid]] {
+            return [weft::error::make invalid-args \
+                "detach: no buffer (run it IN the derived buffer, or name one)"]
+        }
+
+        let r [weft::derivation::detach! $bid]
+
+        if [weft::error::error? $r] { return $r }
+
+        return #{kind detached buffer $bid derivation $r
+            name [get [weft::ws::buffer $bid] name]}
+    }
+
+    ;; Every derivation as a row: name, status (ok / stale: why /
+    ;; error: why / not run), its inputs, its output -- right-click a
+    ;; row to show the output.  A derivation itself, by hand.
+    proc derivations {} {
+        let out [weft::shell::out-buffer! [weft::image::ctx]]
+        var n 0
+
+        foreach name [weft::derivation::names] {
+            let rec [weft::derivation::record $name]
+            let st [get $rec status]
+            var status [get $st state]
+
+            if [== error [get $st state]] {
+                set! status "error: [weft::error::message [get $st error]]"
+            } else {
+                let why [weft::derivation::stale-reason $name]
+
+                if [not [empty? $why]] { set! status "stale: $why" }
+            }
+
+            var ins ()
+
+            foreach b [get $rec inputs] {
+                set! ins [List::push $ins [get [weft::ws::buffer $b] name]]
+            }
+
+            foreach u [get $rec unresolved] {
+                set! ins [List::push $ins "$u (not open)"]
+            }
+
+            let ob [get $rec output]
+            let row "$name  $status  <- [String::join $ins ", "]  [weft::derivation::output-name $name]  $ob\n"
+
+            if [and [not [empty? $ob]] [weft::ws::buffer? $ob]] {
+                weft::sink::emit! $out $row \
+                    #{layer {qjump} meta #{kind {derivation-row} derivation $name}
+                        present #{ptype {qjump}
+                            value #{buffer $ob start 0 end 0}}}
+            } else {
+                weft::sink::emit! $out $row
+            }
+
+            set! n [+ $n 1]
+        }
+
+        return #{kind emitted summary "$n derivations -> *output*" count $n}
+    }
+
+    proc emit {text *rest} {
+        let out [weft::shell::out-buffer! [weft::image::ctx]]
+        var opts #{}
+
+        if [== 1 [len $rest]] { set! opts [get $rest 0] }
+
+        var t [String::from $text]
+
+        if [not [empty? $t]] {
+            let n [String::length $t]
+
+            if [not [== [String::range $t [- $n 1] $n] "\n"]] {
+                set! t "$t\n"
+            }
+        }
+
+        let r [weft::sink::emit! $out $t $opts]
+
+        return #{kind emitted summary [String::trim $t] start [get $r start]
+            end [get $r end]}
+    }
+
+    proc note {text} {
+        let r [weft::annot::note! [weft::image::ctx] $text]
+
+        if [weft::error::error? $r] { return $r }
+
+        return #{kind noted count [len $r] notes $r}
+    }
+
+    proc notes {} {
+        let ctx [weft::image::ctx]
+        let d [weft::derivation::define! notes \
+            {weft::annot::notes-rows! [get [weft::image::ctx] out] [get [weft::image::ctx] inputs]} \
+            [weft::annot::noted-buffers]]
+
+        if [weft::error::error? $d] { return $d }
+
+        return [weft::derivation::run! notes $ctx]
+    }
+
+    proc diff {a b} {
+        let ctx [weft::image::ctx]
+        let ba [weft::ws::buffer-resolve $a exact $ctx]
+
+        if [weft::error::error? $ba] { return $ba }
+
+        let bb [weft::ws::buffer-resolve $b exact $ctx]
+
+        if [weft::error::error? $bb] { return $bb }
+
+        ;; Star names (a derived side) lose their stars: a derivation
+        ;; name is one word with no '*'.
+        let name "diff:[String::replace [get [weft::ws::buffer $ba] name] "*" ""]:[String::replace [get [weft::ws::buffer $bb] name] "*" ""]"
+        let d [weft::derivation::define! $name \
+            {weft::linediff::rows! [get [weft::image::ctx] out] [get [get [weft::image::ctx] inputs] 0] [get [get [weft::image::ctx] inputs] 1]} \
+            [list $ba $bb]]
+
+        if [weft::error::error? $d] { return $d }
+
+        return [weft::derivation::run! $name $ctx]
+    }
+
+    proc keep {name} {
+        let src [weft::live::defining-source $name]
+
+        if [empty? $src] {
+            return [weft::error::make invalid-args \
+                "keep: no evaluation this session defined '$name' (a proc/var/let at the top level of a REPL or EXECUTE evaluation)"]
+        }
+
+        let r [weft::live::write! $name $src]
+
+        if [weft::error::error? $r] { return $r }
+
+        return #{kind kept name $name path $r
+            summary "kept $name -> $r"}
+    }
+
+    ;; Drop a kept block.
+    proc unkeep {name} {
+        let r [weft::live::remove! $name]
+
+        if [weft::error::error? $r] { return $r }
+
+        if [not $r] {
+            return [weft::error::make invalid-args "unkeep: nothing kept as '$name'"]
+        }
+
+        return #{kind unkept name $name path [weft::live::path]}
+    }
+
+    ;; The kept blocks as rows: the derivation named `kept`.
+    proc kept {} {
+        let d [weft::derivation::define! kept \
+            {weft::live::rows! [get [weft::image::ctx] out]} ()]
+
+        if [weft::error::error? $d] { return $d }
+
+        return [weft::derivation::run! kept [weft::image::ctx]]
+    }
+
     ;; ---- opening (and therefore creating) files ----
 
     ;; Open a path.  A path with no file behind it becomes an empty
@@ -952,6 +1181,9 @@ namespace weft {
             ({weft::version} {the running version}))}
 
         #{title {Image and REPL (ctrl+r opens *lcl*)} rows (
+            ({weft::keep my-proc} {write the form that defined user::my-proc this session into ~/.config/weft/live.lcl -- replayed at boot})
+            ({weft::kept} {what live.lcl holds, as rows})
+            ({weft::unkeep my-proc} {drop a kept block})
             ({weft::repl::attach} {execute IN a buffer: REPL evals then carry it as ctx})
             ({weft::repl::target} {which buffer the REPL is attached to})
             ({weft::repl::detach} {drop the attachment})
@@ -988,6 +1220,14 @@ namespace weft {
             ({weft::q::annotate} {terminal: live rules as producers, styled})
             ({weft::q::replace {new}} {terminal: pend edits as a reviewable plan}))}
 
+        #{title {Derivations -- computed buffers with provenance (docs/derive.md)} rows (
+            ({weft::derive lines {weft::emit "[q::count [q::lines [q::doc]]] lines"} README.md} {define + run: the program's rows land in *lines*, read-only; name inputs after the program})
+            ({weft::derive lines} {re-run a derivation: the refresh verb})
+            ({weft::diff README.md docs/qol.md} {two buffers as a unified diff: a derivation over both; rows jump into either side})
+            ({weft::derivations} {every derivation with its status -- right-click a row to show its output})
+            ({weft::detach} {sever the derived buffer you run this in: editable, renamed, yours})
+            ({weft::emit "a row"} {one row into this evaluation's output -- a derivation program's primitive})
+        )}
         #{title {Filters and operands -- the selection through, or handed to, a program (docs/commands.md stage D)} rows (
             ({weft::operand} {this evaluation's operand text: the selection a middle-click/ctrl+shift+enter handed the command})
             ({weft::filter::pipe {sort}} {selection -> stdin; stdout replaces it (|sort)})
@@ -1002,6 +1242,8 @@ namespace weft {
             ({weft::transform::reject} {discard it}))}
 
         #{title {Annotations} rows (
+            ({weft::note {remark}} {attach a note to the selection (authored layer `notes`: styled, persisted, re-anchored)})
+            ({weft::notes} {the notes index as a derivation -- right-click a row jumps to the note})
             ({weft::annot::edit-at} {edit the annotations at the cursor as text})
             ({weft::annot::apply-edit} {commit that editing session})
             ({weft::annot::cancel-edit} {abandon it}))}

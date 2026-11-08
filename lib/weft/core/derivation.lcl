@@ -1,0 +1,698 @@
+;;; weft::derivation -- computed buffers
+;;;
+;;; A derivation is a RECORD -- name, program (lcl source text),
+;;; declared input buffers, the owned output buffer, and the input
+;;; generations captured at the last success -- under ONE publish
+;;; contract: capture the inputs, stage the program's output through
+;;; the sink into a scratch buffer, publish text and annotations into
+;;; the output buffer in one transaction.  A failing run discards the
+;;; staging buffer and leaves the last good result in place, with the
+;;; failure on the header's status line.  Not a new computation model:
+;;; the name for what q::show, q::materialize and the regenerating
+;;; listings already do.
+;;;
+;;;   #{name vocab program {...} inputs (b12 b7) input_keys (...) output b31
+;;;     captured ((b12 0:40 3) (b7 0:2 0)) layers (qjump)
+;;;     ran "2026-10-31 14:02:11" run_id x118
+;;;     status #{state ok|stale|error|never ...}}
+;;;
+;;; Generations are INPUT generations, never text revisions alone: per
+;;; declared input the doc revision AND the annotation store's change
+;;; counter (an authored note edited, an annotator re-run, with the
+;;; text untouched, still counts).  All compare for CHANGE, never
+;;; order.  Staleness is answered when asked; nothing here schedules a
+;;; refresh -- `run!` is the refresh verb.
+;;;
+;;; The program is evaluated in `user::` through weft::image::eval-in!
+;;; with ctx #{out <staging> inputs (...) derivation <name> buffer
+;;; <first input> source #{name "derive <name>"}}: `[q::doc]` reads
+;;; the first input, `weft::sink::emit!` on ctx `out` lands rows with
+;;; exact ranges and presentations, and a string (or number) the
+;;; program RETURNS is emitted as one row -- the common case stays a
+;;; one-liner.  Rows carrying qjump presentations are the provenance:
+;;; right-click jumps to the originating range.
+
+namespace weft::derivation {
+
+    var _defs #{}
+    var _staging_seq 0
+
+    proc names {} {
+        return [List::sort [Dict::keys $_defs]]
+    }
+
+    proc defined? {name} {
+        return [has? $_defs $name]
+    }
+
+    proc record {name} {
+        if [has? $_defs $name] { return [get $_defs $name] }
+
+        return #{}
+    }
+
+    ;; The output buffer's name: star-wrapped, like every machine
+    ;; buffer (*output*, *query*).
+    proc output-name {name} {
+        return "*$name*"
+    }
+
+    ;; The derivation owning `bid` as its output, "" when none.
+    proc for-output {bid} {
+        foreach n [Dict::keys $_defs] {
+            if [== $bid [get [get $_defs $n] output]] { return $n }
+        }
+
+        return ""
+    }
+
+    ;; Tests only: forget every record (the buffers stay).
+    proc reset! {} {
+        set! _defs #{}
+        return 1
+    }
+
+    proc _name-ok? {name} {
+        if [empty? $name] { return 0 }
+        if [>= [String::find $name " "] 0] { return 0 }
+        if [>= [String::find $name "*"] 0] { return 0 }
+
+        return 1
+    }
+
+    ;; A program may be a q:: PLAN instead of source text: run!
+    ;; then emits the plan's rows (weft::q::emit-rows!) -- q::show is
+    ;; a derivation named `query` whose program is its plan.  Plans
+    ;; hold closures, so they are not persisted (plan section 14
+    ;; rule 8); snapshot skips them.
+    proc _plan? {program} {
+        return [and [dict? $program] \
+            [and [has? $program kind] [== query [get $program kind]]]]
+    }
+
+    ;; Define (or redefine) a derivation.  Redefinition keeps the
+    ;; output buffer and the last captured generations -- the old
+    ;; result stays visible, marked stale until the next run.
+    ;; Optional opts: #{limit N} bounds a plan program's rows (200).
+    proc define! {name program inputs *rest} {
+        var opts #{}
+
+        if [== 1 [len $rest]] { set! opts [get $rest 0] }
+        if [not [weft::derivation::_name-ok? $name]] {
+            return [weft::error::make invalid-args \
+                "derivation: bad name '$name' (one word, no '*')"]
+        }
+
+        if [not [list? $inputs]] {
+            return [weft::error::make invalid-args \
+                "derivation '$name': inputs must be a list of buffer ids"]
+        }
+
+        foreach b $inputs {
+            if [not [weft::ws::buffer? $b]] {
+                return [weft::error::make invalid-args \
+                    "derivation '$name': no buffer '$b'"]
+            }
+        }
+
+        if [not [weft::derivation::_plan? $program]] {
+            if [or [dict? $program] \
+                   [empty? [String::trim [String::from $program]]]] {
+                return [weft::error::make invalid-args \
+                    "derivation '$name': the program must be lcl source text (or a q:: plan)"]
+            }
+        }
+
+        var limit 200
+
+        if [has? $opts limit] { set! limit [get $opts limit] }
+
+        ;; Inputs by durable key too (canonical path, else name), so
+        ;; a session snapshot still names an input that has since
+        ;; closed.
+        var keys ()
+
+        foreach b $inputs {
+            let bb [weft::ws::buffer $b]
+            var key [get $bb path]
+
+            if [empty? $key] { set! key [get $bb name] }
+
+            set! keys [List::push $keys $key]
+        }
+
+        var rec #{name $name program $program inputs $inputs
+            input_keys $keys unresolved () output "" captured ()
+            layers () ran "" run_id "" limit $limit
+            status #{state never}}
+
+        if [has? $_defs $name] {
+            let old [get $_defs $name]
+
+            set! rec [Dict::merge $rec #{output [get $old output]
+                captured [get $old captured] layers [get $old layers]
+                ran [get $old ran] run_id [get $old run_id]
+                status [get $old status]}]
+
+            ;; Re-defining the SAME derivation (weft::notes does it on
+            ;; every call) changes nothing; a new program or a new
+            ;; input list makes the old result stale.
+            if [not [empty? [get $old output]]] {
+                if [not [== [String::from $program] \
+                            [String::from [get $old program]]]] {
+                    set! rec [put $rec status \
+                        #{state stale reason "program redefined"}]
+                } else {
+                    if [not [== [String::from $inputs] \
+                                [String::from [get $old inputs]]]] {
+                        set! rec [put $rec status \
+                            #{state stale reason "inputs redeclared"}]
+                    }
+                }
+            }
+        }
+
+        set! _defs [put $_defs $name $rec]
+
+        return $name
+    }
+
+    ;; Drop the record.  Its output buffer, when open, is released
+    ;; exactly as detach! releases it.
+    proc forget! {name} {
+        if [not [has? $_defs $name]] {
+            return [weft::error::make invalid-args \
+                "derivation: no derivation named '$name'"]
+        }
+
+        let out [get [get $_defs $name] output]
+
+        if [and [not [empty? $out]] [weft::ws::buffer? $out]] {
+            weft::derivation::detach! $out
+        }
+
+        set! _defs [del $_defs $name]
+
+        return $name
+    }
+
+    ;; ---- generations ----
+
+    ;; One input's generation: (bid doc-revision annot-change-seq).
+    proc _gen {bid} {
+        return [list $bid \
+            [Lk::doc_revision [weft::ws::buffer-doc $bid]] \
+            [Lk::annot_store_seq [weft::ws::buffer-store $bid]]]
+    }
+
+    ;; Capture every declared input, or a structured error naming the
+    ;; one that is gone (closed, or never resolved at session restore).
+    proc _capture {rec} {
+        if [> [len [get $rec unresolved]] 0] {
+            return [weft::error::make invalid-args \
+                "derivation '[get $rec name]': input '[get [get $rec unresolved] 0]' is not open"]
+        }
+
+        var gens ()
+
+        foreach b [get $rec inputs] {
+            if [not [weft::ws::buffer? $b]] {
+                return [weft::error::make invalid-args \
+                    "derivation '[get $rec name]': input buffer '$b' is closed"]
+            }
+
+            set! gens [List::push $gens [weft::derivation::_gen $b]]
+        }
+
+        return $gens
+    }
+
+    proc _buffer-name {bid} {
+        if [not [weft::ws::buffer? $bid]] { return $bid }
+
+        return [get [weft::ws::buffer $bid] name]
+    }
+
+    ;; Why the last result is out of date ("" when current): the
+    ;; captured generations against the inputs now, the program
+    ;; against its last run.  Computed when asked -- a comparison,
+    ;; never a recompute.
+    proc stale-reason {name} {
+        if [not [has? $_defs $name]] { return "" }
+
+        let rec [get $_defs $name]
+        let st [get $rec status]
+
+        if [== never [get $st state]] { return "not run" }
+
+        if [== stale [get $st state]] { return [get $st reason] }
+
+        foreach g [get $rec captured] {
+            let b [get $g 0]
+
+            if [not [weft::ws::buffer? $b]] {
+                return "input $b closed"
+            }
+
+            let now [weft::derivation::_gen $b]
+
+            if [not [== [get $g 1] [get $now 1]]] {
+                return "[weft::derivation::_buffer-name $b] text changed"
+            }
+
+            if [not [== [get $g 2] [get $now 2]]] {
+                return "[weft::derivation::_buffer-name $b] annotations changed"
+            }
+        }
+
+        return ""
+    }
+
+    proc stale? {name} {
+        return [not [empty? [weft::derivation::stale-reason $name]]]
+    }
+
+    ;; ---- the header: provenance as text ----
+
+    proc time-string {} {
+        let t [weft::cap::invoke "time.now" #{} #{}]
+
+        if [== [weft::task::state $t] succeeded] {
+            let secs [weft::task::result $t]
+
+            if $weft_have_time {
+                return [Time::strftime "%Y-%m-%d %H:%M:%S" $secs]
+            }
+
+            return [String::from $secs]
+        }
+
+        return "?"
+    }
+
+    proc _inputs-line {gens} {
+        var parts ()
+
+        foreach g $gens {
+            set! parts [List::push $parts \
+                "[weft::derivation::_buffer-name [get $g 0]] (rev [get $g 1], annots [get $g 2])"]
+        }
+
+        if [== 0 [len $parts]] { return "(no inputs)" }
+
+        return [String::join $parts ", "]
+    }
+
+    proc header {name gens ran status_line} {
+        return ";; derivation $name\n;; ran $ran  inputs: [weft::derivation::_inputs-line $gens]\n;; status: $status_line\n\n"
+    }
+
+    ;; Rewrite the header's status line in place (the output stays
+    ;; read-only by POLICY; programmatic transactions apply).  A
+    ;; buffer without one -- text from before this module -- gets the
+    ;; line prepended.
+    proc _patch-status! {bid status_line} {
+        let doc [weft::ws::buffer-doc $bid]
+        let lines [String::split [Lk::doc_text $doc] "\n"]
+        var off 0
+        var i 0
+
+        while [and [< $i [len $lines]] [< $i 4]] {
+            let l [get $lines $i]
+
+            if [== 0 [String::find $l ";; status: "]] {
+                let from $off
+                let n [String::length $l]
+
+                Lk::doc_transact $doc {
+                    Lk::doc_delete $doc $from $n
+                    Lk::doc_insert $doc $from ";; status: $status_line"
+                }
+
+                return 1
+            }
+
+            set! off [+ $off [+ [String::length $l] 1]]
+            set! i [+ $i 1]
+        }
+
+        Lk::doc_transact $doc {
+            Lk::doc_insert $doc 0 ";; status: $status_line\n"
+        }
+
+        return 1
+    }
+
+    ;; ---- the output buffer ----
+
+    ;; The record's output buffer, created on first publish.  A buffer
+    ;; already wearing the name is adopted only when it is read-only
+    ;; (ours from an earlier session, or a session-restored shell);
+    ;; an editable one is somebody's text and is never overwritten.
+    proc _output! {rec} {
+        let have [get $rec output]
+
+        if [and [not [empty? $have]] [weft::ws::buffer? $have]] {
+            return $have
+        }
+
+        let nm [weft::derivation::output-name [get $rec name]]
+        var bid [weft::ws::buffer-for-name $nm]
+
+        if [and [not [empty? $bid]] [weft::ws::buffer-editable? $bid]] {
+            return [weft::error::make invalid-args \
+                "derivation '[get $rec name]': a buffer named $nm is open and editable -- close or rename it first"]
+        }
+
+        if [empty? $bid] {
+            set! bid [weft::ws::buffer-create! $nm "" ""]
+        }
+
+        weft::ws::buffer-set-editable! $bid 0
+
+        return $bid
+    }
+
+    ;; Copy the staged text and every annotation (with its
+    ;; presentation) into the output buffer: text in one transaction,
+    ;; then the layers this derivation published last time are cleared
+    ;; and the staged ones added.  The text moves whole, so offsets
+    ;; copy flat.
+    proc _publish! {rec staging out} {
+        let sdoc [weft::ws::buffer-doc $staging]
+        let sstore [weft::ws::buffer-store $staging]
+        let odoc [weft::ws::buffer-doc $out]
+        let ostore [weft::ws::buffer-store $out]
+        let text [Lk::doc_text $sdoc]
+
+        Lk::doc_transact $odoc {
+            if [> [Lk::doc_len $odoc] 0] {
+                Lk::doc_delete $odoc 0 [Lk::doc_len $odoc]
+            }
+
+            Lk::doc_insert $odoc 0 $text
+        }
+
+        var clear #{}
+
+        foreach l [get $rec layers] { set! clear [put $clear $l 1] }
+        foreach l [Lk::annot_layers $sstore] { set! clear [put $clear $l 1] }
+
+        foreach l [Dict::keys $clear] {
+            var _lr ""
+            var _le ""
+
+            catch { Lk::annot_layer_register $ostore $l } _lr _le
+
+            foreach id [Lk::annot_by_layer $ostore $l] {
+                Lk::annot_remove $ostore $id
+            }
+        }
+
+        var layers ()
+
+        foreach l [Lk::annot_layers $sstore] {
+            set! layers [List::push $layers $l]
+
+            foreach id [Lk::annot_by_layer $sstore $l] {
+                let sp [Lk::annot_span $sstore $id]
+                let nid [Lk::annot_add $ostore [get $sp 0] [get $sp 1] $l \
+                    [Lk::annot_meta_all $sstore $id]]
+                let p [weft::ws::presentation-of $sstore $id]
+
+                if [dict? $p] {
+                    weft::ws::present! $ostore $nid [get $p ptype] \
+                        [get $p value]
+                }
+            }
+        }
+
+        return $layers
+    }
+
+    ;; Record the failure; the output keeps its last good result and
+    ;; says so on its status line.  Returns the error (programmable).
+    proc _fail! {name err} {
+        var rec [get $_defs $name]
+        let at [weft::derivation::time-string]
+
+        set! rec [put $rec status #{state error error $err at $at}]
+        set! _defs [put $_defs $name $rec]
+
+        let out [get $rec output]
+
+        if [and [not [empty? $out]] [weft::ws::buffer? $out]] {
+            weft::derivation::_patch-status! $out \
+                "error: [weft::error::message $err] (at $at; last good result kept)"
+        }
+
+        return $err
+    }
+
+    ;; Run a derivation: capture, stage, publish.  `ctx` is the
+    ;; executing evaluation's ctx (fields the program should not
+    ;; inherit -- the caller's range and view -- are dropped).
+    ;; Returns #{kind show buffer <out> derivation <name> ran <time>}
+    ;; or the structured error of the failed run.
+    proc run! {name ctx} {
+        if [not [has? $_defs $name]] {
+            return [weft::error::make invalid-args \
+                "derivation: no derivation named '$name'"]
+        }
+
+        var rec [get $_defs $name]
+        let gens [weft::derivation::_capture $rec]
+
+        if [weft::error::error? $gens] {
+            return [weft::derivation::_fail! $name $gens]
+        }
+
+        set! _staging_seq [+ $_staging_seq 1]
+
+        let staging [weft::ws::buffer-create! \
+            "*derive-staging-$_staging_seq*" "" ""]
+        let ran [weft::derivation::time-string]
+
+        weft::sink::emit! $staging \
+            [weft::derivation::header $name $gens $ran ok]
+
+        var first ""
+
+        if [> [len [get $rec inputs]] 0] {
+            set! first [get [get $rec inputs] 0]
+        }
+
+        var fields #{}
+
+        if [dict? $ctx] { set! fields $ctx }
+
+        foreach k (start end selections operand view execution) {
+            if [has? $fields $k] { set! fields [del $fields $k] }
+        }
+
+        set! fields [Dict::merge $fields #{out $staging
+            inputs [get $rec inputs] derivation $name buffer $first
+            source #{name "derive $name" line 1}}]
+
+        var failed ""
+        var ok 1
+        var r #{ok 1 id "" value ""}
+        var counts #{}
+
+        if [weft::derivation::_plan? [get $rec program]] {
+            var _pr ""
+            var _pe ""
+
+            if [not [== 0 [catch {
+                    set! counts [weft::q::emit-rows! [get $rec program] \
+                        [get $rec limit] $staging]
+                } _pr _pe]]] {
+                set! ok 0
+                set! failed [weft::error::from-caught $_pe]
+            }
+        } else {
+            set! r [weft::image::eval-in! user [get $rec program] \
+                [weft::ctx::make $fields]]
+        }
+
+        if [and $ok [get $r ok]] {
+            let v [get $r value]
+
+            if [weft::error::error? $v] {
+                set! ok 0
+                set! failed $v
+            } else {
+                let t [type $v]
+
+                if [or [== $t string] [or [== $t int] [== $t float]]] {
+                    var text [String::from $v]
+
+                    if [not [empty? $text]] {
+                        let n [String::length $text]
+
+                        if [not [== [String::range $text [- $n 1] $n] "\n"]] {
+                            set! text "$text\n"
+                        }
+
+                        weft::sink::emit! $staging $text
+                    }
+                }
+            }
+        } else {
+            if $ok {
+                set! ok 0
+                set! failed [get $r error]
+            }
+        }
+
+        if [not $ok] {
+            weft::ws::buffer-close! $staging 1
+
+            return [weft::derivation::_fail! $name $failed]
+        }
+
+        let out [weft::derivation::_output! $rec]
+
+        if [weft::error::error? $out] {
+            weft::ws::buffer-close! $staging 1
+
+            return [weft::derivation::_fail! $name $out]
+        }
+
+        let layers [weft::derivation::_publish! $rec $staging $out]
+
+        weft::ws::buffer-close! $staging 1
+
+        set! rec [Dict::merge $rec #{output $out captured $gens
+            layers $layers ran $ran run_id [get $r id]
+            status #{state ok}}]
+        set! _defs [put $_defs $name $rec]
+
+        return [Dict::merge #{kind show buffer $out derivation $name
+            ran $ran} $counts]
+    }
+
+    ;; Sever the link: the buffer becomes an ordinary editable
+    ;; path-less buffer named `<name>-detached` (the header stays as
+    ;; provenance; the star name stays free for the next run), the
+    ;; record forgets it.  Returns the derivation's name.
+    proc detach! {bid} {
+        let name [weft::derivation::for-output $bid]
+
+        if [empty? $name] {
+            return [weft::error::make invalid-args \
+                "detach: buffer [weft::derivation::_buffer-name $bid] is not a derivation's output"]
+        }
+
+        var rec [get $_defs $name]
+
+        set! rec [Dict::merge $rec #{output "" layers ()
+            status #{state never}}]
+        set! _defs [put $_defs $name $rec]
+
+        var nm "$name-detached"
+        var i 2
+
+        while [not [empty? [weft::ws::buffer-for-name $nm]]] {
+            set! nm "$name-detached-$i"
+            set! i [+ $i 1]
+        }
+
+        weft::ws::buffer-rename! $bid $nm
+        weft::ws::buffer-set-editable! $bid 1
+
+        return $name
+    }
+
+    ;; ---- sessions: definitions persist, results do not ----
+
+    ;; Records as durable data: inputs by canonical path, or by name
+    ;; for path-less buffers.  Output text is a cache and stays out.
+    proc snapshot {} {
+        var out ()
+
+        foreach n [weft::derivation::names] {
+            let rec [get $_defs $n]
+
+            ;; A plan program holds closures: not durable.
+            if [weft::derivation::_plan? [get $rec program]] { continue }
+
+            set! out [List::push $out #{name $n program [get $rec program]
+                inputs [get $rec input_keys]}]
+        }
+
+        return $out
+    }
+
+    ;; Restore records lazily: inputs resolve against the open
+    ;; buffers (a missing one is reported, never an error at
+    ;; startup); a buffer the session recreated under the output's
+    ;; name is adopted as the output, read-only, holding only the
+    ;; header -- the first run fills it.  Returns how many records
+    ;; came back.
+    proc restore! {snap ctx} {
+        if [not [list? $snap]] { return 0 }
+
+        var n 0
+
+        foreach d $snap {
+            if [not [and [dict? $d] [and [has? $d name] [has? $d program]]]] {
+                continue
+            }
+
+            let name [get $d name]
+            var ins ()
+            var missing ()
+            var keys ()
+
+            if [has? $d inputs] { set! keys [get $d inputs] }
+
+            foreach key $keys {
+                var bid [weft::ws::buffer-for-path $key]
+
+                if [empty? $bid] { set! bid [weft::ws::buffer-for-name $key] }
+
+                if [empty? $bid] {
+                    set! missing [List::push $missing $key]
+                } else {
+                    set! ins [List::push $ins $bid]
+                }
+            }
+
+            var rec #{name $name program [get $d program] inputs $ins
+                input_keys $keys unresolved $missing output ""
+                captured () layers () ran "" run_id "" limit 200
+                status #{state never}}
+
+            let nm [weft::derivation::output-name $name]
+            let bid [weft::ws::buffer-for-name $nm]
+
+            if [not [empty? $bid]] {
+                var status "not run this session (weft::derive $name re-runs)"
+
+                if [> [len $missing] 0] {
+                    set! status "input '[get $missing 0]' is not open"
+                }
+
+                let doc [weft::ws::buffer-doc $bid]
+                let head ";; derivation $name\n;; restored  inputs: [String::join $keys ", "]\n;; status: $status\n\n"
+
+                Lk::doc_transact $doc {
+                    if [> [Lk::doc_len $doc] 0] {
+                        Lk::doc_delete $doc 0 [Lk::doc_len $doc]
+                    }
+
+                    Lk::doc_insert $doc 0 $head
+                }
+
+                weft::ws::buffer-set-editable! $bid 0
+                set! rec [put $rec output $bid]
+            }
+
+            set! _defs [put $_defs $name $rec]
+            set! n [+ $n 1]
+        }
+
+        return $n
+    }
+}

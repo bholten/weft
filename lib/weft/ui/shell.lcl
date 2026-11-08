@@ -63,6 +63,9 @@ proc wsh_editor_hooks {} {
                 Lk::annot_present $wsh_ui $store $annot_id $ptype $value
                 return ""
             }]
+            presentation [lambda {store annot_id} {
+                return [Lk::annot_presentation $wsh_ui $store $annot_id]
+            }]
             selection [lambda {ed} {
                 return [Lk::editor_selection $ed]
             }]

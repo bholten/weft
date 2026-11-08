@@ -133,11 +133,13 @@ gate "one session per buffer" [== 1 [weft::ts::session-count]]
 
 ;; The capture rides the annotation; `proc` must be a keyword (the
 ;; grammar's predicate-guarded pattern -- predicates ARE evaluated).
+;; Since submodule 61caf67 the grammar names it keyword.function; the
+;; palette falls back by dotted prefix, so `keyword` still styles it.
 var _kw 0
 foreach _id [Lk::annot_by_layer $_tstore "ts"] {
     let _sp [Lk::annot_span $_tstore $_id]
     if [and [== 0 [get $_sp 0]] [== 4 [get $_sp 1]]] {
-        if [== keyword [Lk::annot_meta $_tstore $_id capture]] {
+        if [== keyword.function [Lk::annot_meta $_tstore $_id capture]] {
             set! _kw 1
         }
     }

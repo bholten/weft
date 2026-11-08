@@ -48,7 +48,8 @@ namespace weft::session {
     }
 
     proc snapshot {} {
-        return #{tree [weft::session::_node-snapshot [weft::ws::tree-root]]}
+        return #{tree [weft::session::_node-snapshot [weft::ws::tree-root]]
+            derivations [weft::derivation::snapshot]}
     }
 
     proc save! {} {
@@ -135,6 +136,10 @@ namespace weft::session {
 
         if [not [empty? $f]] {
             weft::ws::focus! $f
+        }
+
+        if [has? $v derivations] {
+            weft::derivation::restore! [get $v derivations] $ctx
         }
 
         return 1

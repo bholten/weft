@@ -510,8 +510,9 @@ if $weft_have_ts {
     gate "tree-sitter appears as a range source" \
         [> [weft::q::count $_tsq] 3]
 
+    ;; (`proc` is keyword.function since grammar submodule 61caf67.)
     let _kw [weft::q::select $_tsq [lambda {r} {
-        return [== keyword [get [get $r meta] capture]]
+        return [== keyword.function [get [get $r meta] capture]]
     }]]
     let _kwr [get [weft::q::_records $_kw 5] records]
     gate "syntax records select by capture" \

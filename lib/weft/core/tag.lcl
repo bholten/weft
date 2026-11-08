@@ -1,6 +1,7 @@
-;;; Tag verbs (docs/buffers.md "Tags").  The line over each pane reads
+;;; Tag verbs  The line over each pane reads
 ;;;
-;;;   qol.md Newcol Delcol New Del |
+;;;   Newcol Delcol New Del |
+;;;   *vocab* Newcol Delcol New Del Detach Derive |   (a stale derivation)
 ;;;
 ;;; and every word middle-clicks.  Acme's words, as one-line aliases
 ;;; over the portable weft:: vocabulary: each acts on the ctx the
@@ -50,6 +51,19 @@ namespace weft::tag {
     ;;; in the tag only while the buffer is dirty -- Acme's signal.
     proc Put {} {
         return [weft::save]
+    }
+
+    ;;; Derive: re-run the derivation whose output is under this tag
+    ;;; (`weft::derive` with no name).  It appears only while the
+    ;;; result is stale -- the same signal as Put.
+    proc Derive {} {
+        return [weft::derive]
+    }
+
+    ;;; Detach: sever the buffer under this tag from its derivation
+    ;;; (`weft::detach`): editable, renamed `<name>-detached`, yours.
+    proc Detach {} {
+        return [weft::detach]
     }
 }
 

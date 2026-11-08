@@ -142,6 +142,8 @@ namespace weft::image {
             return #{ok 0 error $err id $id}
         }
 
+        let outer_ctx $_current_ctx
+
         set! _wimg_code $code
         set! _wimg_file [get $src name]
         set! _wimg_line [get $src line]
@@ -151,7 +153,7 @@ namespace weft::image {
         let prog "namespace $ns { weft::image::_capture! \[eval_at \$_wimg_code \$_wimg_file \$_wimg_line\] }"
 
         if [== 0 [catch { eval $prog } r e]] {
-            set! _current_ctx #{}
+            set! _current_ctx $outer_ctx
             weft::image::_record! #{id $id ns $ns source $code ok 1
                 value $_wimg_result origin $src
                 buffer [weft::ctx::field $ctx buffer]
@@ -160,7 +162,7 @@ namespace weft::image {
             return #{ok 1 value $_wimg_result id $id}
         }
 
-        set! _current_ctx #{}
+        set! _current_ctx $outer_ctx
         let err [weft::error::from-caught $e]
 
         weft::image::_record! #{id $id ns $ns source $code ok 0

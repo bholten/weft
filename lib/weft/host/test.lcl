@@ -52,6 +52,7 @@ namespace weft::testhost {
     ;; #{annot <id> ptype .. value #{}} per store is overkill -- tests
     ;; only need the flat list.
     var _presented ()
+    var _pres_by_id #{}
 
     proc presented {} {
         return $_presented
@@ -190,6 +191,20 @@ namespace weft::testhost {
     proc record-present {store annot_id ptype value} {
         set! _presented [List::push $_presented \
             #{annot $annot_id ptype $ptype value $value}]
+        ;; The getter's table: stores are opaque, so the key is the
+        ;; store's rendering plus the id -- fine for a fake.
+        set! _pres_by_id [put $_pres_by_id "[repr $store]/$annot_id" \
+            #{ptype $ptype value $value}]
+        return ""
+    }
+
+    ;; The inverse (Lk::annot_presentation in the shell): the last
+    ;; presentation set on (store, id), "" when none.
+    proc presentation-of {store annot_id} {
+        let k "[repr $store]/$annot_id"
+
+        if [has? $_pres_by_id $k] { return [get $_pres_by_id $k] }
+
         return ""
     }
 
@@ -213,6 +228,9 @@ namespace weft::testhost {
                 present [lambda {store annot_id ptype value} {
                     return [weft::testhost::record-present $store \
                         $annot_id $ptype $value]
+                }]
+                presentation [lambda {store annot_id} {
+                    return [weft::testhost::presentation-of $store $annot_id]
                 }]
                 selection [lambda {ed} {
                     return [weft::testhost::editor-selection $ed]

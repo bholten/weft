@@ -134,9 +134,13 @@ changed {weft::interact::* + weft::config::handler} {plumb rules as data (weft::
     [has? [weft::plumb::rule-names] file-line]
 ported {plumb file:line ViewLayer + weft::plumb::scan} {plumb producer, revision-driven and live on rule changes} \
     [== plumb [get [weft::plumb::producer-def] name]]
-changed {middle-click acme-exec (+cmd/!cmd buffers)} {EXECUTE -> weft::cmd::resolve, streams into *output* with run records} \
-    [and [== argv [get [weft::cmd::resolve {ls -l} [weft::ctx::make #{buffer $_b ns user}]] route]] \
-         [== lcl [get [weft::cmd::resolve {weft::version} [weft::ctx::make #{buffer $_b ns user}]] route]]]
+if $weft_have_posix {
+    changed {middle-click acme-exec (+cmd/!cmd buffers)} {EXECUTE -> weft::cmd::resolve, streams into *output* with run records} \
+        [and [== argv [get [weft::cmd::resolve {ls -l} [weft::ctx::make #{buffer $_b ns user}]] route]] \
+             [== lcl [get [weft::cmd::resolve {weft::version} [weft::ctx::make #{buffer $_b ns user}]] route]]]
+} else {
+    puts "deferred: middle-click acme-exec parity (host built without posix: no PATH walk)"
+}
 changed {weft::shell::exec cmd} {sh {...} explicit spelling; operators route to sh -c} \
     [== shell [get [weft::cmd::resolve {echo a | wc} [weft::ctx::make #{buffer $_b ns user}]] route]]
 dropped {right-click pipe-selection (replace selection with command output)} {right-click is LOOK (Acme); edits go through reviewable plans -- transforms / weft::q::replace}
