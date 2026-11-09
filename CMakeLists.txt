@@ -6,10 +6,6 @@ project(weft
   LANGUAGES C
 )
 
-# ---- Package matrix (plan section 3): which Lcl packages this host
-# registers.  Core weft never calls packages directly -- only host
-# capability bindings do -- so turning these off changes the host, not
-# the application.
 option(WEFT_LCL_IO "Register the Lcl io package (ANSI C file I/O)" ON)
 option(WEFT_LCL_POSIX "Register the Lcl posix package (fs predicates, cwd, dirs)" ON)
 option(WEFT_LCL_REGEX "Register the Lcl regex package" ON)
@@ -18,8 +14,6 @@ option(WEFT_LCL_JSON "Register the Lcl json package" ON)
 option(WEFT_LCL_TIME "Register the Lcl time package" ON)
 option(WEFT_LCL_TS "Register the tree-sitter package (embedded grammars)" ON)
 
-# ---- lk dependency: FetchContent pinned by commit, with a local-path
-# override for co-development (plan section 3, decided).
 set(WEFT_LK_SOURCE_DIR "" CACHE PATH
   "Local lk checkout to build against (co-development override)")
 
@@ -29,15 +23,10 @@ if(NOT WEFT_LK_SOURCE_DIR AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../lk/CMakeLis
 endif()
 
 if(NOT WEFT_LK_SOURCE_DIR)
-  # TODO(release cut): add a GIT_REPOSITORY/GIT_TAG pin here once the
-  # weft-features branch work lands on lk master.
   message(FATAL_ERROR
     "weft: set -DWEFT_LK_SOURCE_DIR=/path/to/lk (no git pin yet)")
 endif()
 
-# Same override for lcl: lk pins lcl from GitHub, but co-development
-# needs the local checkout.  FetchContent's first declaration wins, so
-# declaring lcl here (before lk configures) supersedes lk's pin.
 set(WEFT_LCL_SOURCE_DIR "" CACHE PATH
   "Local lcl checkout to build against (co-development override)")
 
@@ -63,7 +52,6 @@ endif()
 FetchContent_Declare(lk SOURCE_DIR "${WEFT_LK_SOURCE_DIR}")
 FetchContent_MakeAvailable(lk)
 
-# ---- The weft host binary ----
 add_executable(weft host/weft-main.c)
 
 target_link_libraries(weft PRIVATE lcl_lk)
@@ -79,13 +67,6 @@ target_include_directories(weft PRIVATE
   "${lk_SOURCE_DIR}/src/lcl"
   "${lk_SOURCE_DIR}/src/sdl")
 
-# Dev-tree default paths; each has a runtime env-var override
-# (WEFT_LIB_DIR, WEFT_CONFIG_DIR, WEFT_BOOT) so an installed layout
-# works without a rebuild.
-# lcl's lib/ of Lcl-implemented libraries (Doc, ...) is a require
-# root too, so weft dogfoods them: require "doc/src/Doc.lcl".
-# GetProperties recovers lcl_SOURCE_DIR whichever declaration won
-# (ours above, or lk's pin).
 FetchContent_GetProperties(lcl)
 target_compile_definitions(weft PRIVATE
   LK_DSL_PATH="${lk_SOURCE_DIR}/lib/lk-dsl.lcl"
@@ -120,10 +101,6 @@ if(WEFT_LCL_TIME)
   target_link_libraries(weft PRIVATE lcl_time)
 endif()
 
-# ---- tree-sitter (P4): runtime pinned via FetchContent (the legacy
-# host's approach, same tag); grammars compiled from the checked-out
-# submodules.  Highlight queries are read from the submodule tree at
-# session open -- absolute path baked here, so it works from any CWD.
 if(WEFT_LCL_TS)
   FetchContent_Declare(
     tree-sitter
@@ -153,4 +130,22 @@ if(WEFT_LCL_TS)
     WEFT_HAVE_TS WEFT_TS_LCL WEFT_TS_C
     WEFT_TS_QUERY_DIR="${CMAKE_CURRENT_SOURCE_DIR}/submodules")
   target_link_libraries(weft PRIVATE weft-ts-lcl weft-ts-c weft-ts-runtime)
+endif()
+
+if(TARGET lcl_lk_tui_bind)
+  get_target_property(_weft_srcs weft SOURCES)
+  get_target_property(_weft_defs weft COMPILE_DEFINITIONS)
+  get_target_property(_weft_libs weft LINK_LIBRARIES)
+  get_target_property(_weft_incs weft INCLUDE_DIRECTORIES)
+  list(TRANSFORM _weft_libs REPLACE "^lcl_lk$" "lcl_lk_tui_bind")
+
+  add_executable(weft-tui ${_weft_srcs})
+  target_compile_definitions(weft-tui PRIVATE ${_weft_defs})
+  target_include_directories(weft-tui PRIVATE ${_weft_incs})
+  target_link_libraries(weft-tui PRIVATE ${_weft_libs})
+  target_compile_options(weft-tui PRIVATE -Wall -Wextra)
+  set_target_properties(weft-tui PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED OFF
+    C_EXTENSIONS OFF)
 endif()

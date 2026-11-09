@@ -1,29 +1,4 @@
-/* weft-ts.c -- the `ts` lcl package: tree-sitter parse sessions
- * (plan P4).
- *
- * The host exposes DATA, not policy: a session (parser + highlight
- * query + last tree, one per buffer) and a spans call that parses the
- * given text and returns every passing highlight capture as
- * #{start N end N capture "name"}.  Which captures get which colors,
- * when to rescan, and where annotations live are all Lcl -- the
- * legacy host baked the palette into C, a decision deliberately not
- * ported.
- *
- * Unlike the legacy highlighter, query predicates (#eq?, #any-of?,
- * #match?) ARE evaluated -- the lcl grammar's highlights.scm depends
- * on them to tell keywords from ordinary bare words; without them
- * every bare word matches every pattern.  Unknown predicates and
- * directives (#set!) accept, matching upstream behavior of ignoring
- * what a consumer does not implement.
- *
- * Grammars are compiled in (submodule sources); highlight queries are
- * read from the submodule tree at session open (WEFT_TS_QUERY_DIR is
- * baked absolute, so sessions are CWD-proof).  Parsing is
- * incremental: Ts::edit feeds document deltas to the session's tree
- * (see its contract comment), and spans reparses against it -- only
- * the changed regions re-lex.  The legacy host reused trees WITHOUT
- * the edits and silently misaligned its captures.
- */
+
 
 #include <regex.h>
 #include <stdio.h>
@@ -131,12 +106,9 @@ static char *read_whole_file(const char *path) {
   return buf;
 }
 
-/* ---- predicate evaluation ---- */
-
-/* Text of the first node captured under `value_id` in this match. */
 static int capture_text(const TSQueryMatch *m, uint32_t value_id,
-                        const char *text, uint32_t text_len,
-                        const char **out, uint32_t *out_len) {
+                        const char *text, uint32_t text_len, const char **out,
+                        uint32_t *out_len) {
   uint16_t i;
   for (i = 0; i < m->capture_count; i++) {
     if (m->captures[i].index == value_id) {
@@ -153,8 +125,6 @@ static int capture_text(const TSQueryMatch *m, uint32_t value_id,
   return 0;
 }
 
-/* One predicate: steps[0] is the operator string, then arguments,
- * ending before the Done step.  Returns 1 = pass. */
 static int eval_predicate(const TSQuery *q, const TSQueryMatch *m,
                           const char *text, uint32_t text_len,
                           const TSQueryPredicateStep *steps, uint32_t n) {
@@ -193,7 +163,7 @@ static int eval_predicate(const TSQuery *q, const TSQueryMatch *m,
           break;
         }
       } else {
-        /* capture-vs-capture comparison: not implemented, accept */
+
         return 1;
       }
     }
@@ -241,7 +211,6 @@ static int eval_predicate(const TSQuery *q, const TSQueryMatch *m,
     return negate ? !hit : hit;
   }
 
-  /* #set! and anything else unknown: accept. */
   return 1;
 }
 
@@ -265,14 +234,12 @@ static int match_passes(const TSQuery *q, const TSQueryMatch *m,
   return 1;
 }
 
-/* ---- span collection ---- */
-
 typedef struct {
   uint32_t start;
   uint32_t end;
-  const char *capture; /* borrowed from the query */
+  const char *capture;
   uint32_t capture_len;
-  uint32_t pattern; /* pattern index in the query -- the override order */
+  uint32_t pattern;
   uint32_t order;
 } weft_ts_span;
 
@@ -293,8 +260,6 @@ static int span_cmp(const void *pa, const void *pb) {
   }
   return 0;
 }
-
-/* ---- procs ---- */
 
 static lcl_return_code c_ts_langs(lcl_interp *interp, int argc,
                                   lcl_value **argv, lcl_value **out) {
@@ -408,10 +373,6 @@ static lcl_return_code c_ts_spans(lcl_interp *interp, int argc,
   }
   text_len = (uint32_t)strlen(text);
 
-  /* Incremental when a tree exists: Ts::edit has described every
-   * change since the last parse (the documented contract above) --
-   * reusing an UNedited tree was the legacy host's silent-misalign
-   * bug, which is why the contract is load-bearing. */
   old = s->tree;
   s->tree = ts_parser_parse_string(s->parser, old, text, text_len);
   if (old) {
@@ -463,13 +424,6 @@ static lcl_return_code c_ts_spans(lcl_interp *interp, int argc,
   }
   ts_query_cursor_delete(cursor);
 
-  /* Same range captured by several patterns: the LAST pattern in the
-   * QUERY wins (highlight queries are written bottom-override, e.g.
-   * lcl's "keywords MUST BE LAST").  Emission order is NOT a proxy for
-   * that: the cursor orders matches by match start, so a later pattern
-   * whose match begins earlier (proc-params patterns anchored at the
-   * `proc` keyword) would emit first and lose.  Sort by (range,
-   * pattern index); keep each range group's last. */
   if (count > 1) {
     qsort(spans, count, sizeof(*spans), span_cmp);
   }
@@ -506,20 +460,6 @@ static lcl_return_code c_ts_spans(lcl_interp *interp, int argc,
   return LCL_RC_OK;
 }
 
-/* Ts::edit session edits -- apply document deltas to the session's
- * tree so the next spans call can reparse incrementally.  Each edit
- * is #{start N deleted_len N inserted_len N} in SEQUENTIAL
- * coordinates (lk's delta contract: expressed in the state produced
- * by the preceding delta), which is exactly ts_tree_edit's
- * semantics -- apply in order.  Points are byte-degenerate (row 0,
- * column = byte): span consumers read bytes only, and weft's
- * equality gates pin incremental output == fresh parse.  Without a
- * tree this is a no-op (the next spans call full-parses anyway).
- *
- * CONTRACT: callers must report EVERY document change between spans
- * calls; a skipped edit silently misaligns captures (the legacy
- * host's bug).  weft::ts guarantees it with a doc subscription that
- * lives as long as the session. */
 static lcl_return_code c_ts_edit(lcl_interp *interp, int argc, lcl_value **argv,
                                  lcl_value **out) {
   weft_ts_session *s;
