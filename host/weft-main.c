@@ -1,10 +1,4 @@
-/* weft-main.c -- the weft host binary.
- *
- * Deliberately small (plan section 3): create the interpreter, register
- * lcl core + the package matrix + lk, publish host facts as globals,
- * load the lk DSL prelude, and hand off to app/boot.lcl.  Everything
- * after that -- capability registry, workspace, UI -- is Lcl.
- */
+
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,8 +16,8 @@
 #include <lcl-regex.h>
 #endif
 #ifdef WEFT_HAVE_PROCESS
-#include <signal.h>
 #include <lcl-process.h>
+#include <signal.h>
 #endif
 #ifdef WEFT_HAVE_JSON
 #include <lcl-json.h>
@@ -94,10 +88,7 @@ int main(int argc, char **argv) {
   const char *home;
 
 #ifdef WEFT_HAVE_PROCESS
-  /* A filter child that exits before reading its stdin (|head -1 on a
-   * large selection, |false) would otherwise take the whole image
-   * down with SIGPIPE: the write fails with EPIPE instead, and the
-   * filter module stops feeding.  Hosts own effects. */
+
   signal(SIGPIPE, SIG_IGN);
 #endif
 
@@ -131,7 +122,6 @@ int main(int argc, char **argv) {
   lcl_register_weft_ts(interp);
 #endif
 
-  /* ---- Arguments: weft [--headless script.lcl] [files...] ---- */
   files = lcl_list_new();
   for (i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--version") == 0) {
@@ -149,7 +139,6 @@ int main(int argc, char **argv) {
     }
   }
 
-  /* ---- Host facts, read by app/boot.lcl ---- */
   home = getenv("HOME");
   snprintf(user_config, sizeof(user_config), "%s/.config/weft/init.lcl",
            home ? home : "");
@@ -159,11 +148,11 @@ int main(int argc, char **argv) {
   define_str(interp, "weft_root", env_or("WEFT_ROOT", WEFT_ROOT_DEFAULT));
   define_str(interp, "weft_lib_dir",
              env_or("WEFT_LIB_DIR", WEFT_LIB_DIR_DEFAULT));
-  /* Bare `require weft/...` resolves here regardless of launch CWD. */
+
   lcl_add_require_root(interp, env_or("WEFT_LIB_DIR", WEFT_LIB_DIR_DEFAULT));
   define_str(interp, "weft_lcl_lib_dir",
              env_or("WEFT_LCL_LIB_DIR", WEFT_LCL_LIB_DIR_DEFAULT));
-  /* lcl's Lcl-implemented libraries: require "doc/src/Doc.lcl". */
+
   lcl_add_require_root(interp,
                        env_or("WEFT_LCL_LIB_DIR", WEFT_LCL_LIB_DIR_DEFAULT));
   define_str(interp, "weft_config_dir",
@@ -210,10 +199,8 @@ int main(int argc, char **argv) {
   define_int(interp, "weft_have_ts", 0);
 #endif
 
-  /* ---- lk DSL prelude, then boot ---- */
 #ifdef LK_DSL_PATH
-  if (eval_file_reporting(interp, LK_DSL_PATH, "lk DSL prelude") !=
-      LCL_RC_OK) {
+  if (eval_file_reporting(interp, LK_DSL_PATH, "lk DSL prelude") != LCL_RC_OK) {
     lcl_interp_free(interp);
     return 1;
   }

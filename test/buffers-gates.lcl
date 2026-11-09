@@ -206,11 +206,13 @@ gate "close: forced discards" \
     [and [== closed [get $_cl3 kind]] [not [weft::ws::buffer? $_util]]]
 gate "close: result counts the retargeted panes" [== 2 [get $_cl3 panes]]
 gate "close: no pane closed" [== 2 [len [weft::ws::panes]]]
-;; MRU other buffer: focus history is (_root_pane _pb); both showed
-;; util, so the walk finds nothing and falls to *scratch*.
-gate "close: falls back to *scratch* when no other buffer is shown" \
-    [== [weft::ws::buffer-for-name "*scratch*"] \
-        [weft::ws::view-buffer [weft::ws::pane-view $_root_pane]]]
+;; Per-pane trails: root showed qol before util, _pb showed plan --
+;; each pane falls back to ITS OWN previous buffer even though
+;; neither is shown anywhere (the trail beats the global MRU, which
+;; here would find nothing and dump both into *scratch*).
+gate "close: each pane falls back to its own previous buffer" \
+    [and [== $_qol [weft::ws::view-buffer [weft::ws::pane-view $_root_pane]]] \
+         [== $_plan [weft::ws::view-buffer [weft::ws::pane-view $_pb]]]]
 
 ;; MRU fallback when another buffer IS shown: qol in root (touched
 ;; last), plan in _pb; close plan -> _pb falls back to qol.
@@ -223,12 +225,19 @@ let _cl4 [ev {weft::close /w/docs/plan.md} \
 gate "close: evacuates to the most recently active other buffer" \
     [and [== closed [get $_cl4 kind]] \
          [== $_qol [weft::ws::view-buffer [weft::ws::pane-view $_pb]]]]
+;; The terminal fallback: an open-but-HIDDEN buffer catches nothing
+;; (trails are per-pane, the MRU walks panes), so with every trail
+;; entry dead and both panes on qol, evacuation creates *scratch* --
+;; the hidden _u2 only makes the close legal (not the only buffer).
+let _u2 [weft::ws::buffer-open! "/w/src/util.lcl" $_c0]
 gate "close: the ctx buffer by default" \
     [== $_qol [get [ev {weft::close} \
         [weft::ctx::make [weft::ws::focused-ctx-fields]]] buffer]]
 gate "close: *scratch* remains after the last named buffer closes" \
     [== [weft::ws::buffer-for-name "*scratch*"] \
         [weft::ws::view-buffer [weft::ws::pane-view $_root_pane]]]
+ev {weft::close /w/src/util.lcl} \
+    [weft::ctx::make [weft::ws::focused-ctx-fields]]
 gate "close: the only buffer refuses" \
     [== denied [weft::error::code [ev {weft::close} \
         [weft::ctx::make [weft::ws::focused-ctx-fields]]]]]
@@ -308,7 +317,7 @@ gate "bindings profile binds new/split-new" \
     [and [has? $_bound "ctrl+shift+n"] \
          [and [has? $_bound "ctrl+alt+e"] [has? $_bound "ctrl+alt+d"]]]
 
-;; ===================== new / split-h / split-v =====================
+;; ===================== new / split (directions) ====================
 ev {weft::only} [weft::ctx::make [weft::ws::focused-ctx-fields]]
 let _np0 [weft::ws::focused-pane]
 let _nb0 [weft::ws::view-buffer [weft::ws::pane-view $_np0]]
@@ -324,48 +333,58 @@ gate "new: empty, path-less, clean" \
 gate "new: no split, pane unchanged" \
     [and [== $_np0 [get $_n1 pane]] [== 1 [len [weft::ws::panes]]]]
 
-let _n2 [ev {weft::new v} [weft::ctx::make #{pane $_np0}]]
-gate "new v: splits stacked, the NEW pane shows the new buffer" \
+let _n2 [ev {weft::new down} [weft::ctx::make #{pane $_np0}]]
+gate "new down: splits stacked, the NEW pane shows the new buffer" \
     [and [== v [get $_n2 axis]] \
          [and [not [== $_np0 [get $_n2 pane]]] \
               [== [get $_n2 buffer] \
                   [weft::ws::view-buffer [weft::ws::pane-view [get $_n2 pane]]]]]]
-gate "new v: the old pane keeps *new*" \
+gate "new down: the old pane keeps *new*" \
     [== [get $_n1 buffer] [weft::ws::view-buffer [weft::ws::pane-view $_np0]]]
-gate "new v: names uniquify -> *new-2*" [== "*new-2*" [get $_n2 name]]
-gate "new v: focus moved to the new pane" \
+gate "new down: names uniquify -> *new-2*" [== "*new-2*" [get $_n2 name]]
+gate "new down: focus moved to the new pane" \
     [== [get $_n2 pane] [weft::ws::focused-pane]]
-gate "new v: the split is stacked" \
+gate "new down: the split is stacked" \
     [== v [get [weft::ws::node [get [weft::ws::node $_np0] parent]] axis]]
+gate "new down: result carries the direction" [== down [get $_n2 dir]]
 
-let _n3 [ev {weft::new h notes} [weft::ctx::make #{pane $_np0}]]
-gate "new h NAME: side-by-side split named as asked" \
+let _n3 [ev {weft::new right notes} [weft::ctx::make #{pane $_np0}]]
+gate "new right NAME: side-by-side split named as asked" \
     [and [== h [get $_n3 axis]] [== notes [get $_n3 name]]]
 let _n4 [ev {weft::new notes} [weft::ctx::make #{pane $_np0}]]
 gate "new NAME twice: notes-2 (no stars to keep)" [== notes-2 [get $_n4 name]]
 gate "new: the panes count is 3 (here / stacked / side-by-side)" \
     [== 3 [len [weft::ws::panes]]]
+gate "new h: the old spelling refuses with the map" \
+    [== invalid-args \
+        [weft::error::code [ev {weft::new h} [weft::ctx::make #{pane $_np0}]]]]
 
 ev {weft::only} [weft::ctx::make #{pane $_np0}]
-let _s1 [ev {weft::split-h} [weft::ctx::make #{pane $_np0}]]
-gate "split-h alone: two views of the acting pane's buffer" \
+let _s1 [ev {weft::split right} [weft::ctx::make #{pane $_np0}]]
+gate "split right alone: two views of the acting pane's buffer" \
     [and [== split [get $_s1 kind]] \
          [and [== [get $_n4 buffer] [get $_s1 buffer]] \
               [and [== $_np0 [get $_s1 from]] \
                    [== [get $_s1 buffer] \
                        [weft::ws::view-buffer [weft::ws::pane-view [get $_s1 pane]]]]]]]
-gate "split-h alone: axis h" \
+gate "split right alone: axis h" \
     [== h [get [weft::ws::node [get [weft::ws::node $_np0] parent]] axis]]
 let _plan2 [weft::ws::buffer-open! "/w/docs/plan.md" $_c0]
-let _s2 [ev {weft::split-v plan} [weft::ctx::make #{pane $_np0}]]
-gate "split-v BUF: fuzzy like show -- plan -> docs/plan.md in the new pane" \
+let _s2 [ev {weft::split down plan} [weft::ctx::make #{pane $_np0}]]
+gate "split down BUF: fuzzy like show -- plan -> docs/plan.md in the new pane" \
     [and [== $_plan2 [get $_s2 buffer]] \
          [== $_plan2 [weft::ws::view-buffer [weft::ws::pane-view [get $_s2 pane]]]]]
-gate "split-v BUF: the acting pane keeps its buffer" \
+gate "split down BUF: the acting pane keeps its buffer" \
     [== [get $_n4 buffer] [weft::ws::view-buffer [weft::ws::pane-view $_np0]]]
-gate "split-v unknown: structured no-such-buffer, no split made" \
-    [and [== no-such-buffer [err-kind [ev {weft::split-v nope} [weft::ctx::make #{pane $_np0}]]]] \
+gate "split down unknown: structured no-such-buffer, no split made" \
+    [and [== no-such-buffer [err-kind [ev {weft::split down nope} [weft::ctx::make #{pane $_np0}]]]] \
          [== 3 [len [weft::ws::panes]]]]
+gate "split left: the new pane lands FIRST (the a side)" \
+    [== [get [ev {weft::split left} [weft::ctx::make #{pane $_np0}]] pane] \
+        [get [weft::ws::node [get [weft::ws::node $_np0] parent]] a]]
+gate "split alone: refuses asking for a direction" \
+    [== invalid-args \
+        [weft::error::code [ev {weft::split} [weft::ctx::make #{pane $_np0}]]]]
 ev {weft::only} [weft::ctx::make #{pane $_np0}]
 
 puts ""

@@ -92,11 +92,15 @@ gate "lcl route failure is a failed task" \
 gate "lcl failure reported in output" [>= [String::find \
     [Lk::doc_text [weft::ws::buffer-doc $_out]] "!!"] 0]
 
-let _rt3 [weft::shell::run-text! "echo via-shell" $_ctx]
-gate "shell route stays async" [== [weft::task::state $_rt3] pending]
-drain-tasks
-gate "shell route streams" [>= [String::find \
-    [Lk::doc_text [weft::ws::buffer-doc $_out]] "via-shell"] 0]
+if $weft_have_posix {
+    let _rt3 [weft::shell::run-text! "echo via-shell" $_ctx]
+    gate "shell route stays async" [== [weft::task::state $_rt3] pending]
+    drain-tasks
+    gate "shell route streams" [>= [String::find \
+        [Lk::doc_text [weft::ws::buffer-doc $_out]] "via-shell"] 0]
+} else {
+    puts "deferred: shell route gates (host built without posix: no PATH walk)"
+}
 
 ;; ---- cancellation via buffer close ----
 let _t3 [weft::shell::execute! "sleep 30" $_ctx]

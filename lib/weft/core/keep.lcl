@@ -1,0 +1,314 @@
+;;; weft::live -- `weft::keep`: definitions made live in the REPL that
+;;; survive a restart
+;;;
+;;; SOURCE REPLAY, not an image dump.  `keep name` finds the latest
+;;; execution record whose source defines user::<name> at its head
+;;; (`proc`, `var` or `let`, via lcl's own reader `Lex::commands`) and
+;;; writes exactly that form into one human-editable file beside the
+;;; user config -- `~/.config/weft/live.lcl` -- under a block marker:
+;;;
+;;;   ;; keep: classify 2026-10-31 19:12:03
+;;;   proc classify {line} { ... }
+;;;   ;; end keep: classify
+;;;
+;;; Re-keeping a name REPLACES its block, so the file never
+;;; accumulates redefinitions.  Boot loads the file after init.lcl,
+;;; one block at a time under a catch: a block that fails (a captured
+;;; free variable that no longer exists, a renamed dependency) is
+;;; reported in *messages* and the rest still load.  Promotion to
+;;; init.lcl is a cut and paste.  Config `live_path` overrides where
+;;; the file lives.
+
+namespace weft::live {
+
+    proc path {} {
+        let cfg [weft::config::value-or live_path ""]
+
+        if [not [empty? [String::from $cfg]]] { return $cfg }
+
+        let uc [String::from $weft_user_config]
+        var dir ""
+        var i [- [String::length $uc] 1]
+
+        while [>= $i 0] {
+            if [== [String::index $uc $i] "/"] {
+                set! dir [String::range $uc 0 $i]
+                set! i -1
+            } else {
+                set! i [- $i 1]
+            }
+        }
+
+        return "${dir}live.lcl"
+    }
+
+    ;; The form that last defined user::<name> in this session: the
+    ;; exact text of that command, sliced from the record's source by
+    ;; the reader's spans.  "" when no evaluation defined it.
+    proc defining-source {name} {
+        let recs [weft::image::records]
+        var i [- [len $recs] 1]
+
+        while [>= $i 0] {
+            let rec [get $recs $i]
+
+            if [and [get $rec ok] [== user [get $rec ns]]] {
+                let found [weft::live::_defining-form [get $rec source] $name]
+
+                if [not [empty? $found]] { return $found }
+            }
+
+            set! i [- $i 1]
+        }
+
+        return ""
+    }
+
+    proc _defining-form {src name} {
+        var cmds ()
+        var _r ""
+        var _e ""
+
+        if [not [== 0 [catch { set! cmds [Lex::commands $src] } _r _e]]] {
+            return ""
+        }
+
+        var out ""
+
+        ;; The LAST definition in the source wins (a redefinition in
+        ;; the same evaluation).
+        foreach c $cmds {
+            let ws [get $c words]
+
+            if [>= [len $ws] 2] {
+                let head [get [get $ws 0] text]
+                let w1 [get [get $ws 1] text]
+
+                if [and [or [== $head proc] [or [== $head var] [== $head let]]] \
+                        [or [== $w1 $name] [== $w1 "user::$name"]]] {
+                    let s0 [get [get [get $ws 0] span] 0]
+                    let e1 [get [get [get $ws [- [len $ws] 1]] span] 1]
+
+                    set! out [String::range $src $s0 $e1]
+                }
+            }
+        }
+
+        return $out
+    }
+
+    ;; ---- the file: blocks under markers ----
+
+    proc _read {path} {
+        let t [weft::cap::invoke "fs.read" #{path $path} #{}]
+
+        if [== [weft::task::state $t] succeeded] {
+            return [weft::task::result $t]
+        }
+
+        return ""
+    }
+
+    ;; Parse the file into blocks #{name date source}; text outside
+    ;; markers is kept as blocks named "" so a hand-written line
+    ;; survives a rewrite.
+    proc blocks {text} {
+        var out ()
+        var cur #{}
+        var body ()
+        var loose ()
+
+        foreach line [String::split $text "\n"] {
+            if [has? $cur name] {
+                if [== 0 [String::find $line ";; end keep"]] {
+                    set! out [List::push $out [put $cur source \
+                        [String::join $body "\n"]]]
+                    set! cur #{}
+                    set! body ()
+                } else {
+                    set! body [List::push $body $line]
+                }
+            } else {
+                if [== 0 [String::find $line ";; keep: "]] {
+                    if [> [len $loose] 0] {
+                        set! out [List::push $out #{name "" date ""
+                            source [String::join $loose "\n"]}]
+                        set! loose ()
+                    }
+
+                    let ws [String::split [String::range $line 9 \
+                        [String::length $line]] " "]
+                    var date ""
+
+                    if [> [len $ws] 1] {
+                        set! date [String::join [List::slice $ws 1 [len $ws]] " "]
+                    }
+
+                    set! cur #{name [get $ws 0] date $date}
+                } else {
+                    set! loose [List::push $loose $line]
+                }
+            }
+        }
+
+        if [has? $cur name] {
+            set! out [List::push $out [put $cur source [String::join $body "\n"]]]
+        }
+
+        ;; Trailing loose text, minus the file's own final newline.
+        while [and [> [len $loose] 0] \
+                [empty? [get $loose [- [len $loose] 1]]]] {
+            set! loose [List::slice $loose 0 [- [len $loose] 1]]
+        }
+
+        if [> [len $loose] 0] {
+            set! out [List::push $out #{name "" date ""
+                source [String::join $loose "\n"]}]
+        }
+
+        return $out
+    }
+
+    proc render {blocks} {
+        var out ""
+
+        foreach b $blocks {
+            if [empty? [get $b name]] {
+                set! out "$out[get $b source]\n"
+            } else {
+                set! out "$out;; keep: [get $b name] [get $b date]\n[get $b source]\n;; end keep: [get $b name]\n"
+            }
+        }
+
+        return $out
+    }
+
+    proc _write {path text} {
+        let t [weft::cap::invoke "fs.write" #{path $path text $text} #{}]
+
+        if [== [weft::task::state $t] succeeded] { return 1 }
+
+        return [weft::task::failure $t]
+    }
+
+    ;; Write (or replace) the block for `name`.  Returns the path, or
+    ;; a structured error.
+    proc write! {name source} {
+        let path [weft::live::path]
+        var bl [weft::live::blocks [weft::live::_read $path]]
+        let date [weft::derivation::time-string]
+        var nb ()
+        var replaced 0
+
+        foreach b $bl {
+            if [== $name [get $b name]] {
+                if [not $replaced] {
+                    set! nb [List::push $nb #{name $name date $date
+                        source $source}]
+                    set! replaced 1
+                }
+            } else {
+                set! nb [List::push $nb $b]
+            }
+        }
+
+        if [not $replaced] {
+            set! nb [List::push $nb #{name $name date $date source $source}]
+        }
+
+        let w [weft::live::_write $path [weft::live::render $nb]]
+
+        if [weft::error::error? $w] { return $w }
+
+        return $path
+    }
+
+    ;; Drop the block for `name`.  Returns 1, 0 when there was none.
+    proc remove! {name} {
+        let path [weft::live::path]
+        var nb ()
+        var had 0
+
+        foreach b [weft::live::blocks [weft::live::_read $path]] {
+            if [== $name [get $b name]] {
+                set! had 1
+            } else {
+                set! nb [List::push $nb $b]
+            }
+        }
+
+        if $had {
+            let w [weft::live::_write $path [weft::live::render $nb]]
+
+            if [weft::error::error? $w] { return $w }
+        }
+
+        return $had
+    }
+
+    ;; Replay every block of the file as a user:: evaluation, each on
+    ;; its own: a failure is a notice, never a stop.  A missing file
+    ;; is nothing to do.  Returns #{loaded N failed N names (...)}.
+    proc load! {path} {
+        let ex [weft::cap::invoke "fs.exists?" #{path $path} #{}]
+
+        if [not [and [== [weft::task::state $ex] succeeded] \
+                     [weft::task::result $ex]]] {
+            return #{loaded 0 failed 0 names ()}
+        }
+
+        var loaded 0
+        var failed 0
+        var names ()
+        var line 1
+
+        foreach b [weft::live::blocks [weft::live::_read $path]] {
+            let src [get $b source]
+
+            if [not [empty? [String::trim $src]]] {
+                var label [get $b name]
+
+                if [empty? $label] { set! label "(loose text)" }
+
+                let r [weft::image::eval-in! user $src \
+                    [weft::ctx::make #{source #{name $path line $line}}]]
+
+                if [get $r ok] {
+                    set! loaded [+ $loaded 1]
+                    set! names [List::push $names $label]
+                } else {
+                    set! failed [+ $failed 1]
+                    weft::shell::notice! "keep: block '$label' in $path failed: [weft::error::message [get $r error]]"
+                }
+            }
+
+            set! line [+ $line [+ 2 [len [String::split $src "\n"]]]]
+        }
+
+        return #{loaded $loaded failed $failed names $names}
+    }
+
+    ;; The kept blocks as rows (the program of the `kept` derivation).
+    proc rows! {out} {
+        let path [weft::live::path]
+        let bl [weft::live::blocks [weft::live::_read $path]]
+        var n 0
+
+        foreach b $bl {
+            if [empty? [get $b name]] { continue }
+
+            let first [get [String::split [get $b source] "\n"] 0]
+
+            weft::sink::emit! $out "[get $b name]  [get $b date]  $first\n"
+            set! n [+ $n 1]
+        }
+
+        if [== 0 $n] {
+            weft::sink::emit! $out "(nothing kept -- weft::keep name writes a live definition to $path)\n"
+        } else {
+            weft::sink::emit! $out "\n$n kept in $path (edit by hand; weft::unkeep name drops one)\n"
+        }
+
+        return ""
+    }
+}

@@ -9,6 +9,235 @@ namespace weft {
         return $weft_version
     }
 
+    ;; weft::derive name {program} [input ...]   define (or redefine) and run
+    ;; weft::derive name                         re-run: the refresh verb
+    ;; weft::derive                              re-run the one whose output
+    proc derive {*args} {
+        let ctx [weft::image::ctx]
+
+        if [== 0 [len $args]] {
+            let b [weft::ctx::field $ctx buffer]
+            let owner [weft::derivation::for-output $b]
+
+            if [empty? $owner] {
+                return [weft::error::make invalid-args \
+                    "derive: this buffer is not a derivation's output -- weft::derive name {program} \[input ...\]"]
+            }
+
+            return [weft::derivation::run! $owner $ctx]
+        }
+
+        let name [get $args 0]
+        let rest [List::slice $args 1 [len $args]]
+
+        if [== 0 [len $rest]] {
+            if [not [weft::derivation::defined? $name]] {
+                return [weft::error::make invalid-args \
+                    "derive: no derivation '$name' -- define one: weft::derive $name {program} \[input ...\]"]
+            }
+
+            return [weft::derivation::run! $name $ctx]
+        }
+
+        let program [get $rest 0]
+        var inputs ()
+
+        if [== 1 [len $rest]] {
+            let b [weft::ctx::field $ctx buffer]
+
+            if [weft::ws::buffer? $b] { set! inputs [list $b] }
+        } else {
+            foreach a [List::slice $rest 1 [len $rest]] {
+                let bid [weft::ws::buffer-resolve $a exact $ctx]
+
+                if [weft::error::error? $bid] { return $bid }
+
+                set! inputs [List::push $inputs $bid]
+            }
+        }
+
+        let d [weft::derivation::define! $name $program $inputs]
+
+        if [weft::error::error? $d] { return $d }
+
+        return [weft::derivation::run! $name $ctx]
+    }
+
+    proc detach {*rest} {
+        let ctx [weft::image::ctx]
+        var bid ""
+
+        if [== 1 [len $rest]] {
+            set! bid [weft::ws::buffer-resolve [get $rest 0] exact $ctx]
+
+            if [weft::error::error? $bid] { return $bid }
+        } else {
+            set! bid [weft::ctx::field $ctx buffer]
+        }
+
+        if [not [weft::ws::buffer? $bid]] {
+            return [weft::error::make invalid-args \
+                "detach: no buffer (run it IN the derived buffer, or name one)"]
+        }
+
+        let r [weft::derivation::detach! $bid]
+
+        if [weft::error::error? $r] { return $r }
+
+        return #{kind detached buffer $bid derivation $r
+            name [get [weft::ws::buffer $bid] name]}
+    }
+
+    ;; Every derivation as a row: name, status (ok / stale: why /
+    ;; error: why / not run), its inputs, its output -- right-click a
+    ;; row to show the output.  A derivation itself, by hand.
+    proc derivations {} {
+        let out [weft::shell::out-buffer! [weft::image::ctx]]
+        var n 0
+
+        foreach name [weft::derivation::names] {
+            let rec [weft::derivation::record $name]
+            let st [get $rec status]
+            var status [get $st state]
+
+            if [== error [get $st state]] {
+                set! status "error: [weft::error::message [get $st error]]"
+            } else {
+                let why [weft::derivation::stale-reason $name]
+
+                if [not [empty? $why]] { set! status "stale: $why" }
+            }
+
+            var ins ()
+
+            foreach b [get $rec inputs] {
+                set! ins [List::push $ins [get [weft::ws::buffer $b] name]]
+            }
+
+            foreach u [get $rec unresolved] {
+                set! ins [List::push $ins "$u (not open)"]
+            }
+
+            let ob [get $rec output]
+            let row "$name  $status  <- [String::join $ins ", "]  [weft::derivation::output-name $name]  $ob\n"
+
+            if [and [not [empty? $ob]] [weft::ws::buffer? $ob]] {
+                weft::sink::emit! $out $row \
+                    #{layer {qjump} meta #{kind {derivation-row} derivation $name}
+                        present #{ptype {qjump}
+                            value #{buffer $ob start 0 end 0}}}
+            } else {
+                weft::sink::emit! $out $row
+            }
+
+            set! n [+ $n 1]
+        }
+
+        return #{kind emitted summary "$n derivations -> *output*" count $n}
+    }
+
+    proc emit {text *rest} {
+        let out [weft::shell::out-buffer! [weft::image::ctx]]
+        var opts #{}
+
+        if [== 1 [len $rest]] { set! opts [get $rest 0] }
+
+        var t [String::from $text]
+
+        if [not [empty? $t]] {
+            let n [String::length $t]
+
+            if [not [== [String::range $t [- $n 1] $n] "\n"]] {
+                set! t "$t\n"
+            }
+        }
+
+        let r [weft::sink::emit! $out $t $opts]
+
+        return #{kind emitted summary [String::trim $t] start [get $r start]
+            end [get $r end]}
+    }
+
+    proc note {text} {
+        let r [weft::annot::note! [weft::image::ctx] $text]
+
+        if [weft::error::error? $r] { return $r }
+
+        return #{kind noted count [len $r] notes $r}
+    }
+
+    proc notes {} {
+        let ctx [weft::image::ctx]
+        let d [weft::derivation::define! notes \
+            {weft::annot::notes-rows! [get [weft::image::ctx] out] [get [weft::image::ctx] inputs]} \
+            [weft::annot::noted-buffers]]
+
+        if [weft::error::error? $d] { return $d }
+
+        return [weft::derivation::run! notes $ctx]
+    }
+
+    proc diff {a b} {
+        let ctx [weft::image::ctx]
+        let ba [weft::ws::buffer-resolve $a exact $ctx]
+
+        if [weft::error::error? $ba] { return $ba }
+
+        let bb [weft::ws::buffer-resolve $b exact $ctx]
+
+        if [weft::error::error? $bb] { return $bb }
+
+        ;; Star names (a derived side) lose their stars: a derivation
+        ;; name is one word with no '*'.
+        let name "diff:[String::replace [get [weft::ws::buffer $ba] name] "*" ""]:[String::replace [get [weft::ws::buffer $bb] name] "*" ""]"
+        let d [weft::derivation::define! $name \
+            {weft::linediff::rows! [get [weft::image::ctx] out] [get [get [weft::image::ctx] inputs] 0] [get [get [weft::image::ctx] inputs] 1]} \
+            [list $ba $bb]]
+
+        if [weft::error::error? $d] { return $d }
+
+        return [weft::derivation::run! $name $ctx]
+    }
+
+    proc keep {name} {
+        let src [weft::live::defining-source $name]
+
+        if [empty? $src] {
+            return [weft::error::make invalid-args \
+                "keep: no evaluation this session defined '$name' (a proc/var/let at the top level of a REPL or EXECUTE evaluation)"]
+        }
+
+        let r [weft::live::write! $name $src]
+
+        if [weft::error::error? $r] { return $r }
+
+        return #{kind kept name $name path $r
+            summary "kept $name -> $r"}
+    }
+
+    ;; Drop a kept block.
+    proc unkeep {name} {
+        let r [weft::live::remove! $name]
+
+        if [weft::error::error? $r] { return $r }
+
+        if [not $r] {
+            return [weft::error::make invalid-args "unkeep: nothing kept as '$name'"]
+        }
+
+        return #{kind unkept name $name path [weft::live::path]}
+    }
+
+    ;; The kept blocks as rows: the derivation named `kept`.
+    proc kept {} {
+        let d [weft::derivation::define! kept \
+            {weft::live::rows! [get [weft::image::ctx] out]} ()]
+
+        if [weft::error::error? $d] { return $d }
+
+        return [weft::derivation::run! kept [weft::image::ctx]]
+    }
+
     ;; ---- opening (and therefore creating) files ----
 
     ;; Open a path.  A path with no file behind it becomes an empty
@@ -92,6 +321,102 @@ namespace weft {
         if [not [empty? $vid]] { weft::ws::view-set-cursor! $vid $cur }
 
         return ""
+    }
+
+    ;; ---- insert: text at the cursor, applied now ----
+
+    ;; Put TEXT into the ctx buffer and apply it at once -- one undo
+    ;; step, no *diff* review.  Where: the selection SET (each range
+    ;; replaced), else the selection (start/end, replaced), else at
+    ;; EVERY caret of the ctx view (the active view of the buffer when
+    ;; the ctx names none: an attached REPL), else the buffer's tail.
+    ;; The cursor lands after the inserted text (one range; lk carries
+    ;; the carets of a set past their own inserts).  This is the
+    ;; "insert at cursor" primitive the transform algebra deliberately
+    ;; is not: a transform's result is a PLAN over [start, end), the
+    ;; whole buffer when nothing is selected, and it waits for review.
+    ;; A timestamp, a signature, a snippet want neither:
+    ;;   weft::config::bind! "ctrl+shift+t" {weft::insert [stamp]}
+    proc insert {text} {
+        let ctx [weft::image::ctx]
+        let bid [weft::ctx::field $ctx buffer]
+
+        if [not [weft::ws::buffer? $bid]] {
+            error "weft::insert: no buffer in ctx (run from a buffer, an attached REPL, or a bound chord)"
+        }
+
+        let doc [weft::ws::buffer-doc $bid]
+        var vid [weft::ctx::field $ctx view]
+
+        if [empty? $vid] {
+            set! vid [weft::ws::active-view-of-buffer $bid]
+        }
+
+        let body [String::from $text]
+        var edits ()
+
+        if [and [has? $ctx selections] [list? [get $ctx selections]]] {
+            foreach s [get $ctx selections] {
+                if [== 2 [len $s]] {
+                    set! edits [List::push $edits \
+                        #{start [get $s 0] end [get $s 1] text $body}]
+                }
+            }
+        }
+
+        if [and [== 0 [len $edits]] [has? $ctx start] [has? $ctx end]] {
+            set! edits [list #{start [get $ctx start] end [get $ctx end]
+                text $body}]
+        }
+
+        if [and [== 0 [len $edits]] [not [empty? $vid]]] {
+            foreach c [weft::ws::view-carets $vid] {
+                set! edits [List::push $edits #{start $c end $c text $body}]
+            }
+        }
+
+        if [== 0 [len $edits]] {
+            let tail [Lk::doc_len $doc]
+            set! edits [list #{start $tail end $tail text $body}]
+        }
+
+        let r [weft::transform::commit! #{transform insert buffer $bid
+            base_rev [Lk::doc_revision $doc] edits $edits}]
+
+        if [weft::error::error? $r] { return $r }
+
+        if [and [== 1 [len $edits]] [not [empty? $vid]]] {
+            weft::ws::view-set-cursor! $vid \
+                [+ [get [get $edits 0] start] [String::length $body]]
+        }
+
+        return ""
+    }
+
+    ;; Save a buffer: the ctx buffer, or one named EXACTLY (fuzzy
+    ;; saving is the convenience-crossing-the-API-boundary bug).  The
+    ;; command form of ctrl+s and of the tag's `Put`.
+    proc save {*rest} {
+        let ctx [weft::image::ctx]
+        var bid ""
+
+        if [empty? $rest] {
+            set! bid [weft::ctx::field $ctx buffer]
+
+            if [not [weft::ws::buffer? $bid]] {
+                return [weft::error::make invalid-args "save: no buffer in ctx"]
+            }
+        } else {
+            set! bid [weft::ws::buffer-resolve [get $rest 0] exact $ctx]
+
+            if [weft::error::error? $bid] { return $bid }
+        }
+
+        let r [weft::ws::buffer-save! $bid $ctx]
+
+        if [weft::error::error? $r] { return $r }
+
+        return #{kind saved buffer $bid path [get [weft::ws::buffer $bid] path]}
     }
 
     proc open {*rest} {
@@ -179,55 +504,109 @@ namespace weft {
             name [get [weft::ws::buffer $bid] name]}
     }
 
-    ;; Split the acting pane: `split-h` side by side, `split-v`
-    ;; stacked.  Alone, the new pane shows the SAME buffer -- two
-    ;; views, one text (what ctrl+e / ctrl+shift+d do).  Given a
-    ;; buffer it shows that one, resolved the way `show` resolves
-    ;; (fuzzy): `weft::split-h qol`.  Focus moves to the new pane.
-    proc _split {axis rest} {
+    ;; Direction words are the surface vocabulary; the kernel keeps
+    ;; axis h/v (h = side by side, v = stacked) and a/b child order.
+    ;; "vertical split" means opposite things to different people --
+    ;; a spatial direction means one.
+    proc _dir? {s} {
+        return [or [== $s left] [or [== $s right]
+                   [or [== $s up] [== $s down]]]]
+    }
+
+    proc _dir-split {dir} {
+        if [== $dir right] { return #{axis h side b} }
+        if [== $dir left] { return #{axis h side a} }
+        if [== $dir down] { return #{axis v side b} }
+        if [== $dir up] { return #{axis v side a} }
+
+        return #{}
+    }
+
+    ;; Resolve a movement word from `pane`: `next` wraps in the ctrl+n
+    ;; order; a direction goes to the nearest spatial neighbour and
+    ;; may be "" (an edge -- no wrapping).
+    proc _dir-target {pane word} {
+        if [== $word next] { return [weft::ws::pane-next $pane] }
+
+        if [weft::_dir? $word] {
+            return [weft::ws::pane-in-direction $pane $word]
+        }
+
+        return [weft::error::make invalid-args \
+            "expected left, right, up, down or next (got $word)"]
+    }
+
+    ;; Split the acting pane toward a direction: `weft::split right`
+    ;; side by side with the new pane after, `left` puts it FIRST;
+    ;; `down`/`up` stack.  Alone, the new pane shows the SAME buffer
+    ;; -- two views, one text (what ctrl+e / ctrl+shift+d do).  Given
+    ;; a buffer it shows that one, resolved the way `show` resolves
+    ;; (fuzzy): `weft::split right qol`.  Focus moves to the new pane.
+    proc split {*rest} {
         let ctx [weft::image::ctx]
+
+        if [== 0 [len $rest]] {
+            return [weft::error::make invalid-args \
+                "split: expected a direction -- left, right, up or down"]
+        }
+
+        let dir [String::from [get $rest 0]]
+
+        if [not [weft::_dir? $dir]] {
+            return [weft::error::make invalid-args \
+                "split: expected left, right, up or down (got $dir)"]
+        }
+
         let pane [weft::_ctx-pane $ctx]
         var bid [weft::ws::view-buffer [weft::ws::pane-view $pane]]
 
-        if [> [len $rest] 0] {
+        if [> [len $rest] 1] {
             set! bid [weft::ws::buffer-resolve \
-                [String::from [get $rest 0]] fuzzy $ctx]
+                [String::from [get $rest 1]] fuzzy $ctx]
 
             if [weft::error::error? $bid] { return $bid }
         }
 
-        let np [weft::ws::pane-split! $pane $axis $bid]
+        let ds [weft::_dir-split $dir]
+        let np [weft::ws::pane-split-at! $pane [get $ds axis] \
+                    [get $ds side] $bid]
 
         if [weft::error::error? $np] { return $np }
 
-        return #{kind split axis $axis pane $np from $pane buffer $bid
+        return #{kind split dir $dir axis [get $ds axis] pane $np
+            from $pane buffer $bid
             name [get [weft::ws::buffer $bid] name]}
     }
 
-    proc split-h {*rest} { return [weft::_split h $rest] }
-    proc split-v {*rest} { return [weft::_split v $rest] }
-
     ;; A fresh, empty, path-less buffer -- the tiling-window-manager
     ;; move: start from nothing and arrange.  `weft::new` shows it in
-    ;; the acting pane; `weft::new h` / `weft::new v` split the pane
-    ;; first (side by side / stacked) and show it in the new pane.  A
-    ;; further word names it (`weft::new v notes`); the default name
-    ;; is *new*, and any name that exists gets a `-2`, `-3` suffix so
-    ;; `show` never meets an ambiguity nobody authored.  Path-less
-    ;; buffers take their name as the filetype key, so a config
-    ;; `filetype! "*new*" #{lang lcl}` applies to every one.
+    ;; the acting pane; `weft::new right` / `weft::new down` (or left/
+    ;; up, which put the new pane first) split the pane and show it in
+    ;; the new pane.  A further word names it (`weft::new down notes`);
+    ;; the default name is *new*, and any name that exists gets a
+    ;; `-2`, `-3` suffix so `show` never meets an ambiguity nobody
+    ;; authored.  Path-less buffers take their name as the filetype
+    ;; key, so a config `filetype! "*new*" #{lang lcl}` applies to
+    ;; every one.
     proc new {*rest} {
         let ctx [weft::image::ctx]
-        var axis ""
+        var dir ""
         var name ""
 
         foreach a $rest {
             let s [String::from $a]
 
-            if [and [and [empty? $axis] [empty? $name]] \
-                    [or [== $s h] [== $s v]]] {
-                set! axis $s
+            if [and [and [empty? $dir] [empty? $name]] [weft::_dir? $s]] {
+                set! dir $s
             } else {
+                ;; the pre-direction spelling: refuse with the map,
+                ;; never a buffer accidentally named "h"
+                if [and [and [empty? $dir] [empty? $name]] \
+                        [or [== $s h] [== $s v]]] {
+                    return [weft::error::make invalid-args \
+                        "new: directions now -- right|down (left|up put the new pane first)"]
+                }
+
                 set! name $s
             }
         }
@@ -239,16 +618,22 @@ namespace weft {
         let bid [weft::ws::buffer-create! $name "" ""]
         let pane [weft::_ctx-pane $ctx]
         var target $pane
+        var axis ""
 
-        if [empty? $axis] {
+        if [empty? $dir] {
             weft::ws::pane-show-buffer! $pane $bid
         } else {
-            set! target [weft::ws::pane-split! $pane $axis $bid]
+            let ds [weft::_dir-split $dir]
+
+            set! axis [get $ds axis]
+            set! target [weft::ws::pane-split-at! $pane $axis \
+                             [get $ds side] $bid]
 
             if [weft::error::error? $target] { return $target }
         }
 
-        return #{kind new buffer $bid name $name pane $target axis $axis}
+        return #{kind new buffer $bid name $name pane $target
+            dir $dir axis $axis}
     }
 
     ;; *new* -> *new-2* -> *new-3*; notes -> notes-2.  The stars stay
@@ -349,15 +734,23 @@ namespace weft {
             return [weft::error::make denied "cannot close the only buffer"]
         }
 
-        var fallback [weft::ws::mru-buffer-excluding $bid]
-
-        if [empty? $fallback] { set! fallback [weft::ws::scratch-buffer!] }
-
         var n 0
 
+        ;; Per-pane evacuation ladder: the pane's OWN trail first (each
+        ;; pane keeps its train of thought), then the workspace MRU,
+        ;; then *scratch*.  The dying buffer lands in each evacuated
+        ;; pane's back stack and then dies -- a dangling entry the
+        ;; lazy read-filter skips.
         foreach p [weft::ws::panes] {
             if [== [weft::ws::view-buffer [weft::ws::pane-view $p]] $bid] {
-                weft::ws::pane-show-buffer! $p $fallback
+                var fb [weft::ws::pane-hist-fallback $p $bid]
+
+                if [empty? $fb] {
+                    set! fb [weft::ws::mru-buffer-excluding $bid]
+                }
+                if [empty? $fb] { set! fb [weft::ws::scratch-buffer!] }
+
+                weft::ws::pane-show-buffer! $p $fb
                 set! n [+ $n 1]
             }
         }
@@ -371,19 +764,154 @@ namespace weft {
         return #{kind closed buffer $bid name $name panes $n}
     }
 
-    ;; Swap the acting pane's view with the next pane's (the ctrl+n
-    ;; order); focus stays.  Swapping projections is deliberately
-    ;; dumb -- "move this pane's buffer" would invent ownership.
-    proc pane-swap {} {
+    ;; Move focus spatially: `weft::focus left|right|up|down` goes to
+    ;; the nearest neighbour (an edge is a quiet no-op -- no wrap);
+    ;; `weft::focus next` cycles like ctrl+n.
+    proc focus {*rest} {
         let ctx [weft::image::ctx]
+
+        if [== 0 [len $rest]] {
+            return [weft::error::make invalid-args \
+                "focus: expected left, right, up, down or next"]
+        }
+
+        let word [String::from [get $rest 0]]
+        let pane [weft::_ctx-pane $ctx]
+        let t [weft::_dir-target $pane $word]
+
+        if [weft::error::error? $t] { return $t }
+
+        if [or [empty? $t] [== $t $pane]] {
+            return #{kind focused pane $pane from $pane dir $word moved 0}
+        }
+
+        weft::ws::focus! $t
+
+        return #{kind focused pane $t from $pane dir $word moved 1}
+    }
+
+    ;; Exchange which buffers two panes display -- the acting pane
+    ;; and its spatial neighbour (`weft::swap right`) or the next in
+    ;; the ctrl+n order (`weft::swap next`).  Contents move, the tree
+    ;; does not, and focus stays with the acting pane.  Swapping
+    ;; projections is deliberately dumb -- "move this pane's buffer"
+    ;; would invent ownership.
+    proc swap {*rest} {
+        let ctx [weft::image::ctx]
+
+        if [== 0 [len $rest]] {
+            return [weft::error::make invalid-args \
+                "swap: expected left, right, up, down or next"]
+        }
+
+        let word [String::from [get $rest 0]]
         let a [weft::_ctx-pane $ctx]
-        let b [weft::ws::pane-next $a]
+        let t [weft::_dir-target $a $word]
 
-        if [== $a $b] { return #{kind swapped pane $a with ""} }
+        if [weft::error::error? $t] { return $t }
 
-        weft::ws::pane-swap-views! $a $b
+        if [or [empty? $t] [== $t $a]] {
+            return #{kind swapped pane $a with "" dir $word}
+        }
 
-        return #{kind swapped pane $a with $b}
+        weft::ws::pane-swap-views! $a $t
+        weft::ws::focus! $a
+
+        return #{kind swapped pane $a with $t dir $word}
+    }
+
+    proc pane-swap {} { return [weft::swap next] }
+
+    ;; Send the acting pane's buffer to another pane's display --
+    ;; `weft::send right` / `weft::send next`.  Display only: the
+    ;; target shows this buffer, the source keeps showing it, focus
+    ;; and the tree never move.  (Unrelated to `>cmd`, the filter
+    ;; spelling that sends the selection to a process.)
+    proc send {*rest} {
+        let ctx [weft::image::ctx]
+
+        if [== 0 [len $rest]] {
+            return [weft::error::make invalid-args \
+                "send: expected left, right, up, down or next"]
+        }
+
+        let word [String::from [get $rest 0]]
+        let s [weft::_ctx-pane $ctx]
+        let b [weft::ws::view-buffer [weft::ws::pane-view $s]]
+        let t [weft::_dir-target $s $word]
+
+        if [weft::error::error? $t] { return $t }
+
+        let name [get [weft::ws::buffer $b] name]
+
+        if [or [empty? $t] [== $t $s]] {
+            return #{kind sent buffer $b name $name from $s to ""
+                dir $word moved 0}
+        }
+
+        weft::ws::pane-show-buffer! $t $b
+
+        return #{kind sent buffer $b name $name from $s to $t
+            dir $word moved 1}
+    }
+
+    ;; Step this pane back / forward along its own buffer trail --
+    ;; each pane is a train of thought: `show` pushes, back and
+    ;; forward move without pushing.  A quiet no-op at either end.
+    proc back {} {
+        let ctx [weft::image::ctx]
+        let p [weft::_ctx-pane $ctx]
+        let t [weft::ws::pane-back! $p]
+
+        if [empty? $t] {
+            return #{kind back pane $p buffer "" name "" moved 0}
+        }
+
+        return #{kind back pane $p buffer $t
+            name [get [weft::ws::buffer $t] name] moved 1}
+    }
+
+    proc forward {} {
+        let ctx [weft::image::ctx]
+        let p [weft::_ctx-pane $ctx]
+        let t [weft::ws::pane-forward! $p]
+
+        if [empty? $t] {
+            return #{kind forward pane $p buffer "" name "" moved 0}
+        }
+
+        return #{kind forward pane $p buffer $t
+            name [get [weft::ws::buffer $t] name] moved 1}
+    }
+
+    ;; Show only this pane -- the escape hatch that replaces closing
+    ;; three panes to stare at one buffer.  A toggle: the tree, its
+    ;; ratios and every hidden view stay intact; any split, close,
+    ;; swap, transpose or focus move to ANOTHER pane drops it, while
+    ;; showing other buffers in the zoomed pane (show/send) keeps it.
+    ;; `weft::only` is the destructive sibling.
+    proc zoom {} {
+        let ctx [weft::image::ctx]
+        let p [weft::_ctx-pane $ctx]
+
+        ;; act where invoked: a clicked `weft::zoom` zooms the
+        ;; clicked pane (focusing a different pane drops any old zoom
+        ;; on the way, which is the right reading of the gesture)
+        if [not [== $p [weft::ws::focused-pane]]] { weft::ws::focus! $p }
+
+        return #{kind zoomed on [weft::ws::zoom-toggle!] pane $p}
+    }
+
+    ;; Close the acting pane -- the command form of ctrl+w.  Its view
+    ;; dies, the buffer survives; the last pane refuses.
+    proc pane-close {} {
+        let ctx [weft::image::ctx]
+        let p [weft::_ctx-pane $ctx]
+        let r [weft::ws::pane-close! $p]
+
+        if [weft::error::error? $r] { return $r }
+
+        return #{kind pane-closed pane $p}
     }
 
     ;; Flip the axis of the acting pane's parent split.
@@ -522,6 +1050,65 @@ namespace weft {
         return #{kind emitted summary "$n buffers -> *output*" count $n}
     }
 
+    ;; One workspace row per tree node, indented by depth; returns the
+    ;; pane count under `node_id`.  Pane rows carry a panejump
+    ;; presentation (right-click focuses that pane); split rows print
+    ;; axis and ratio, plain.
+    proc _ws-row! {out node_id depth} {
+        let n [weft::ws::node $node_id]
+        var pad ""
+        var i 0
+
+        while [< $i $depth] {
+            set! pad "$pad  "
+            set! i [+ $i 1]
+        }
+
+        if [== [get $n kind] pane] {
+            let bid [weft::ws::view-buffer [weft::ws::pane-view $node_id]]
+            var mark ""
+            var tag ""
+
+            if [weft::ws::buffer-dirty? $bid] { set! mark " *" }
+
+            if [== $node_id [weft::ws::focused-pane]] {
+                set! tag {  [focused]}
+
+                if [weft::ws::zoomed?] { set! tag {  [focused, zoomed]} }
+            }
+
+            weft::sink::emit! $out \
+                "$pad[get [weft::ws::buffer $bid] name]$mark$tag  $node_id\n" \
+                #{layer {panejump} meta #{kind {pane-row} pane $node_id}
+                    present #{ptype {panejump} value #{pane $node_id}}}
+
+            return 1
+        }
+
+        weft::sink::emit! $out \
+            "${pad}split [get $n axis] [get $n ratio]\n"
+
+        let na [weft::_ws-row! $out [get $n a] [+ $depth 1]]
+
+        return [+ $na [weft::_ws-row! $out [get $n b] [+ $depth 1]]]
+    }
+
+    ;; The split tree as text -- the workspace inspected the way
+    ;; everything in weft is inspected.  A projection, never the
+    ;; model: the tree stays canonical, this is a menu over it.
+    proc workspace {} {
+        let out [weft::shell::out-buffer! [weft::image::ctx]]
+        let rt [weft::ws::tree-root]
+
+        if [empty? $rt] {
+            return #{kind emitted summary "no panes" count 0}
+        }
+
+        let n [weft::_ws-row! $out $rt 0]
+
+        return #{kind emitted summary "$n panes -> *output*" count $n}
+    }
+
     ;; ---- messages: the flash history ----
     ;; Errors surface as four-second flashes in the status row; this
     ;; is where they go afterwards.  Newest last, so the tail is the
@@ -571,20 +1158,32 @@ namespace weft {
         #{title {Buffers and workspace (ctrl+i inspects at the cursor)} rows (
             ({weft::open notes.md} {open a file -- one that does not exist yet becomes a new one})
             ({weft::buffers} {open buffers -- right-click a row to show it})
+            ({weft::workspace} {the split tree as rows -- right-click a pane row to focus it})
             ({weft::show qol} {show a buffer here -- name, id, path, or a unique prefix})
-            ({weft::new v} {a fresh empty buffer -- alone: here; `h`/`v`: in a new split (side by side / stacked); a further word names it})
-            ({weft::split-h qol} {split this pane side by side showing a buffer -- alone: this buffer twice})
-            ({weft::split-v} {split this pane stacked, likewise})
+            ({weft::new down} {a fresh empty buffer -- alone: here; a direction: in a new split that way; a further word names it})
+            ({weft::split right qol} {split this pane toward a direction, showing a buffer -- alone: this buffer twice; left/up put the new pane first})
+            ({weft::split down} {split this pane stacked, likewise})
+            ({weft::focus right} {focus the nearest pane in a direction (left/right/up/down; `next` cycles) -- edges are quiet})
+            ({weft::send right} {show THIS buffer in the pane that way -- focus and layout stay put; `next` cycles})
+            ({weft::back} {this pane's previous buffer -- every pane keeps its own trail (weft::forward returns)})
+            ({weft::swap right} {exchange what two panes display -- this one and the one that way; focus stays here})
+            ({weft::save} {save this buffer (ctrl+s; the tag's Put) -- `weft::save NAME` saves another})
             ({weft::close notes.md} {kill a buffer by name (add `force` to discard edits); alone: this one})
             ({weft::only} {collapse the splits to this pane -- no buffer is lost})
+            ({weft::zoom} {show only this pane, tree intact -- toggle; any layout change or focus move drops it})
+            ({weft::pane-close} {close this pane -- its buffer stays open (ctrl+w)})
+            ({Newcol} {tag verbs: Newcol Delcol New Del Put -- the line over each pane; `weft::describe Del`})
             ({weft::transpose} {flip this pane's split between side-by-side and stacked})
-            ({weft::pane-swap} {swap this pane's buffer with the next pane's})
+            ({weft::pane-swap} {swap this pane's buffer with the next pane's (weft::swap next)})
             ({weft::commands} {this menu})
             ({weft::keys} {every chord and mouse gesture, by group -- and what shadows what})
             ({weft::messages} {recent status-row messages -- the errors you missed})
             ({weft::version} {the running version}))}
 
         #{title {Image and REPL (ctrl+r opens *lcl*)} rows (
+            ({weft::keep my-proc} {write the form that defined user::my-proc this session into ~/.config/weft/live.lcl -- replayed at boot})
+            ({weft::kept} {what live.lcl holds, as rows})
+            ({weft::unkeep my-proc} {drop a kept block})
             ({weft::repl::attach} {execute IN a buffer: REPL evals then carry it as ctx})
             ({weft::repl::target} {which buffer the REPL is attached to})
             ({weft::repl::detach} {drop the attachment})
@@ -621,6 +1220,14 @@ namespace weft {
             ({weft::q::annotate} {terminal: live rules as producers, styled})
             ({weft::q::replace {new}} {terminal: pend edits as a reviewable plan}))}
 
+        #{title {Derivations -- computed buffers with provenance (docs/derive.md)} rows (
+            ({weft::derive lines {weft::emit "[q::count [q::lines [q::doc]]] lines"} README.md} {define + run: the program's rows land in *lines*, read-only; name inputs after the program})
+            ({weft::derive lines} {re-run a derivation: the refresh verb})
+            ({weft::diff README.md docs/qol.md} {two buffers as a unified diff: a derivation over both; rows jump into either side})
+            ({weft::derivations} {every derivation with its status -- right-click a row to show its output})
+            ({weft::detach} {sever the derived buffer you run this in: editable, renamed, yours})
+            ({weft::emit "a row"} {one row into this evaluation's output -- a derivation program's primitive})
+        )}
         #{title {Filters and operands -- the selection through, or handed to, a program (docs/commands.md stage D)} rows (
             ({weft::operand} {this evaluation's operand text: the selection a middle-click/ctrl+shift+enter handed the command})
             ({weft::filter::pipe {sort}} {selection -> stdin; stdout replaces it (|sort)})
@@ -635,6 +1242,8 @@ namespace weft {
             ({weft::transform::reject} {discard it}))}
 
         #{title {Annotations} rows (
+            ({weft::note {remark}} {attach a note to the selection (authored layer `notes`: styled, persisted, re-anchored)})
+            ({weft::notes} {the notes index as a derivation -- right-click a row jumps to the note})
             ({weft::annot::edit-at} {edit the annotations at the cursor as text})
             ({weft::annot::apply-edit} {commit that editing session})
             ({weft::annot::cancel-edit} {abandon it}))}
@@ -651,6 +1260,8 @@ namespace weft {
                 {bind a chord to a script (a third word documents it in weft::keys); rebinding a native chord shadows it})
             ({weft::template {replace-all {} {}}}
                 {paste a command to complete, cursor in the first {} -- bind! it and any command is a keyed prompt})
+            ({weft::insert {text}}
+                {insert text at the cursor (or over the selection), applied now -- bind! {weft::insert [my-stamp]} for snippets})
             ({weft::config::filetype! {.md} #{wrap word}} {per-filetype settings})
             ({weft::plumb::rule-names} {the plumbing rules in force})
             ({weft::ts::style!} {recolor a tree-sitter capture})

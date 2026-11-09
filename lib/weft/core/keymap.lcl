@@ -7,7 +7,7 @@
 ;;;               chord fires from (`pane`, `search_edit`, ...), a
 ;;;               listing group, one line of doc, and the command
 ;;;               form that does the same thing as a word, when one
-;;;               exists (`weft::split-h`).  lib/weft/ui/intents.lcl
+;;;               exists (`weft::split right`).  lib/weft/ui/intents.lcl
 ;;;               is the table; it is pure data and loads headless.
 ;;;   chord!   -- a HOST PROFILE maps chords to intents
 ;;;               (config/bindings-native.lcl).  Chords are per host;

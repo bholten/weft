@@ -910,12 +910,31 @@ namespace weft::q {
 
     var _mat_n 0
 
-    proc _show-buffer {} {
-        let existing [weft::ws::buffer-for-name "*query*"]
+    proc emit-rows! {plan n out} {
+        let r [weft::q::_run $plan $n]
+        let recs [get $r records]
+        let src [get [get $plan source] buffer]
+        var more ""
 
-        if [not [empty? $existing]] { return $existing }
+        if [get $r truncated] { set! more "+" }
 
-        return [weft::ws::buffer-create! "*query*" "" ""]
+        weft::sink::emit! $out \
+            ";; [weft::q::describe $plan] @ rev [get $r revision] -- [len $recs] of [get $r total]$more rows; re-run to refresh; right-click a row jumps\n\n"
+
+        foreach rec $recs {
+            weft::sink::emit! $out \
+                "\[[get $rec start], [get $rec end]) [get $rec kind]: [weft::q::_row-text $rec]\n" \
+                #{layer {qjump} meta #{kind {qrow}}
+                    present #{ptype {qjump}
+                        value #{buffer $src start [get $rec start]
+                            end [get $rec end]}}}
+        }
+
+        if [== 0 [len $recs]] {
+            weft::sink::emit! $out "(no records)\n"
+        }
+
+        return #{shown [len $recs] total [get $r total]}
     }
 
     proc show {plan *rest} {
@@ -925,61 +944,20 @@ namespace weft::q {
 
         if [== 1 [len $rest]] { set! n [get $rest 0] }
 
-        let r [weft::q::_run $plan $n]
-        let recs [get $r records]
         let src [get [get $plan source] buffer]
-        let bid [weft::q::_show-buffer]
-        let doc [weft::ws::buffer-doc $bid]
-        let store [weft::ws::buffer-store $bid]
+        let d [weft::derivation::define! query $plan [list $src] #{limit $n}]
 
-        var more ""
-
-        if [get $r truncated] { set! more "+" }
-
-        var text ";; [weft::q::describe $plan]\n;; @ rev [get $r revision] -- [len $recs] of [get $r total]$more rows; re-run to refresh; right-click a row jumps\n\n"
-        var rows ()
-
-        foreach rec $recs {
-            let row "\[[get $rec start], [get $rec end]) [get $rec kind]: [weft::q::_row-text $rec]"
-
-            set! rows [List::push $rows #{s [String::length $text]
-                e [+ [String::length $text] [String::length $row]]
-                v #{buffer $src start [get $rec start] end [get $rec end]}}]
-            set! text "$text$row\n"
+        if [weft::error::error? $d] {
+            error "weft::q::show: [weft::error::message $d]"
         }
 
-        if [== 0 [len $recs]] {
-            set! text "$text(no records)\n"
+        let r [weft::derivation::run! query [weft::image::ctx]]
+
+        if [weft::error::error? $r] {
+            error "weft::q::show: [weft::error::message $r]"
         }
 
-        Lk::doc_transact $doc {
-            if [> [Lk::doc_len $doc] 0] {
-                Lk::doc_delete $doc 0 [Lk::doc_len $doc]
-            }
-
-            Lk::doc_insert $doc 0 $text
-        }
-
-        var lr ""
-        var le ""
-
-        catch { Lk::annot_layer_register $store "qjump" } lr le
-
-        foreach id [Lk::annot_by_layer $store "qjump"] {
-            Lk::annot_remove $store $id
-        }
-
-        foreach row $rows {
-            let aid [Lk::annot_add $store [get $row s] [get $row e] \
-                "qjump" #{}]
-
-            weft::ws::present! $store $aid "qjump" [get $row v]
-        }
-
-        weft::ws::buffer-set-editable! $bid 0
-
-        return #{kind show buffer $bid shown [len $recs]
-            total [get $r total]}
+        return $r
     }
 
     proc materialize {plan *rest} {

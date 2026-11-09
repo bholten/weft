@@ -1,0 +1,70 @@
+;;; Tag verbs  The line over each pane reads
+;;;
+;;;   Newcol Delcol New Del |
+;;;   *vocab* Newcol Delcol New Del Detach Derive |   (a stale derivation)
+;;;
+;;; and every word middle-clicks.  Acme's words, as one-line aliases
+;;; over the portable weft:: vocabulary: each acts on the ctx the
+;;; gesture built -- the tag's pane, with that pane's body buffer as
+;;; ctx `buffer` -- so `Del` in pane B's tag kills B's buffer while
+;;; focus stays wherever it was.  Weft has no columns, only the split
+;;; tree, so the column words map onto it.
+;;;
+;;; They are SEEDED into the user package (weft::image::user-seed!)
+;;; so a tag line reads as bare words: the resolver and the image
+;;; both look in user:: first.  `proc Del {} {...}` in init.lcl
+;;; rebinds user::Del and wins; weft::tag::Del stays as the original.
+;;; A seed survives weft::image::reset-user! and is not listed by
+;;; user-defs until you redefine it.  The set a tag shows is config
+;;; text (`weft::config::put! tag_verbs "Newcol Delcol New Del"`), so
+;;; renaming or trimming it needs no code.
+
+namespace weft::tag {
+
+    ;;; Newcol: a fresh empty buffer in a new pane beside this one
+    ;;; (`weft::new right`).
+    proc Newcol {} {
+        return [weft::new right]
+    }
+
+    ;;; Delcol: close this pane -- its buffer stays open
+    ;;; (`weft::pane-close`).
+    proc Delcol {} {
+        return [weft::pane-close]
+    }
+
+    ;;; New: a fresh empty buffer in a new pane below this one
+    ;;; (`weft::new down`).
+    proc New {} {
+        return [weft::new down]
+    }
+
+    ;;; Del: kill the buffer under this tag (`weft::close`).  A dirty
+    ;;; buffer refuses, as Acme's first Del does; `Del force` discards.
+    proc Del {*rest} {
+        if [empty? $rest] { return [weft::close] }
+
+        return [weft::close [get $rest 0]]
+    }
+
+    ;;; Put: save the buffer under this tag (`weft::save`).  It appears
+    ;;; in the tag only while the buffer is dirty -- Acme's signal.
+    proc Put {} {
+        return [weft::save]
+    }
+
+    ;;; Derive: re-run the derivation whose output is under this tag
+    ;;; (`weft::derive` with no name).  It appears only while the
+    ;;; result is stale -- the same signal as Put.
+    proc Derive {} {
+        return [weft::derive]
+    }
+
+    ;;; Detach: sever the buffer under this tag from its derivation
+    ;;; (`weft::detach`): editable, renamed `<name>-detached`, yours.
+    proc Detach {} {
+        return [weft::detach]
+    }
+}
+
+weft::image::user-seed! weft::tag

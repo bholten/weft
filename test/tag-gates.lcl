@@ -1,0 +1,204 @@
+;;; Tag gates (docs/buffers.md "Tags"): the per-pane tag line -- its
+;;; kernel-owned prefix, the user's half, the seeded verbs, and the
+;;; session round trip.  Headless, CWD-independent:
+;;;   weft --headless test/tag-gates.lcl
+
+proc gate {name ok} {
+    if [not $ok] { error "GATE FAILED: $name" }
+    puts "ok: $name"
+}
+
+require "weft/host/test.lcl"
+
+weft::config::put! data_dir "/data"
+weft::ws::init! [weft::testhost::editor-hooks]
+
+proc ev {code ctx} {
+    let r [weft::image::eval-in! user $code $ctx]
+
+    if [not [get $r ok]] { return [get $r error] }
+
+    return [get $r value]
+}
+
+proc tag-text {p} {
+    return [Lk::doc_text [weft::ws::pane-tag-doc $p]]
+}
+
+;; A buffer's display name (the test host names file buffers by path).
+proc nm {b} {
+    return [get [weft::ws::buffer $b] name]
+}
+
+weft::testhost::fs-put! "/w/a.md" "aaa\n"
+weft::testhost::fs-put! "/w/b.md" "bbb\n"
+
+let _c0 [weft::ctx::make #{}]
+let _ba [weft::ws::buffer-open! "/w/a.md" $_c0]
+let _bb [weft::ws::buffer-open! "/w/b.md" $_c0]
+
+;; ===================== the prefix =====================
+let _p1 [weft::ws::tree-init! [weft::ws::view-create! $_ba]]
+gate "a pane is born with a tag editor" \
+    [weft::testhost::editor-alive? [weft::ws::pane-tag-editor $_p1]]
+gate "the tag is not a view and not a buffer" \
+    [and [== 1 [len [weft::ws::views-of-buffer $_ba]]] \
+         [== 2 [len [weft::ws::buffer-list]]]]
+gate "prefix: name, the config verbs, the separator" \
+    [== "[nm $_ba] Newcol Delcol New Del | " [tag-text $_p1]]
+gate "user half starts empty" [== "" [weft::ws::pane-tag-text $_p1]]
+gate "sync is idle when nothing moved" [== 0 [weft::ws::pane-tag-sync! $_p1]]
+
+;; The user types after the separator; the kernel leaves it alone.
+Lk::doc_insert [weft::ws::pane-tag-doc $_p1] \
+    [Lk::doc_len [weft::ws::pane-tag-doc $_p1]] "Look |sort"
+gate "user half is what follows the separator" \
+    [== "Look |sort" [weft::ws::pane-tag-text $_p1]]
+gate "the separator is located" \
+    [== "|" [String::index [tag-text $_p1] [weft::ws::pane-tag-sep $_p1]]]
+
+;; Dirty: Put joins the verbs, in place, the user's text riding along.
+Lk::doc_insert [weft::ws::buffer-doc $_ba] 0 "!"
+gate "dirtying the buffer re-syncs the prefix" [== 1 [weft::ws::pane-tag-sync! $_p1]]
+gate "Put appears while dirty, user half intact" \
+    [== "[nm $_ba] Newcol Delcol New Del Put | Look |sort" [tag-text $_p1]]
+
+;; Showing another buffer renames the tag; the user half stays (it is
+;; the PANE's line, as in Acme).
+weft::ws::pane-show-buffer! $_p1 $_bb
+weft::ws::pane-tag-sync! $_p1
+gate "showing a buffer renames the tag" \
+    [== "[nm $_bb] Newcol Delcol New Del | Look |sort" [tag-text $_p1]]
+
+;; A prefix the user edited is re-synced from the separator.
+Lk::doc_delete [weft::ws::pane-tag-doc $_p1] 0 [+ 1 [String::length [nm $_bb]]]
+gate "user may edit the prefix" \
+    [== "Newcol Delcol New Del | Look |sort" [tag-text $_p1]]
+weft::ws::pane-show-buffer! $_p1 $_ba
+weft::ws::pane-tag-sync! $_p1
+gate "edited prefix is rebuilt from the separator on the next change" \
+    [== "[nm $_ba] Newcol Delcol New Del Put | Look |sort" [tag-text $_p1]]
+
+;; A tag with no separator left gets the prefix put back in front.
+Lk::doc_delete [weft::ws::pane-tag-doc $_p1] 0 [Lk::doc_len [weft::ws::pane-tag-doc $_p1]]
+Lk::doc_insert [weft::ws::pane-tag-doc $_p1] 0 "mine"
+gate "no separator: sep is -1" [== -1 [weft::ws::pane-tag-sep $_p1]]
+weft::ws::pane-show-buffer! $_p1 $_bb
+weft::ws::pane-tag-sync! $_p1
+gate "no separator: the prefix returns in front of everything" \
+    [== "[nm $_bb] Newcol Delcol New Del | mine" [tag-text $_p1]]
+
+;; set-text! replaces the user half only.
+weft::ws::pane-tag-set-text! $_p1 "theirs"
+gate "set-text! replaces the user half" \
+    [== "[nm $_bb] Newcol Delcol New Del | theirs" [tag-text $_p1]]
+
+;; Config owns the words.
+weft::config::put! tag_verbs "Del"
+weft::ws::pane-show-buffer! $_p1 $_ba
+weft::ws::pane-tag-sync! $_p1
+gate "tag_verbs is text from config" \
+    [== "[nm $_ba] Del Put | theirs" [tag-text $_p1]]
+weft::config::put! tag_verbs "Newcol Delcol New Del"
+weft::ws::pane-show-buffer! $_p1 $_bb
+weft::ws::pane-tag-sync! $_p1
+
+;; ===================== the verbs =====================
+gate "verbs resolve as bare words" \
+    [and [== lcl [get [weft::cmd::resolve {Newcol} $_c0] route]] \
+         [and [== lcl [get [weft::cmd::resolve {Del force} $_c0] route]] \
+              [== lcl [get [weft::cmd::resolve {Put} $_c0] route]]]]
+gate "seeds are not the user's definitions" \
+    [== 0 [len [weft::image::user-defs]]]
+
+;; New: a pane below, fresh buffer; Newcol: a pane beside.
+let _rn [ev {New} [weft::ctx::make #{pane $_p1}]]
+gate "New splits down with a fresh buffer" \
+    [and [== new [get $_rn kind]] [== v [get $_rn axis]]]
+let _p2 [get $_rn pane]
+let _rc [ev {Newcol} [weft::ctx::make #{pane $_p2}]]
+gate "Newcol splits right with a fresh buffer" \
+    [and [== new [get $_rc kind]] [== h [get $_rc axis]]]
+let _p3 [get $_rc pane]
+gate "new panes get tags naming their fresh buffers" \
+    [and [== 0 [String::find [tag-text $_p2] "*new*"]] \
+         [== 0 [String::find [tag-text $_p3] "*new-2*"]]]
+
+;; A path-less buffer is dirty for life: no Put there.
+Lk::doc_insert [weft::ws::buffer-doc [weft::ws::view-buffer [weft::ws::pane-view $_p2]]] 0 "x"
+weft::ws::pane-tag-sync! $_p2
+gate "Put never shows on a path-less buffer" \
+    [== "*new* Newcol Delcol New Del | " [tag-text $_p2]]
+
+;; Del acts on the pane in ctx, not the focused one: focus _p1, Del
+;; via _p3's ctx (the lens is _p3's body buffer).
+weft::ws::focus! $_p1
+let _b3 [weft::ws::view-buffer [weft::ws::pane-view $_p3]]
+let _rd [ev {Del} [weft::ctx::make #{pane $_p3 buffer $_b3}]]
+gate "Del kills the buffer under ITS tag" \
+    [and [== closed [get $_rd kind]] [not [weft::ws::buffer? $_b3]]]
+gate "the pane survives Del and falls back along its trail" \
+    [== pane [get [weft::ws::node $_p3] kind]]
+gate "focus did not move" [== $_p1 [weft::ws::focused-pane]]
+
+;; Del on a dirty buffer refuses; Del force discards.
+let _rr [ev {Del} [weft::ctx::make #{pane $_p1 buffer $_ba}]]
+gate "Del refuses a dirty buffer" [weft::error::error? $_rr]
+let _rf [ev {Del force} [weft::ctx::make #{pane $_p1 buffer $_ba}]]
+gate "Del force discards" \
+    [and [== closed [get $_rf kind]] [not [weft::ws::buffer? $_ba]]]
+
+;; Put saves through weft::save.
+Lk::doc_insert [weft::ws::buffer-doc $_bb] 0 "!"
+let _pw [weft::ws::view-buffer [weft::ws::pane-view $_p1]]
+let _rp [ev {Put} [weft::ctx::make #{pane $_p1 buffer $_bb}]]
+gate "Put saves" \
+    [and [== saved [get $_rp kind]] \
+         [and [not [weft::ws::buffer-dirty? $_bb]] \
+              [== "!bbb\n" [weft::testhost::fs-get "/w/b.md"]]]]
+weft::ws::pane-tag-sync! [weft::_ctx-pane [weft::ctx::make #{buffer $_bb}]]
+gate "weft::save by exact name" \
+    [== saved [get [ev "weft::save [nm $_bb]" $_c0] kind]]
+gate "weft::save without a buffer is a structured error" \
+    [== invalid-args [weft::error::code [weft::save]]]
+
+;; Delcol closes the pane and frees its tag editor.
+let _ted3 [weft::ws::pane-tag-editor $_p3]
+let _rdc [ev {Delcol} [weft::ctx::make #{pane $_p3}]]
+gate "Delcol closes the pane" \
+    [and [== pane-closed [get $_rdc kind]] \
+         [not [has? [weft::ws::node $_p3] kind]]]
+gate "pane-close frees the tag editor" \
+    [not [weft::testhost::editor-alive? $_ted3]]
+
+;; A user redefinition wins and is listed; reset brings the seed back.
+ev {proc Del {} { return mine }} $_c0
+gate "user::Del shadows the seed" [== mine [ev {Del} $_c0]]
+gate "a redefined seed is a user definition" \
+    [has? [weft::image::user-defs] Del]
+weft::image::reset-user!
+gate "reset restores the seed" \
+    [== lcl [get [weft::cmd::resolve {Del} $_c0] route]]
+gate "describe knows a seeded verb" \
+    [== emitted [get [ev {weft::describe Del} $_c0] kind]]
+
+;; ===================== sessions =====================
+weft::ws::pane-tag-set-text! $_p1 "Look |sort"
+weft::ws::pane-tag-set-text! $_p2 ""
+let _nb [nm $_bb]
+gate "session saves" [== 1 [weft::session::save!]]
+
+weft::ws::init! [weft::testhost::editor-hooks]
+let _fresh [weft::ws::buffer-create! "*scratch*" "" ""]
+weft::ws::tree-init! [weft::ws::view-create! $_fresh]
+gate "session restores" [== 1 [weft::session::restore! #{}]]
+
+var _found ""
+foreach p [weft::ws::panes] {
+    if [== "Look |sort" [weft::ws::pane-tag-text $p]] { set! _found $p }
+}
+gate "the user half of a tag survives the session" [not [empty? $_found]]
+gate "the restored tag has its prefix" \
+    [== "$_nb Newcol Delcol New Del | Look |sort" [tag-text $_found]]
+
+puts "tag gates: all passed"
